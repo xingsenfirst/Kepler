@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Kepler 对象存储管理系统</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230067c0'/><path d='M8 11h6l2 2h8v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z' fill='%23fff'/></svg>">
+</head>
+<body>
+  <div id="app">
+    <!-- ============ 顶部工具栏 ============ -->
+    <header id="toolbar">
+      <div class="tb-row tb-main">
+        <div class="tb-left">
+          <button id="btn-menu" class="icon-btn only-narrow" title="导航面板"></button>
+          <button id="btn-back" class="icon-btn" title="后退" disabled></button>
+          <button id="btn-fwd" class="icon-btn" title="前进" disabled></button>
+          <button id="btn-up" class="icon-btn" title="上一级"></button>
+          <button id="btn-refresh" class="icon-btn" title="刷新"></button>
+          <nav id="breadcrumb" class="address-bar" title="地址栏"></nav>
+        </div>
+        <div class="tb-center">
+          <div id="search-box">
+            <span id="search-icon"></span>
+            <input id="search-input" type="text" placeholder="搜索当前目录及子目录（回车）" autocomplete="off">
+            <button id="btn-filter" title="筛选条件" class="icon-btn small"></button>
+            <button id="btn-search-clear" class="icon-btn small" title="清除搜索并返回浏览" hidden></button>
+          </div>
+        </div>
+        <div class="tb-right">
+          <div id="view-switch" class="seg" title="视图切换">
+            <button data-view="list" title="列表视图"></button>
+            <button data-view="thumbs" title="缩略图视图"></button>
+            <button data-view="large" title="大图标视图"></button>
+            <button data-view="small" title="小图标视图"></button>
+          </div>
+          <button id="btn-viewopt" class="icon-btn" title="视图选项（列/排序/刷新频率）"></button>
+          <span class="tb-sep"></span>
+          <div id="user-menu-wrap" class="user-menu-wrap" hidden>
+            <button id="btn-user-menu" class="tb-btn user-menu-btn" title="账户菜单"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4.42 0-8 2.24-8 5v1h16v-1c0-2.76-3.58-5-8-5z"/></svg><span id="user-name"></span><span class="um-caret">▾</span></button>
+            <div id="user-menu" class="user-menu" hidden>
+              <div class="um-head" id="um-head"></div>
+              <div class="um-item" id="um-profile">编辑资料</div>
+              <div class="um-item" id="um-users" hidden>用户管理</div>
+              <div class="um-sep" id="um-sep" hidden></div>
+              <div class="um-item danger" id="um-logout">退出</div>
+            </div>
+          </div>
+          <span class="tb-sep"></span>
+          <button id="btn-syssettings" class="tb-btn" title="系统设置"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM19.43 13c-.14-.73-.44-1.41-.86-2.01l1.49-1.15c.28-.21.37-.59.2-.9a9.99 9.99 0 0 0-2.35-2.94c-.27-.22-.67-.24-.95-.04l-1.73 1.03a7.91 7.91 0 0 0-2.24-.86L13 3.03c-.05-.34-.34-.59-.69-.59h-2c-.35 0-.64.25-.69.59l-.1 2.52c-.78.17-1.52.48-2.24.86L5.55 5.96c-.28-.2-.68-.18-.95.04a9.99 9.99 0 0 0-2.35 2.94c-.18.31-.08.69.2.9l1.49 1.15c-.42.6-.72 1.28-.86 2.01L1.03 15.1c-.31.05-.53.35-.53.7v2c0 .35.22.65.53.7l2.52.1c.14.73.44 1.41.86 2.01l-1.49 1.15c-.28.21-.37.59-.2.9a9.99 9.99 0 0 0 2.35 2.94c.27.22.67.24.95.04l1.73-1.03c.72.38 1.46.69 2.24.86l.1 2.52c.05.34.34.59.69.59h2c.35 0 .64-.25.69-.59l.1-2.52c.78-.17 1.52-.48 2.24-.86l1.73 1.03c.28.2.68.18.95-.04a9.99 9.99 0 0 0 2.35-2.94c.18-.31.08-.69-.2-.9l-1.49-1.15c.42-.6.72-1.28.86-2.01l2.52-.1c.31-.05.53-.35.53-.7v-2c0-.35-.22-.65-.53-.7l-2.52-.1z"/></svg>系统设置</button>
+        </div>
+      </div>
+      <div class="tb-row tb-ops">
+        <button id="op-newfolder" class="op-btn"><span class="op-ic"></span>新建文件夹</button>
+        <button id="op-upload" class="op-btn"><span class="op-ic"></span>上传</button>
+        <button id="op-download" class="op-btn" disabled><span class="op-ic"></span>下载</button>
+        <button id="op-rename" class="op-btn" disabled><span class="op-ic"></span>重命名</button>
+        <button id="op-move" class="op-btn" disabled><span class="op-ic"></span>移动</button>
+        <button id="op-copylink" class="op-btn" disabled><span class="op-ic"></span>复制链接</button>
+        <button id="op-delete" class="op-btn danger" disabled><span class="op-ic"></span>删除</button>
+        <button id="op-selectall" class="op-btn ghost">全选</button>
+      </div>
+    </header>
+
+    <!-- ============ 主体 ============ -->
+    <div id="body">
+      <aside id="sidebar">
+        <div class="side-head">
+          <span class="side-title">存储桶</span>
+          <span class="side-head-btns">
+            <button id="btn-bucket-add" class="icon-btn small" title="添加存储桶"></button>
+            <button id="btn-bucket-refresh" class="icon-btn small" title="刷新桶列表"></button>
+          </span>
+        </div>
+        <ul id="bucket-list" class="bucket-list" title="选择存储桶"></ul>
+        <nav id="tree" class="tree" title="文件夹导航"></nav>
+        <div class="side-foot">
+          <button id="side-buckets" class="side-link">🪣 存储桶管理</button>
+          <button id="side-links" class="side-link">🔗 链接管理</button>
+        <button id="side-orders" class="side-link">💰 订单管理</button>
+          <button id="side-dashboard" class="side-link">📊 监控仪表盘</button>
+          <button id="side-logs" class="side-link">🗒️ 操作日志</button>
+          <button id="side-settings" class="side-link">🔑 密钥设置</button>
+          <button id="side-help" class="side-link">❓ 使用帮助</button>
+        </div>
+      </aside>
+      <div id="sidebar-mask" hidden></div>
+
+      <main id="main">
+        <!-- 文件浏览区 -->
+        <section id="explorer">
+          <div id="search-banner" hidden>
+            <span id="search-banner-text"></span>
+            <button id="btn-exit-search" class="mini-btn">返回浏览</button>
+          </div>
+          <div id="file-area" tabindex="0"></div>
+          <div id="load-more" hidden><button class="mini-btn">加载更多</button><span class="loading-spin" hidden></span></div>
+          <div id="empty-hint" hidden></div>
+        </section>
+
+        <!-- 存储桶管理 -->
+        <section id="bucketmgr" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card wide">
+              <h3>存储桶管理 <span id="bucketmgr-count" class="lk-count"></span>
+              <select id="bucketmgr-interval" class="mini-select" title="自动刷新时间">
+                <option value="5000">每 5 秒</option>
+                <option value="30000">每 30 秒</option>
+                <option value="60000">每 1 分钟</option>
+                <option value="300000">每 5 分钟</option>
+                <option value="0">从不</option>
+              </select>
+              <button id="btn-buckets-refresh" class="mini-btn">刷新</button>
+              <button id="btn-buckets-add" class="mini-btn primary">＋ 添加存储桶</button></h3>
+            <div id="bucketmgr-table"></div>
+            <div class="card-note">已用容量按对象列表实时扫描统计（最多扫描 5000 个对象，超出为估算，缓存 5 分钟）；累计上传 / 下载流量与请求数为本系统经手操作的累计值。「清空文件」与「彻底删除」需手动输入完整存储桶名称确认；「解绑」仅移除本地记录。彻底删除要求桶内文件已清空且无分片上传碎片。</div>
+          </div>
+
+            <!-- IP 访问屏蔽：规则的增删改与预检均为管理员专属（规则含其它用户的来源 IP），
+                 普通用户整卡隐藏（JS 在角色权威渲染点统一赋值，且不发起规则列表请求） -->
+            <div class="dash-card wide" id="ipguard-card">
+            <h3>IP 访问屏蔽 <span id="ipguard-count" class="lk-count"></span>
+              <button id="btn-ipguard-refresh" class="mini-btn">刷新</button>
+              <button id="btn-ipguard-add" class="mini-btn primary">＋ 添加屏蔽规则</button></h3>
+            <div class="ipguard-test-row">
+              <span class="bk-sub">规则预检：</span>
+              <input type="text" id="ipguard-test-ip" placeholder="输入 IP（如 8.8.8.8）" autocomplete="off" spellcheck="false">
+              <select id="ipguard-test-method" class="mini-select">
+                <option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option>
+                <option value="DELETE">DELETE</option><option value="HEAD">HEAD</option>
+              </select>
+              <select id="ipguard-test-scope" class="mini-select" title="按哪个作用范围预检">
+                <option value="">全局（无桶上下文）</option>
+                <option value="active">当前激活桶</option>
+              </select>
+              <button id="btn-ipguard-test" class="mini-btn">检测</button>
+              <span id="ipguard-test-result"></span>
+            </div>
+            <div id="ipguard-table"></div>
+            <div class="card-note">规则支持单个 IP（如 1.2.3.4）与 IP 段 CIDR（如 10.0.0.0/8）；「请求方法」留空表示屏蔽全部方法，也可只屏蔽指定方法（如仅屏蔽写操作 PUT/POST/DELETE 而放行读操作 GET/HEAD）。「作用范围」支持全局（对所有存储桶生效）与桶级（一个或多个存储桶，穿梭框选择）两级：桶级规则仅当访问目标为所选桶之一时参与判定（文件操作按当前激活桶、分享链接按其所属桶、桶管理操作按 URL 指定的桶）；判定时桶级规则优先、全局规则其次，两者独立配置、叠加生效——任一级别命中即屏蔽，全部未命中才放行。「屏蔽海外 IP」功能已迁移到「存储桶管理」列表中，可针对每个桶单独开启。存储桶被解绑或彻底删除时，仅作用于该桶的规则将被删除，多桶规则自动移除该桶引用。</div>
+          </div>
+          </div>
+        </section>
+
+        <!-- 链接管理 -->
+        <section id="linkmgr" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card wide">
+            <h3>分享链接管理 <span id="linkmgr-count" class="lk-count"></span>
+              <button id="btn-links-refresh" class="mini-btn">刷新</button></h3>
+            <div id="linkmgr-table"></div>
+            <div class="card-note">托管链接由本服务在线时提供下载（有效期 / 次数 / 密码三种限制可任意组合）；删除链接仅清除本地记录，不影响云端文件。预签名直链不在此列表中。</div>
+          </div>
+          </div>
+        </section>
+
+        <!-- 订单管理 -->
+        <section id="ordermgr" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card wide">
+            <h3>付费订单 <span id="ordermgr-count" class="lk-count"></span>
+              <button id="btn-orders-refresh" class="mini-btn">刷新</button></h3>
+            <div id="ordermgr-table"></div>
+            <div class="card-note">记录所有「需付费下载」链接产生的支付订单。文件名在创建订单时已快照保存，因此分享链接被删除后仍能核对款项对应的文件；「是否已下载」仅在下载<b>传输完成后</b>才标记，传输中途失败不会计入。支付结果由服务端向支付网关主动查单确认，页面上的状态随查单结果更新。<br><b>退款</b>仅对「已支付」的订单可用：本系统<b>不代持资金</b>，标记为已退款只是记账动作（该订单的支付凭证立即失效、金额不再计入「已收」），实际退款请在对应支付渠道后台完成。</div>
+          </div>
+          </div>
+        </section>
+
+        <!-- 监控仪表盘 -->
+        <section id="dashboard" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card card-storage">
+              <h3>存储用量</h3>
+              <div class="storage-flex">
+                <canvas id="chart-donut" width="180" height="180"></canvas>
+                <div class="storage-legend" id="storage-legend"></div>
+              </div>
+              <div class="card-note" id="storage-note"></div>
+            </div>
+            <div class="dash-card">
+              <h3>今日流量</h3>
+              <div class="kv-big">
+                <div><label>上传</label><b id="today-up">—</b></div>
+                <div><label>下载</label><b id="today-down">—</b></div>
+              </div>
+              <h3 class="mt">今日 API 请求</h3>
+              <div class="kv-big">
+                <div><label>成功</label><b class="ok" id="today-ok">—</b></div>
+                <div><label>失败</label><b class="bad" id="today-fail">—</b></div>
+                <div><label>成功率</label><b id="today-rate">—</b></div>
+              </div>
+            </div>
+            <div class="dash-card wide">
+              <h3>近 7 天流量趋势</h3>
+              <div class="chart-wrap"><canvas id="chart-traffic" height="220"></canvas></div>
+              <div class="chart-legend"><span><i style="background:#4f8ef7"></i>上传</span><span><i style="background:#39b97b"></i>下载</span></div>
+            </div>
+            <div class="dash-card wide">
+              <h3>近 7 天 API 请求统计</h3>
+              <div class="chart-wrap"><canvas id="chart-requests" height="220"></canvas></div>
+              <div class="chart-legend"><span><i style="background:#4f8ef7"></i>成功</span><span><i style="background:#e5484d"></i>失败</span></div>
+            </div>
+            <div class="dash-card wide">
+              <h3>请求类型分布（近 7 天累计）</h3>
+              <div class="chart-wrap"><canvas id="chart-types" height="200"></canvas></div>
+            </div>
+            <!-- 操作日志（仅管理员：日志详情含用户名 / 客户端 IP / 对象键 / 桶名） -->
+            <div class="dash-card wide" id="dash-logs-card" hidden>
+              <h3>操作日志 <button id="btn-logs-refresh" class="mini-btn">刷新</button>
+                <select id="logs-level" class="mini-select"><option value="">全部级别</option><option value="info">info</option><option value="warn">warn</option><option value="error">error</option></select>
+              </h3>
+              <div id="logs-table" class="logs-table"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 系统设置 -->
+        <section id="systemsettings" class="card-view" hidden>
+          <div class="dash-grid">
+            <!-- 用户管理（仅管理员可见；普通用户此卡片整体隐藏，改由账户菜单「编辑资料」自助） -->
+            <div class="dash-card wide sysset-card" id="sysset-user-card">
+              <h3 class="sysset-h3"><span class="sysset-tag">用户</span><span id="sysset-user-title">用户管理</span> <span id="user-count" class="lk-count"></span>
+                <button id="btn-user-add" class="mini-btn primary sysset-action">＋ 添加用户</button></h3>
+              <div class="enc-warn" id="sysset-user-intro">
+                <b>简要说明</b>：管理系统登录账户与权限。管理员可添加、编辑、删除用户并配置角色权限；普通用户仅可登录使用，无法进入用户管理。系统至少保留一个管理员，且不能删除当前登录账户。
+              </div>
+              <div id="user-table" class="user-table"></div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>用户数据加密存储于本地配置（<code>data/config.enc</code>），密码经 scrypt 加盐哈希保存，任何接口均不回传密码哈希。</li>
+                  <li>会话默认 24 小时有效，服务重启后需重新登录。</li>
+                  <li>新增用户默认角色为普通用户，可随时调整；角色为「管理员」的账户可进入系统设置中的用户管理。</li>
+                </ul>
+              </div>
+            </div>
+            <!-- 你为什么要 F12 翻代码？你什么目的？ -->
+            <div class="dash-card wide sysset-card" id="sysset-enc-card">
+            <h3 class="sysset-h3"><span class="sysset-tag enc">加密</span>文件加密 <span id="enc-status" class="lk-count"></span>
+              <button id="btn-enc-save" class="mini-btn primary sysset-action">保存设置</button></h3>
+            <div class="enc-warn">
+              <b>简要说明</b>：文件将经加密后再上传至对象存储。<b>若加密密钥丢失或未经解密就卸载该系统，加密文件将永远无法解密。</b>
+              <ul class="enc-warn-list">
+                <li><b>crypto</b>：AES-256-GCM 加密，逐段校验完整性，安全性更高，但消耗更多时间和性能。</li>
+                <li><b>文件头魔数</b>：覆写文件头并进行流式异或，可自定义魔数头（如 ENCRYPTED 或 0x00BADF00D），速度更快，但<b>仅为混淆级保护，可能被二进制编辑器或已知明文分析还原，请勿用于敏感数据</b>。</li>
+                <li><b>随机盐</b>：每个文件独立 16 字节盐（默认开启），同内容每次密文不同，提高混淆强度。</li>
+                <li><b>不加密</b>：文件直接上传，不安全，可能在后续版本移除。</li>
+              </ul>
+            </div>
+            <div id="sysset-enc-body">
+              <div class="form-item">
+                <label>加密方式</label>
+                <!-- 可勾选卡片组：保留原生 radio（value / name / checked 与事件绑定不变），
+                     原生控件视觉隐藏，改由自定义指示器与卡片高亮表达选中态 -->
+                <div class="enc-modes" role="radiogroup" aria-label="加密方式">
+                  <label class="enc-mode-opt">
+                    <input type="radio" name="enc-mode" value="none" checked>
+                    <span class="enc-mode-mark" aria-hidden="true"></span>
+                    <span class="enc-mode-text">
+                      <b>不加密</b>
+                      <span class="bk-sub">文件以明文直传云端（默认）</span>
+                    </span>
+                  </label>
+                  <label class="enc-mode-opt">
+                    <input type="radio" name="enc-mode" value="crypto">
+                    <span class="enc-mode-mark" aria-hidden="true"></span>
+                    <span class="enc-mode-text">
+                      <b>crypto</b>
+                      <span class="bk-sub">AES-256-GCM 高强度加密，逐段校验完整性，防篡改</span>
+                    </span>
+                  </label>
+                  <label class="enc-mode-opt">
+                    <input type="radio" name="enc-mode" value="magic">
+                    <span class="enc-mode-mark" aria-hidden="true"></span>
+                    <span class="enc-mode-text">
+                      <b>文件头魔数</b>
+                      <span class="bk-sub">仅覆写文件头 + 流式异或，轻量快速（混淆级，非强加密）</span>
+                    </span>
+                  </label>
+                </div>
+              </div>
+              <div id="enc-magic-block" hidden>
+                <div class="enc-warn danger" style="margin: 4px 0 14px">
+                  <b>⚠️ 安全强度提示</b>：魔数模式属于<b>混淆级保护，非强加密</b>，建议仅用于防止 IDC 服务商审核。<b>若涉及隐私或敏感数据请务必选择 crypto 模式</b>。
+                </div>
+                <div class="form-item">
+                  <label>自定义魔数（1-64 字节）</label>
+                  <input type="text" id="enc-magic" class="full" placeholder="如 ENCRYPTED（文本）或 0x00BADF00D（十六进制）" autocomplete="off" spellcheck="false">
+                  <div class="hint">魔数将覆写每个文件的文件头（原文件头保存在本地元数据中，解密时自动还原）；支持纯文本或 0x 前缀十六进制。留空使用默认值 ENCRYPTED。</div>
+                  <div class="hint" id="enc-magic-preview"></div>
+                </div>
+              </div>
+              <div id="enc-crypto-block" hidden>
+                <div class="form-item">
+                  <label>查看密码（访问权限验证，可选）</label>
+                  <input type="password" id="enc-password" class="full" placeholder="设置后查看 / 下载加密文件需先验证此密码" autocomplete="new-password">
+                  <div class="hint">仅做访问控制（scrypt 哈希存储，忘记可在此重置）；加密强度由本地密钥文件决定，与该密码相互独立。留空 = 不设密码限制。</div>
+                </div>
+              </div>
+            </div>
+            <div class="card-note">
+              <ul class="note-list">
+                <li>加密密钥与元数据保存在本地 <code>data/enc.key</code> 与 <code>data/enc-meta.json</code>——<b>请务必备份</b>：密钥丢失后密文将无法解密。</li>
+                <li>修改加密方式只影响之后的新上传，已有文件保持原方式；分片上传（大文件）同样支持两种加密方式与断点续传。</li>
+                <li>加密文件的缩略图显示占位图标；「复制链接 → 预签名直链」对加密文件不可用（直链只能取得密文）。</li>
+              </ul>
+            </div>
+          </div>
+
+            <!-- 上传排除（文件过滤） -->
+            <div class="dash-card wide sysset-card" id="sysset-excludes-card">
+              <h3 class="sysset-h3"><span class="sysset-tag excl">排除</span>上传排除 <button id="btn-excludes-save" class="mini-btn primary sysset-action">保存设置</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：开启对应规则后，上传流程将在<b>文件选择阶段</b>与<b>上传处理阶段</b>自动过滤命中的文件，它们不会进入上传队列、不会上传到云端。选项保存后即时生效并持久化，重新登录后仍然保持。
+              </div>
+              <div id="sysset-excludes-body">
+                <div class="excludes-group">
+                  <label class="check-line"><input type="checkbox" id="ex-dsstore">排除 .DS_Store 文件</label>
+                  <label class="check-line"><input type="checkbox" id="ex-thumbsdb">排除 Thumbs.db 文件</label>
+                  <label class="check-line"><input type="checkbox" id="ex-gitignore">根据 .gitignore 排除文件</label>
+                </div>
+                <div class="form-item">
+                  <div class="hint">支持标准 gitignore 语法：<code>#</code> 注释、<code>!</code> 取反、尾部 <code>/</code>（仅目录）、前导 / 锚定、<code>*</code> <code>**</code> <code>?</code> <code>[..]</code> 通配、<code>\</code> 转义；以最后一条命中规则为准。</div>
+                </div>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>排除规则在文件选择阶段（界面过滤）与上传处理阶段（服务端兜底校验）均生效；未命中的文件正常上传。关闭对应选项后，同类文件将恢复可上传。</li>
+                  <li>与 GitHub 规则相同：.gitignore 文件将一同上传。虽然它通常极小，但这仍然会产生流量费用。</li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- WebDAV 服务 -->
+            <div class="dash-card wide sysset-card" id="sysset-webdav-card">
+              <h3 class="sysset-h3"><span class="sysset-tag wd">WebDAV</span>WebDAV 服务
+                <label class="ip-switch sysset-action" title="启用 / 停用 WebDAV（强制 HTTPS）">
+                  <input type="checkbox" id="webdav-enabled">
+                  <i></i><span id="webdav-enabled-text">停用</span>
+                </label>
+              </h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：启用后，系统会在独立端口提供 <b>WebDAV over HTTPS</b> 服务，可将当前存储桶挂载到系统文件管理器（Windows 资源管理器 / macOS Finder）或支持 WebDAV 的应用中。<b>由于涉及密钥传输和解密，本功能强制要求 TLS 加密传输</b>；访问需使用下方账户进行 Basic 认证，账户密码均加密存储于服务器端。
+              </div>
+
+              <div class="form-item">
+                <label>服务器地址（挂载时填写）</label>
+                <div class="wd-url-row">
+                  <code id="webdav-url" class="wd-url">—</code>
+                  <button id="btn-webdav-copy-url" class="mini-btn" type="button">复制地址</button>
+                </div>
+                <div class="hint" id="webdav-run-hint">服务未运行。启用开关且至少存在一个账户后，服务将在 HTTPS 端口启动。</div>
+              </div>
+
+              <div id="webdav-panel" hidden>
+                <div class="wd-list-head">
+                  <label style="margin:0">账户列表</label>
+                  <button id="btn-webdav-add" class="mini-btn primary" type="button">＋ 添加新账户</button>
+                </div>
+                <div id="webdav-account-list" class="wd-account-list"></div>
+              </div>
+
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>每个账户包含应用名称、用户名与密码；第三方应用挂载时以<b>用户名 + 密码</b>完成 Basic 认证。</li>
+                  <li>账户口令以 AES-256-GCM 字段级加密后随本地配置保存（<code>data/config.enc</code>）。</li>
+                  <li>因使用自签名证书，部分客户端首次连接需信任证书。</li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- 验证码服务 -->
+            <div class="dash-card wide sysset-card" id="sysset-captcha-card">
+              <h3 class="sysset-h3"><span class="sysset-tag cap">验证</span>登录验证
+                <label class="ip-switch sysset-action" title="启用 / 停用登录验证码">
+                  <input type="checkbox" id="captcha-enabled">
+                  <i></i><span id="captcha-enabled-text">停用</span>
+                </label>
+              </h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：为登录页面启用人机验证（CAPTCHA），需通过校验才能登录，<b>关闭后登录流程保持原有逻辑。</b>
+              </div>
+              <div class="form-item">
+                <label>验证服务商</label>
+                <div class="seg-col" id="captcha-provider">
+                  <button class="chip" data-v="recaptcha" type="button">Google reCAPTCHA</button>
+                  <button class="chip" data-v="turnstile" type="button">Cloudflare Turnstile</button>
+                </div>
+                <!-- reCAPTCHA 前端脚本固定从 <https://recaptcha.net/recaptcha/api.js 加载（非 google.com，避免无法访问） -->
+              </div>
+              <div class="form-item">
+                <label>站点密钥（Site Key）</label>
+                <input type="text" id="captcha-sitekey" class="full" placeholder="服务商控制台获取，用于前端渲染验证组件" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="form-item">
+                <label>服务端密钥（Secret Key）<span id="captcha-secret-state" class="hint" style="margin-left:6px"></span></label>
+                <input type="password" id="captcha-secretkey" class="full" placeholder="留空表示保持现有密钥不变" autocomplete="new-password">
+                <div class="hint">仅用于服务端校验，任何接口均不会回传明文。密钥经加密配置（<code>data/config.enc</code>）保存，或通过环境变量 <code>CAPTCHA_SITE_KEY</code> / <code>CAPTCHA_SECRET_KEY</code> 注入（环境变量优先，禁止硬编码）。</div>
+              </div>
+              <div class="form-row">
+                <div class="form-item">
+                  <label>校验超时（毫秒，1000–15000）</label>
+                  <input type="number" id="captcha-timeout" min="1000" max="15000" step="500" value="5000">
+                  <div class="hint">服务端向验证服务商发起校验的最长等待时间，超时即按下方策略处理，<b>不挂起登录接口</b>。</div>
+                </div>
+                <div class="form-item">
+                  <label>服务异常时策略</label>
+                  <div class="seg-col" id="captcha-onerror">
+                    <button class="chip" data-v="block" type="button">拦截并提示（默认）</button>
+                    <button class="chip" data-v="degrade" type="button">降级放行</button>
+                  </div>
+                  <div class="hint">「拦截」= 服务商不可用/超时时拒绝登录并明确提示；「降级」= 此时跳过验证放行（可用性优先，仅在服务商故障期间生效）。</div>
+                </div>
+              </div>
+              <div id="captcha-msg" class="form-msg"></div>
+              <div class="form-item" style="margin-top:4px">
+                <button id="btn-captcha-save" class="mini-btn primary">保存设置</button>
+                <span id="captcha-effective" class="hint" style="margin-left:10px"></span>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>校验<b>全部在服务端完成</b>：前端提交的 token 必须经服务商接口回源验证，不信任任何前端返回结果。</li>
+                  <li>环境变量覆盖优先级最高：<code>CAPTCHA_ENABLED</code> / <code>CAPTCHA_PROVIDER</code> / <code>CAPTCHA_SITE_KEY</code> / <code>CAPTCHA_SECRET_KEY</code>。</li>
+                  <li>切换服务商或修改密钥后保存即生效，下次进入登录页按新配置渲染。</li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- 支付设置 -->
+            <div class="dash-card wide sysset-card" id="sysset-payment-card">
+              <h3 class="sysset-h3"><span class="sysset-tag pay">支付</span>支付设置
+                <label class="ip-switch sysset-action" title="启用 / 停用支付功能（停用后所有付费链接自动转为免费下载，原配置保留）">
+                  <input type="checkbox" id="payment-enabled">
+                  <i></i><span id="payment-enabled-text">停用</span>
+                </label>
+                <span id="payment-status" class="lk-count"></span>
+              </h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：可设置分享链接是否需付费才可下载（仅支持托管链接）。凭证随系统配置一同加密保存（<code>data/config.enc</code>），密钥类字段任何接口均不回传明文（只回传「是否已配置」）。<b>停用支付功能后，所有付费链接自动转为免费下载，原有付费配置原样保留，重新启用即恢复。</b>
+              </div>
+              <div class="form-item">
+                <label>支付平台</label>
+                <div class="pay-tabs" id="payment-tabs"></div>
+              </div>
+              <div class="form-item" id="payment-channel-row">
+                <label>启用该渠道 <span id="payment-channel-state" class="pay-state"></span></label>
+                <label class="check-line"><input id="payment-channel-on" type="checkbox">  允许下载者通过该渠道付款</label>
+                <div class="hint" id="payment-channel-hint"></div>
+              </div>
+              <div id="payment-form"></div>
+              <div id="payment-msg" class="form-msg"></div>
+              <div class="form-item" style="margin-top:4px">
+                <button id="btn-payment-validate" class="mini-btn" type="button">校验</button>
+                <button id="btn-payment-save" class="mini-btn primary" type="button">保存设置</button>
+                <button id="btn-payment-clear" class="mini-btn danger" type="button">清除本平台</button>
+                <span id="payment-hint" class="hint" style="margin-left:10px"></span>
+              </div>
+              <div class="hr"></div>
+              <div class="form-item">
+                <label for="payment-site-url">站点对外地址</label>
+                <input id="payment-site-url" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false" style="max-width:420px">
+                <button id="btn-payment-site-url" class="mini-btn" type="button" style="margin-left:8px">保存地址</button>
+                <div class="hint">支付网关向本服务<b>回调支付结果</b>、以及支付完成后<b>跳回本站点</b>的目标地址。必须是对外可达的完整地址（<code>http(s)://</code> 开头）。<b>本机 <code>127.0.0.1</code> 收不到公网回调</b>，生产环境务必填写；留空则按每次访问的 Host 兜底，仅适合本地调试。</div>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>字段命名<b>沿用各平台官方文档</b>（支付宝 <code>app_id</code>、微信支付 <code>mchid</code> / <code>api_v3_key</code>、PayPal <code>client_id</code>），可直接对照其控制台填写。</li>
+                  <li>密钥类字段留空提交表示<b>保持现有值不变</b>；如需更换，直接填入新值即可。</li>
+                  <li>校验未通过时<b>不会保存任何内容</b>，界面会逐字段标出具体原因。</li>
+                  <li>支付功能处于<b>启用</b>状态时，至少需要保留一个渠道；如需全部关闭，请先停用支付功能。</li>
+                  <li>渠道「已启用」但凭证未填完时状态为<b>待补全</b>，此时下载者无法选择该渠道付款。</li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- 关于（该卡片永远置于“设置页”的最后，不能有任何功能卡片在此之后） -->
+            <div class="dash-card wide sysset-card">
+              <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
+              <div class="about-body">
+                <p><b>Kepler 对象存储管理系统</b> Standard V1.1.8</p>
+                <ul class="about-list">
+                  <li>开发者：xingsem2005</li>
+                  <li>项目地址：<a href="https://github.com/xingsem2005/bucket-manager" target="_blank">https://github.com/xingsem2005/bucket-manager</a></li>
+                  <li>基于 WTFPL 协议开源。</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 密钥管理 -->
+        <section id="credmgr" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card wide">
+              <h3>访问密钥管理 <span id="credmgr-count" class="lk-count"></span>
+                <button id="btn-credmgr-refresh" class="mini-btn">刷新</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：访问密钥为<b>所有用户共享</b>，由管理员统一管理。<b>普通用户不能自行绑定密钥</b>，只能使用管理员分配的、允许普通用户可用的密钥；如有多个密钥，普通用户可在「对普通用户可见」的密钥中选择其一使用。
+              </div>
+              <div id="credmgr-table"></div>
+              <div class="card-note">密钥以 AES-256-GCM 加密存储于本地配置（<code>data/config.enc</code>），任何接口均不回传密钥明文（仅显示掩码）。删除密钥仅移除本地记录，不影响云端。</div>
+            </div>
+
+            <!-- 自定义域名：保存走 PUT /api/config（管理员专属），普通用户整卡隐藏 -->
+            <div class="dash-card wide" id="credmgr-domain-card">
+              <h3>自定义请求域名（可选）</h3>
+              <div class="form-item">
+                <label>主域名</label>
+                <input type="text" id="credmgr-domain-1" placeholder="cdn.example.com" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="form-item">
+                <label>备用域名</label>
+                <input type="text" id="credmgr-domain-2" placeholder="backup-cdn.example.com" autocomplete="off" spellcheck="false">
+                <div class="hint">配置后“复制链接”生成的分享地址将优先使用主域名；主域名不可用时请手动替换为备用域名。</div>
+              </div>
+              <div class="form-item">
+                <button id="btn-credmgr-save-domain" class="mini-btn primary">保存域名</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ============ 状态栏 ============ -->
+    <footer id="statusbar">
+      <span id="status-conn" class="st-item"><i class="dot"></i><em>未连接</em></span>
+      <span id="status-bucket" class="st-item"></span>
+      <span id="status-items" class="st-item"></span>
+      <span id="status-selected" class="st-item"></span>
+      <span class="st-flex"></span>
+      <span id="status-quota" class="st-item quota" title="存储用量（配额可在设置中调整）">
+        <i class="quota-bar"><i></i></i><em id="quota-text">—</em>
+      </span>
+      <span id="status-traffic" class="st-item" title="实时上传/下载速度（近 10 秒平均），悬停查看今日累计">↑— ↓—</span>
+      <button id="status-uploads" class="st-item st-btn" title="上传管理">⇧ 上传队列 <b id="upload-count">0</b></button>
+    </footer>
+  </div>
+
+  <!-- 上传管理抽屉 -->
+  <div id="upload-drawer" hidden>
+    <div class="drawer-head">
+      <b>上传管理</b>
+      <span id="upload-summary"></span>
+      <span class="drawer-actions">
+        <button id="btn-clear-finished" class="mini-btn">清除已完成</button>
+        <button id="btn-drawer-close" class="icon-btn small" title="收起"></button>
+      </span>
+    </div>
+    <div id="upload-list"></div>
+  </div>
+
+  <!-- 登录 / 初始化管理员遮罩 -->
+  <div id="auth-overlay" class="auth-overlay" hidden>
+    <div class="auth-card">
+      <!-- 不再需要登录页 LOGO 展示，因为特么的放哪儿都显得怪异 -->
+      <!-- <div class="auth-logo">
+        <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0067c0"/><path d="M8 11h6l2 2h8v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z" fill="#fff"/></svg>
+      </div> -->
+      <h2 id="auth-title">登录</h2>
+      <p id="auth-sub" class="auth-sub">请输入账户凭据以继续</p>
+      <div id="auth-fields">
+        <div class="form-item">
+          <label for="auth-username">用户名</label>
+          <input id="auth-username" type="text" placeholder="请输入用户名" autocomplete="username" spellcheck="false">
+        </div>
+        <div class="form-item">
+          <label for="auth-password">密码</label>
+          <input id="auth-password" type="password" placeholder="请输入密码" autocomplete="current-password">
+        </div>
+        <div class="form-item" id="auth-confirm-item" hidden>
+          <label for="auth-confirm">确认密码</label>
+          <input id="auth-confirm" type="password" placeholder="请再次输入密码" autocomplete="new-password">
+        </div>
+        <div class="form-item" id="auth-remember-item">
+          <label class="check-line"><input id="auth-remember" type="checkbox">  记住登录状态（30 天内免登录）</label>
+          <div class="hint">为安全起见，仅保存用户名。<b>建议使用浏览器记住并自动填充密码</b>。</div>
+        </div>
+      </div>
+      <!-- 人机验证容器：仅当服务端开启验证码时由 JS 填充并显示，关闭时不产生任何页面改动 -->
+      <div id="auth-captcha" class="auth-captcha" hidden></div>
+      <div id="auth-captcha-msg" class="auth-captcha-msg" hidden></div>
+      <div id="auth-error" class="auth-error" hidden></div>
+      <button id="btn-auth-submit" class="auth-btn">登 录</button>
+      <p id="auth-foot" class="auth-foot"></p>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <div id="ctx-menu" hidden></div>
+  <input type="file" id="file-input" multiple hidden>
+  <input type="file" id="folder-input" webkitdirectory hidden>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

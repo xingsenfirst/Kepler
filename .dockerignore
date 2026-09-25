@@ -1,0 +1,33 @@
+# 构建上下文裁剪 —— 减小镜像体积与构建时间，并避免把敏感数据带进镜像
+
+# 依赖与构建产物：镜像内会重新 npm ci
+node_modules
+npm-debug.log*
+
+# 运行时数据：配置加密密钥 / 用户 / 日志，绝对不能进镜像
+#  —— 其中 data/secret.key 与 data/enc.key 是解密主密钥，泄露等于配置全公开
+data
+*.log
+
+# 版本控制与编辑器
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.swp
+*.swo
+
+# 中间产物与工作区
+.workbuddy
+docs
+tests
+scripts
+coverage
+*.tmp
+
+# 容器与工程配置本身
+Dockerfile
+.dockerignore
+.editorconfig
+eslint.config.js

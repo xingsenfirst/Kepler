@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.log
+
+# 临时目录 / 临时产物一律不入库。
+# 注意：备份目录（如 .tmp-databak/）里可能同时含 secret.key 与 enc.key ——
+# 二者同时泄露即可解开全部云端密文，因此这类目录必须被忽略，不能只靠 data/ 那条规则。
+.tmp-*

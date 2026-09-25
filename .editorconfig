@@ -1,0 +1,27 @@
+# 统一跨编辑器的代码风格，避免「谁用什么编辑器」导致的杂乱 diff
+# 与 .gitattributes / ESLint 的职责边界：本文件只管空白与编码，不管语法规则。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# 前端与后端均为 2 空格缩进（现状一致）
+[*.{js,mjs,cjs,json,yml,yaml,html,css,md}]
+indent_size = 2
+
+# Markdown 允许行尾双空格表示换行，不要自动裁剪
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows 批处理需 CRLF
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[Dockerfile]
+indent_size = 4

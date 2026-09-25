@@ -1,0 +1,25 @@
+{
+  "name": "object-manager",
+  "version": "1.1.8",
+  "description": "基于对象存储的云存储管理系统",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:watch": "node --test --watch \"tests/**/*.test.js\"",
+    "lint": "node scripts/lint.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "WTFPL",
+  "dependencies": {
+    "cos-nodejs-sdk-v5": "^2.14.0",
+    "express": "^4.19.2",
+    "selfsigned": "^2.4.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  }
+}

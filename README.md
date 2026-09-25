@@ -79,12 +79,17 @@
 <h2 id="readme-section4">1. 环境要求</h2>
 
 ---
+
 - Node.js ≥ 18（推荐 20 及以上；S3 适配器依赖内置 `fetch`，热重载依赖 `--watch`）
 - 仅三个运行时依赖：`express`、`cos-nodejs-sdk-v5`、`selfsigned`
 - 测试与 lint 不引入运行时依赖：测试使用 Node 内置 `node:test`；ESLint 为可选开发依赖
+
 ---
+
 <h2 id="readme-section5">2. 安装与启动</h2>
+
 ---
+
 ```bash
 npm install
 npm start        # 生产启动
@@ -105,28 +110,65 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 浏览器打开 <http://127.0.0.1:3000>（或自签名 HTTPS 端口）。服务默认**仅监听本机回环地址**，不对局域网开放。
 
 > 若要使用 **Windows Hello**，请改用 <http://localhost:3000> 打开 —— `rpId` 必须是有效域名，以 `127.0.0.1` 这类 IP 字面量访问时部分浏览器会直接拒绝（详见下文「用户管理与 Windows Hello」）。
+
 ---
+
 <h2 id="readme-section6">3. 可用脚本</h2>
+
 ---
+
 | 命令 | 说明 |
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（30 个文件 / 500+ 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（31 个文件 / 500+ 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
+
 ---
-<h2 id="readme-section7">4. Docker 部署</h2>
+
+<h2 id="readme-section7">4. 一键部署脚本与 Docker 部署</h2>
+
 ---
+
+在全新 Linux 服务器（Debian/Ubuntu、RHEL/CentOS/Rocky/Alma、Alpine、openSUSE）上跑一条命令即可完成部署：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh | sudo bash -s -- --domain cos.example.com
+```
+
+脚本会自动安装 git / curl / Node.js 等依赖、从 `https://github.com/xingsenfirst/Kepler.git` 拉取源码、配置 Nginx 反代与 HTTPS 证书、注册 systemd 服务并做健康检查。**只需提供域名**，用户名与密码在打开页面后的首次初始化流程中设置。脚本幂等，重复执行等价于升级 / 修复。
+
+安装完成会注册全局 `kepler` 命令，输入编号回车即可执行：
+
+| 编号 | 作用 | 说明 |
+| --- | --- | --- |
+| 1 | 重新安装 | 按已保存配置重新拉取源码并安装，数据目录不动 |
+| 2 | 修改初始管理员用户名 | 停服后原子改配置，改完自动拉起 |
+| 3 | 修改初始管理员密码 | 同上，密码经管道传入，不出现在命令行与日志里 |
+| 4 | 修改应用端口 | 同步 `.env`、服务与 Nginx 反代配置 |
+| 5 | 卸载 | 清理服务、应用、数据、证书配置与全局命令 |
+| 0 | 退出 | — |
+
+常用参数：`--domain`（必填）、`--port`、`--https-port`、`--http-port`、`--dir`、`--data-dir`、`--mode systemd|docker`、`--tls auto|letsencrypt|selfsigned|none`、`--mirror cn`（国内加速）、`--skip-node` / `--skip-deps` / `--skip-nginx` / `--skip-service`（自行接管某一步）。
+
+> 部署状态保存在 `/etc/kepler/deploy.conf`（0600）：修改端口、重新安装都以它为准，避免重跑时参数丢失；卸载会一并清除该文件。
+
+若更习惯用镜像方式：
+
 ```bash
 docker build -t cos-manager .
 docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 ```
 
 镜像基于 `node:22-alpine`，多阶段构建；以非 root 用户 `node` 运行，`tini` 作为 PID 1 转发信号，`/app/data` 声明为数据卷（**主密钥与配置都在此目录，务必持久化**）。`.dockerignore` 已排除 `data/`，不会将本机密钥打入镜像。
+
 ---
+
 <h2 id="readme-section8">5. 首次配置</h2>
+
 ---
+
 1. 首次打开进入初始化页，创建**管理员账号**并登录。
 2. 自动弹出「系统设置」，在**访问密钥管理**卡片中通过**图标卡片**选择服务商（非下拉菜单），再按该服务商的字段名填入访问密钥（腾讯云为 SecretId / SecretKey，阿里云为 AccessKey ID / AccessKey Secret 等，界面随选择自动切换提示）。
 3. 可点「测试连接」用未保存的密钥先验证，再「保存密钥」。
@@ -138,7 +180,11 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 
 <h1 id="readme-section9">四、使用指南</h1>
 
+---
+
 <h2 id="readme-section10">1. 常用操作</h2>
+
+---
 
 - **浏览**：目录树或双击进入文件夹；面包屑跳级；`←` `→` 前进后退，`↑` / Backspace 返回上一级，`F5` 刷新。
 - **上传**：点击上传选择文件 / 文件夹，或直接拖入窗口；队列内每个任务可暂停 / 继续 / 取消 / 重试。
@@ -147,14 +193,22 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 - **右键菜单**：对象上（打开 / 下载 / 复制链接 / 重命名 / 移动 / 删除）；空白处（刷新 / 新建 / 上传 / 全选）。
 - **搜索**：关键字回车搜索；「筛选」可组合类型 / 修改日期区间 / 大小区间，并可选「仅当前目录」（默认含子目录，勾选后只列直接子项，大目录能快一个数量级）。改关键词或切目录会自动取消上一轮搜索，不为已作废的结果继续翻页。
 - **视图选项**：自定义显示列、排序方向、自动刷新频率（手动 / 5s / 15s / 30s / 60s），保存在浏览器本地。
+
 ---
+
 <h2 id="readme-section11">2. 断点续传</h2>
+
+---
 
 - ≤ 8MB 直传；更大文件自动分片（8MB 起步、按大小自适应），单文件 3 分片并发。启用「文件头魔数」加密时分片固定为 **5MB**（该模式的密钥流是同步生成的，分片越大越会卡住服务；5MB 同时也是 AWS S3 要求的分片下限，不能再小）。
 - 上传中暂停、刷新页面或服务重启后，再次上传同一文件（同路径同大小）会自动对齐云端已传分片并续传。
 - 取消任务会调用分片中止接口清理云端分片，避免产生无用存储费用。
+
 ---
+
 <h2 id="readme-section12">3. 文件加密</h2>
+
+---
 
 在「系统设置 → 文件加密」选择：
 
@@ -169,8 +223,12 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 - **查看密码**（可选）：设置后查看 / 下载加密文件前须验证，通过后获得 30 分钟有效的 HMAC 令牌，令牌**仅通过 `x-enc-token` 请求头**传递；密码以 scrypt 哈希存储，与加密密钥相互独立，忘记可重置。
 - 重命名 / 移动 / 复制 / 删除 / 清空桶全程联动加密元数据；加密对象禁止生成预签名直链。
 - ⚠️ 上传过程中切换加密方式，进行中的分片任务会被拒绝合并（409），请取消后重新上传，避免明文 / 密文混合损坏。
+
 ---
+
 <h2 id="readme-section13">4. 分享与审计</h2>
+
+---
 
 - 链接可设置有效期、可下载次数、访问密码，并可随时修改或删除；托管链接可查看**已下载次数与最近下载时间**（分享下载不记录来源 IP，IP 仅在登录 / 解锁限流的告警日志中出现）。
 - IP 屏蔽规则对**后续请求**立即生效，但无法中断已经开始传输的下载 —— 拉黑只拦截新的请求，已在传输中的响应会跑完。
@@ -178,7 +236,11 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 - 上传过滤：可排除 `.DS_Store`、`Thumbs.db`，或按 `.gitignore` 规则过滤；规则即时生效并持久化（与 Git 一致，`.gitignore` 文件本身仍会上传）。
 - WebDAV：在系统设置中开启并维护账户（应用名 / 用户名 / 密码），第三方客户端以 Basic 认证挂载 `https://127.0.0.1:8443/dav/`。能力声明为 **DAV level 1**：支持 `OPTIONS / PROPFIND / GET / HEAD / PUT / DELETE / MKCOL / MOVE / COPY`，**不实现文件锁**（`LOCK` / `UNLOCK` / `PROPPATCH` 一律回 405）——因此在资源管理器与 Office 里可以直接读写文件，但不能用它们依赖加锁的「锁定式」协同编辑；目录列举超过上限时会通过 `X-WebDAV-Truncated` 响应头与操作日志如实告知，不会静默截断。
 
+---
+
 <h2 id="readme-section14">5. 用户管理与 Windows Hello</h2>
+
+---
 
 **权限划分**（接口层强校验，前端隐藏仅为第一层）：
 
@@ -201,25 +263,35 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 
 **启用 Windows Hello**：点击右上角账户菜单 →「编辑资料」，勾选 **Windows Hello 验证**，输入**当前密码**确认后系统立即唤起 Windows Hello（指纹 / 面容 / PIN），注册成功即生效。管理员在「用户管理」列表对自己一行点编辑可见同一开关（两处入口共用同一套可用性判定与注册流程）；对他人仅提供「清除其 Windows Hello 凭据」——Windows Hello 必须在**用户本人的设备**上完成生物识别，无法代为启用。
 
-```
-
 > 验证码与 Windows Hello 为串联关系而非互斥关系：两者同时开启时各自生效；只开启其中之一也能正常登录。
 
 **记住登录状态**：登录页勾选后会话有效期由 24 小时延长至 **30 天**，Cookie 的 `Max-Age` 由会话剩余有效期推导（二者同源）。浏览器本地**仅保存用户名，不保存密码**（localStorage 为明文可读存储）。Windows Hello 两步登录同样支持该选项。
 
 **关闭 / 换设备**：在账户菜单「编辑资料」中取消勾选并输入密码即可关闭。若更换设备或重装系统导致凭据失效又无法登录，可由**管理员在用户管理中清除该用户的凭据**（与重置密码同级的救济通道）。
 
+---
+
 <h2 id="readme-section15">6. 安全告知</h2>
+
+---
 
 > 本项目为个人项目，未经企业级安全审计，请勿直接用于企业生产环境。
 
-设计取舍与技术限制的完整清单见 [Develop_Document.md]。
+设计取舍与技术限制的完整清单见 [Develop_Document.md](./Develop_Document.md)。
+
+---
 
 <h2 id="readme-section16">7. 付费下载</h2>
 
+---
+
 分享链接可单独设置为「需付费下载」，下载者完成支付后才取得下载权限。**现阶段仅支持人民币（CNY），最低 0.01 元**。
 
+---
+
 <h2 id="readme-section17">8. 订单管理</h2>
+
+---
 
 侧边栏「订单管理」（仅管理员可见）列出全部付费订单，视觉与「链接管理」一致：
 
@@ -238,6 +310,10 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 
 **退款是记账动作，不是资金操作**：本系统不代持资金（下载者付的钱不经过本机），真实退款在对应的支付渠道后台完成。点击「退款」经二次确认后，系统只把该订单标记为「已退款」：订单整行划线失效、支付凭证立即失效（下载者需重新支付），且这笔金额从「已收」中扣除。该标记不可逆 —— 网关查单仍会回答"已支付"，但系统不会据此复活已退款的订单。
 
+---
+
 <h1 id="readme-section18">五、开源协议</h1>
+
+---
 
 本项目采用 **WTFPL** 许可证（见 `package.json`）。

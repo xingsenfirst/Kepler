@@ -776,6 +776,12 @@ collect_config() {
   DOMAIN="${DOMAIN,,}"
   DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"
   DOMAIN="${DOMAIN%%/*}"
+  # 把「域名:端口」整段粘进来是很常见的输入。带端口的取值会被 is_ip_addr 当成 IP
+  # 放行（它只看到冒号），后果是：静默降级成自签名证书 + server_name 里带着端口让
+  # nginx -t 失败（用户在 nginx 那步看到一堆看不懂的报错）。这里一次说清楚。
+  if [[ "$DOMAIN" =~ ^[^:]+:[0-9]+$ ]]; then
+    die "域名里不要带端口：${DOMAIN}（端口请用 --https-port / --http-port 指定，例如：--domain ${DOMAIN%%:*} --https-port ${DOMAIN##*:}）"
+  fi
   if ! is_valid_domain "$DOMAIN" && ! is_ip_addr "$DOMAIN"; then
     die "域名格式不合法：$DOMAIN"
   fi
@@ -1200,18 +1206,32 @@ install_nginx() {
     ok "Nginx 已安装：$(nginx -v 2>&1 | sed 's/.*nginx\///' || true)"
   else
     info "安装 Nginx…"
-    pkg_install nginx
+    # 这里用 pkg_run_pm（失败只给退出码、不中断）而不是 pkg_install：
+    #   ① RHEL 系的 nginx 在 EPEL 源里，第一枪打不中是常态，得先补源再打第二枪。
+    #      若走 pkg_install，第一次失败就已经 die 了 —— 下面的 EPEL 兜底和整段
+    #      「对症」提示（含 --skip-nginx 逃生口）永远轮不到执行，用户只看到
+    #      「软件包安装失败：nginx」。
+    #   ② 失败原因与修法统一交给下面的提示层，信息比通用诊断更具体。
+    mark_log
+    pkg_run_pm nginx || true
     if ! have nginx && [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
       # RHEL 系的 nginx 在 EPEL 源里
       info "未找到 nginx，尝试启用 EPEL 源后重试…"
       run_soft "$PM" install -y epel-release
-      if ! have nginx; then pkg_install nginx; fi
+      if ! have nginx; then pkg_run_pm nginx || true; fi
     fi
     # 系统包装不上，再找一遍面板/编译版（很多机器其实已经有 nginx，只是没进 PATH）
     if ! have nginx; then locate_nginx; fi
     if ! have nginx; then
       HINTS=()
       add_hint "Nginx 是外网访问的入口（TLS 终结 + 反向代理）。可这样修："
+      add_hint ""
+      add_hint "  已尝试：$(pm_install_cmd) nginx"
+      if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        add_hint "  已尝试：启用 EPEL 源（$(epel_rpm_cmd)）后再装"
+      fi
+      local l
+      while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 4)"
       add_hint ""
       case "$PM" in
         apt)
@@ -1247,6 +1267,41 @@ install_nginx() {
   nginx_detect_layout || true
 }
 
+# 主配置里「http{} 第一层」的 include 通配目录。
+#
+# 为什么必须认上下文，而不是「主配置里任意一个通配 include 目录」：
+# Debian/Ubuntu 的 /etc/nginx/nginx.conf 顶层（http{} 之外）就有
+#   include /etc/nginx/modules-enabled/*.conf;
+# 而 /etc/nginx/modules-enabled 在装了 nginx 的 Debian/Ubuntu 上必然存在 ——
+# 只挑「第一个存在的通配 include 目录」，就会把站点配置写进那里，于是 server{}
+# 落在 main 上下文里，nginx -t 直接报
+#   "server" directive is not allowed here
+# 部署就在这里断掉（Debian/Ubuntu 是最常见的部署目标）。
+# 站点配置只能落在 http 上下文，所以只采信 http{} 直接内部的 include（嵌套在
+# server{} 里的 include 如 /etc/nginx/default.d 也排除）。
+nginx_http_include_dirs() {
+  local conf="$1"
+  [[ -r "$conf" ]] || return 0
+  awk '
+    BEGIN { depth = 0; inside = 0; http_depth = 0 }
+    {
+      code = $0
+      sub(/#.*/, "", code)                                   # 去掉行内注释
+      is_http_open = (!inside && code ~ /^[[:space:]]*http[[:space:]]*\{/)
+      if (inside && !is_http_open && depth == http_depth && match(code, /include[[:space:]]+[^;]+;/)) {
+        d = substr(code, RSTART, RLENGTH)
+        sub(/^include[[:space:]]+/, "", d)
+        sub(/;$/, "", d)
+        gsub(/"/, "", d)
+        if (d ~ /\*/) { sub(/\/[^\/]*$/, "", d); if (d != "") print d }
+      }
+      depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+      if (is_http_open) { inside = 1; http_depth = depth }
+      else if (inside && depth < http_depth) inside = 0
+    }
+  ' "$conf" 2>/dev/null || true
+}
+
 # 探测 Nginx 的真实配置体系。
 # 很多机器（宝塔/AMH/自建编译/官方镜像）的 nginx 并不用 /etc/nginx/conf.d：
 # 直接照抄 Debian/RHEL 惯例写过去，配置根本不会被 include，站点也就不会生效。
@@ -1264,20 +1319,15 @@ nginx_detect_layout() {
   [[ -n "$NGINX_CONF_PATH" ]] || NGINX_CONF_PATH="/etc/nginx/nginx.conf"
   local main_dir; main_dir="$(dirname "$NGINX_CONF_PATH")"
 
-  # 候选目录：① 主配置里带通配符的 include 目录（最可信）② 主配置同级 conf.d
-  #           ③ 面板常见 vhost 目录 ④ 发行版惯例目录
+  # 候选目录：① 主配置 http{} 内的通配 include 目录（最可信）
+  #           ② 主配置同级 conf.d ③ 面板常见 vhost 目录 ④ 发行版惯例目录
   local -a cands=()
-  if [[ -r "$NGINX_CONF_PATH" ]]; then
-    local inc d
-    while IFS= read -r inc; do
-      [[ "$inc" == *'*'* ]] || continue          # 只认通配 include（排除 mime.types 之类）
-      d="${inc%/*}"
-      [[ "$d" == "$inc" ]] && continue
-      [[ "$d" == /* ]] || d="${main_dir}/${d}"    # 相对路径按主配置目录拼接
-      cands+=("$d")
-    done < <(grep -oE 'include[[:space:]]+[^;]+;' "$NGINX_CONF_PATH" 2>/dev/null \
-             | sed -E 's/include[[:space:]]+//; s/;$//; s/^"//; s/"$//' || true)
-  fi
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == /* ]] || d="${main_dir}/${d}"    # 相对路径按主配置目录拼接
+    cands+=("$d")
+  done < <(nginx_http_include_dirs "$NGINX_CONF_PATH")
   cands+=("${main_dir}/conf.d" "/www/server/panel/vhost/nginx" "/etc/nginx/conf.d" "/etc/nginx/sites-enabled")
 
   local c
@@ -2202,16 +2252,10 @@ external_check() {
   return 0
 }
 
-# 把普通字符串编码成 JSON 字符串字面量（不含外层引号），用于安全地把值传进 node -e
-json_quote() {
-  local s="${1-}" out=""
-  out="${s//\\/\\\\}"
-  out="${out//\"/\\\"}"
-  out="${out//$'\n'/\\n}"
-  out="${out//$'\r'/\\r}"
-  out="${out//$'\t'/\\t}"
-  printf '%s' "$out"
-}
+# 注意：改管理员凭据时，值一律**原样**经 stdin 送给 node（见 update_initial_admin）。
+# 不要在这里加任何「转义/编码」步骤：值走的是管道而不是命令行，不需要转义，而多一次
+# 转义就会把反斜杠、引号、制表符变成字面字符写进真实密码 —— 表现为「提示修改成功，
+# 但用原密码登不上」。
 
 # ------------------------------------------------------------------------------
 # 12. 全局管理命令与运行中配置维护
@@ -2271,11 +2315,10 @@ process.stdin.on('end', () => { main().catch(fail); });
 
 async function main() {
   const field = process.argv[1];
-  let value = input.replace(/\r?\n$/, '');
-  try {
-    const decoded = JSON.parse(input);
-    if (typeof decoded === 'string') value = decoded;
-  } catch (e) { /* 非 JSON 输入（无换行结尾的管道）时按原文处理 */ }
+  // 值由 deploy.sh 原样经 stdin 送达（systemd / docker 两条分支完全一致）。
+  // 这里刻意不做 JSON 解析：若值恰好长得像 JSON 字符串字面量（比如密码就是
+  // "abc123" 连着引号），JSON.parse 会把引号「解码」掉，用户拿原密码就登不上了。
+  const value = input.replace(/\r?\n$/, '');
   const admins = store.listUsers()
     .filter((user) => user.role === 'admin')
     .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
@@ -2301,7 +2344,9 @@ NODE
   managed_service_stop
   local rc=0
   if [[ "$MODE" == "docker" ]]; then
-    if (cd "$INSTALL_DIR" && printf '%s' "$(json_quote "$value")" | docker compose run --rm --no-deps -T --entrypoint node "$SERVICE_NAME" -e "$script" "$field") >>"$LOG_FILE" 2>&1; then
+    # 值经 stdin 原样传入：两条分支必须完全一致，否则会出现「同样的密码在 docker 方式下
+    # 被写错」—— 曾经这里包了一层转义，把反斜杠/引号/制表符写进了真实密码。
+    if (cd "$INSTALL_DIR" && printf '%s' "$value" | docker compose run --rm --no-deps -T --entrypoint node "$SERVICE_NAME" -e "$script" "$field") >>"$LOG_FILE" 2>&1; then
       :
     else
       rc=$?

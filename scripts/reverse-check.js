@@ -1254,6 +1254,81 @@ const CASES = [
       testFile: 'invariants.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * 部署脚本（deploy.sh）此前完全没有登记反向对照 —— 它的护栏只在
+       * tests/deploy-script.test.js 里，退不回旧实现就等于没验证过。
+       * Debian/Ubuntu 的 nginx.conf 顶层就有 include /etc/nginx/modules-enabled/*.conf;
+       * （动态模块目录，位于 http{} 之外），而该目录在装了 nginx 的机器上必然存在。
+       * 退回「主配置里任意通配 include 目录」的挑法后，站点配置会被写进 modules-enabled，
+       * server{} 落在 main 上下文 → nginx -t 报 "server" directive is not allowed here。
+       */
+      name: 'D1-01 · nginx 站点目录退回「任意通配 include 目录」（Debian 会选中 modules-enabled）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: '    [[ -n "$d" ]] || continue',
+          replacement: '    [[ "$d" == *\'*\'* ]] || continue\n    d="${d%/*}"',
+        },
+        {
+          anchor: '  done < <(nginx_http_include_dirs "$NGINX_CONF_PATH")',
+          replacement: "  done < <(grep -oE 'include[[:space:]]+[^;]+;' \"$NGINX_CONF_PATH\" 2>/dev/null | sed -E 's/include[[:space:]]+//; s/;$//; s/^\"//; s/\"$//' || true)",
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 值经 stdin 传进 node，本来不需要转义；多包一层「安全转义」会把反斜杠、引号、
+       * 制表符变成字面字符写进真实密码 —— 提示成功却登不上，且只有特殊字符才触发。
+       */
+      name: 'D1-02 · 改管理员凭据退回「先转义再传值」（docker 分支写坏真实密码）',
+      file: 'deploy.sh',
+      anchor: 'printf \'%s\' "$value" | docker compose run',
+      replacement: 'printf \'%s\' "${value//\\\\/\\\\\\\\}" | docker compose run',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 值若恰好长得像 JSON 字符串字面量（密码就是 "abc123" 连着引号），
+       * JSON.parse 会把引号「解码」掉 → 用户拿原密码登不上。
+       */
+      name: 'D1-03 · 内联脚本退回 JSON.parse 解码（密码长得像 JSON 字面量时被改坏）',
+      file: 'deploy.sh',
+      anchor: "  const value = input.replace(/\\r?\\n$/, '');",
+      replacement: "  let value = input.replace(/\\r?\\n$/, '');\n"
+        + "  try { const decoded = JSON.parse(input); if (typeof decoded === 'string') value = decoded; } catch (e) {}",
+      testFile: 'deploy-script.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * pkg_install 失败即 die → 它后面的 EPEL 兜底与整段「对症」提示（含 --skip-nginx）
+       * 全是死代码；而 RHEL 系 nginx 在 EPEL 里，第一枪打不中是常态。
+       */
+      name: 'D1-04 · nginx 安装退回会中断的 pkg_install（EPEL 兜底与对症提示成死代码）',
+      file: 'deploy.sh',
+      anchor: '    pkg_run_pm nginx || true',
+      replacement: '    pkg_install nginx',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 放行「域名:端口」的后果：is_ip_addr 只看到冒号就当成 IP → 静默改自签名证书，
+       * server_name 里带端口又让 nginx -t 失败，用户在最难懂的一步卡住。
+       */
+      name: 'D1-05 · 删掉「域名带端口」校验（静默自签名 + server_name 带端口打挂 nginx -t）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$DOMAIN" =~ ^[^:]+:[0-9]+$ ]]; then\n'
+        + '    die "域名里不要带端口：${DOMAIN}（端口请用 --https-port / --http-port 指定，例如：--domain ${DOMAIN%%:*} --https-port ${DOMAIN##*:}）"\n'
+        + '  fi',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

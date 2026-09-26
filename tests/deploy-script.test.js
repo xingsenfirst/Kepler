@@ -390,3 +390,198 @@ test('deploy.sh：卸载白名单不得误伤正常安装目录', () => {
     '个人目录要按路径组件精确匹配（Desktop/Downloads/Documents）');
   assert(/拒绝递归删除系统目录|\/usr\/local/.test(body), '系统目录白名单必须显式列出并拒绝');
 });
+
+/**
+ * 跑一段 bash 片段（cwd 在仓库根，里面可以 `source ./deploy.sh`）。
+ * 与 spawnBash 同理用**异步 spawn**，且必须容忍片段以非 0 退出（被测代码会 die）。
+ */
+function spawnBashSnippet(script, extraEnv) {
+  return new Promise((resolve) => {
+    const child = spawn('bash', ['-c', script], {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...(extraEnv || {}) },
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => resolve({ unavailable: e.code || String(e) }));
+    child.on('close', (code) => resolve({ code, out, err }));
+  });
+}
+
+test('deploy.sh：站点配置必须落在主配置 http{} 里 include 的目录（Debian 的 modules-enabled 陷阱）', async () => {
+  const src = readDeploy();
+  assert(hasFn(src, 'nginx_http_include_dirs'),
+    '必须按「include 是否位于 http{} 内」筛候选目录：只挑「主配置里任意一个通配 include 目录」会在 Debian/Ubuntu 上选中 modules-enabled');
+
+  // 真实形态：Debian/Ubuntu 的 nginx.conf 顶层就有 include .../modules-enabled/*.conf;
+  // （动态模块目录，在 http{} 之外），而该目录在装了 nginx 的机器上必然存在。
+  // 站点配置写进去 → server{} 落在 main 上下文 → nginx -t 报
+  // 「"server" directive is not allowed here」，部署就在这里断掉。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/bin" "$T/etc/nginx/modules-enabled" "$T/etc/nginx/conf.d"
+cat > "$T/etc/nginx/nginx.conf" <<EOF
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include $T/etc/nginx/modules-enabled/*.conf;
+
+events {
+	worker_connections 768;
+}
+
+http {
+	include $T/etc/nginx/mime.types;
+	include $T/etc/nginx/conf.d/*.conf;
+	include $T/etc/nginx/sites-enabled/*;
+}
+EOF
+cat > "$T/bin/nginx" <<EOF
+#!/bin/sh
+if [ "\\$1" = "-V" ]; then
+  printf 'nginx version: nginx/1.24.0\\n'
+  printf 'configure arguments: --conf-path=$T/etc/nginx/nginx.conf\\n'
+fi
+EOF
+chmod +x "$T/bin/nginx"
+PATH="$T/bin:$PATH" nginx_detect_layout >/dev/null 2>&1 || true
+printf 'CONF=%s\\n' "$NGINX_CONF"
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  const conf = (all.match(/CONF=(.+)/) || [])[1] || '';
+  assert(!conf.includes('modules-enabled'),
+    `站点配置不得写进 modules-enabled（那是 http{} 之外的主上下文，server{} 会直接报错）：${conf}`);
+  assert(/\/etc\/nginx\/conf\.d\/kepler\.conf$/.test(conf),
+    `http{} 内 include 的 conf.d 才是站点配置该落的地方，实际选中：${conf}`);
+});
+
+test('deploy.sh：改管理员凭据必须原样传值（转义会写进真实密码）', () => {
+  const src = readDeploy();
+  // 注意：不能用 fnBody() —— 它会停在 heredoc 里第一个行首 `}`，
+  // 而两条取值分支恰好写在 heredoc 之后。
+  const start = src.indexOf('\nupdate_initial_admin() {');
+  const end = src.indexOf('\nprompt_admin_username() {', start);
+  assert(start !== -1 && end > start, 'update_initial_admin() 的结构变了，护栏需要同步');
+  const body = codeOnly(src.slice(start, end));
+
+  assert(!/json_quote/.test(src),
+    '值经 stdin 传递，不需要转义函数：多包一层转义会把反斜杠/引号/制表符变成字面字符写进真实密码（提示成功却登不上）');
+  assert(/printf '%s' "\$value" \| docker compose run/.test(body),
+    'docker 分支必须把原值直接交给 stdin，不得再套一层编码');
+  assert(/printf '%s' "\$value" \| env NODE_ENV=production/.test(body),
+    'systemd 分支同样必须原样传值（两条分支必须一致，否则「同样的密码换个部署方式就登不上」）');
+
+  const inline = extractInlineScript();
+  assert(!/JSON\.parse\(/.test(inline),
+    '内联脚本不得解析 JSON：值若恰好长得像 JSON 字符串字面量（密码就是 "abc123" 带引号），会被解码成 abc123');
+  assert(/const value = input\.replace/.test(inline), '必须按 stdin 原文取值');
+});
+
+test('deploy.sh：改管理员密码在特殊字符下真实生效（真实 node 管道）', async () => {
+  // 覆盖历史上会被静默改写的取值：引号、反斜杠、制表符，以及「长得像 JSON 字符串」的密码。
+  // 脚本/密码/数据目录一律经**环境变量**递进去：拼进双引号命令串会被 bash 展开
+  // `${...}` 与反引号，等于测了个假样本。
+  const script = extractInlineScript();
+  const tricky = ['a"bcd123', 'back\\slash123', 'tab\tinside', '"abc123"'];
+  for (const pass of tricky) {
+    const { tmp, dataDir } = tempDataDir('kepler-deploy-exact-');
+    try {
+      await seedAdmin(dataDir);
+      const r = await spawnBashSnippet(
+        'printf \'%s\' "$KEPLER_PASS" | env NODE_ENV=production COS_DATA_DIR="$KEPLER_DATA" '
+        + 'node -e "$KEPLER_INLINE" password',
+        { KEPLER_INLINE: script, KEPLER_PASS: pass, KEPLER_DATA: dataDir },
+      );
+      if (r.unavailable) return;
+      assert.strictEqual(r.code, 0, `改密码不应失败（${pass}）：${r.err}`);
+      const mod = freshRequireStore(dataDir);
+      const store = mod.require(CONFIG_STORE);
+      const admin = store.listUsers().find((u) => u.role === 'admin');
+      const loggedIn = await store.authenticateUser(admin.username, pass);
+      assert.strictEqual(loggedIn ? loggedIn.username : null, 'admin',
+        `密码必须原样落盘，才能用「用户输入的原文」登录：${JSON.stringify(pass)}`);
+      const stale = await store.authenticateUser(admin.username, 'Old' + 'Pass123');
+      assert.strictEqual(stale, null, '旧密码必须立即失效');
+    } finally {
+      delete process.env.COS_DATA_DIR;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+test('deploy.sh：nginx 装不上时必须走到对症提示（不得被通用失败出口截胡）', async () => {
+  const body = codeOnly(fnBody(readDeploy(), 'install_nginx'));
+  assert(/pkg_run_pm nginx/.test(body),
+    'nginx 安装要先用「不中断」的调用：RHEL 系第一枪常常打不中（包在 EPEL 里），走 pkg_install 会直接 die');
+  assert(!/pkg_install nginx/.test(body),
+    '不得用会 die 的 pkg_install 装 nginx：它一失败就中断，下面的 EPEL 兜底与对症提示全成死代码');
+  assert(body.indexOf('epel-release') < body.indexOf('die_with_hint "Nginx 安装失败"'),
+    'EPEL 兜底必须夹在「尝试安装」与「判失败」之间');
+
+  // 行为验证：系统装包一律失败 + RHEL 系，非交互执行
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+PM=dnf
+ASSUME_YES=0
+pkg_run_pm() { return 1; }
+run_soft() { return 0; }
+locate_nginx() { return 1; }
+have() { case "$1" in nginx) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+out="$( install_nginx 2>&1 </dev/null )"
+rc=$?
+printf '%s\\n' "$out"
+printf 'RC=%s\\n' "$rc"
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert(/RC=1/.test(all), `装不上 nginx 应以非 0 退出：${all.slice(0, 300)}`);
+  assert(/epel-release/.test(all),
+    `RHEL 系失败后必须真的去启用 EPEL 重试（这行兜底以前永远执行不到）：${all.slice(0, 400)}`);
+  assert(/--skip-nginx/.test(all),
+    `必须给出对症提示与 --skip-nginx 逃生口（以前只会看到「软件包安装失败：nginx」）：${all.slice(0, 400)}`);
+  assert(!/软件包安装失败：nginx/.test(all),
+    '不得掉进通用失败出口：那意味着 nginx 专属诊断全部不可达');
+});
+
+test('deploy.sh：域名带端口必须当场拒绝（否则静默降级 + nginx -t 失败）', async () => {
+  const src = readDeploy();
+  assert(/域名里不要带端口/.test(src), '必须在 collect_config 里显式拒绝「域名:端口」');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+MODE=systemd; INSTALL_DIR=/opt/kepler; DATA_DIR=""; TLS_MODE=auto
+SUB_PATH=/; EMAIL=""; REPO_URL="https://example.com/x.git"
+APP_PORT=3000; HTTP_PORT=80; HTTPS_PORT=443
+for d in "example.com:8080" "https://cos.example.com:8443/" "1.2.3.4:80" "cos.example.com" "2001:db8::1"; do
+  DOMAIN="$d"
+  out="$( collect_config 2>&1 )"
+  rc=$?
+  if grep -q '不要带端口' <<<"$out"; then verdict=拒绝; else verdict=放行; fi
+  printf 'CASE %-32s rc=%s %s\\n' "$d" "$rc" "$verdict"
+done
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  const line = (d) => (all.split('\n').find((l) => l.includes(`CASE ${d}`)) || '').trim();
+  assert(/rc=1 拒绝/.test(line('example.com:8080')),
+    `带端口的域名必须当场拒绝（放行会导致：静默改自签名证书 + server_name 带端口让 nginx -t 失败）：${all.slice(0, 300)}`);
+  assert(/rc=1 拒绝/.test(line('https://cos.example.com:8443/')),
+    '整段 URL 粘进来也要拒绝，并提示端口该用哪个参数传');
+  // 正反两面都要测：只测「该拒绝的都拒绝了」，坏实现（一律拒绝）会全绿
+  assert(/rc=0 放行/.test(line('cos.example.com')), '正常域名必须放行');
+  assert(/rc=0 放行/.test(line('2001:db8::1')), 'IPv6 字面量必须放行（不能把冒号一律当成端口）');
+});

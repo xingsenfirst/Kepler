@@ -555,3 +555,56 @@ test('项目内 Markdown 表格一律使用紧凑型布局（不得用 pad 对�
   assertEqual(bad.join('\n'), '',
     `以下 Markdown 仍是 pad 布局（单元格填充空格或分隔行被拉长）：\n${bad.join('\n')}`);
 });
+
+/**
+ * 一键安装命令护栏
+ *
+ * ## 背景
+ * README 与 deploy.sh 头注释里那条「从网上取 deploy.sh 并执行」的命令，原先写成
+ * `curl -fsSL <url> | sudo bash`。它**看着**没问题（带了 -f），但这个家族的坑全落在
+ * 两个字符上，且后果统一是「用户拿到一句根本看不懂的报错」：
+ *
+ *   1) 不带 `-f`：curl 收到 404 **仍返回 0**，把 14 字节响应体「404: Not Found」
+ *      原样写进 deploy.sh，执行它就是
+ *      `./deploy.sh: line 1: 404:: command not found`（退出码 127）——本仓确实收到过
+ *      这条报错，排查方向全被带偏到脚本语法上。
+ *   2) 纯管道：`curl … | sudo bash` 的 `$?` 取到的是**右侧 bash 的 0**，
+ *      下载失败会被上层当成成功（实测 curl 那侧是 22，但被管道吞掉）。
+ *
+ * 因此这里钉住三件事：地址必须指向本仓库（防仓库/分支改名后静默 404）、必须带 `-f`、
+ * 不得用裸管道把下载内容直接喂给解释器。「仓库地址」的单一事实源是 package.json 的
+ * `repository` 字段。
+ */
+test('文档：一键安装命令必须 fail-fast（-f + 先落盘再执行），且地址指向本仓库', () => {
+  const repoUrl = JSON.parse(readDoc('package.json')).repository.url;
+  const parsed = /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/.exec(repoUrl);
+  assert(parsed, `package.json 的 repository.url 应为 GitHub 仓库地址，实际：${repoUrl}`);
+  const [, owner, repo] = parsed;
+
+  const hits = [];
+  for (const file of [README, 'deploy.sh']) {
+    readDoc(file).split('\n').forEach((line, i) => {
+      const m = /raw\.githubusercontent\.com\/\S*/.exec(line);
+      if (m) hits.push({ file, line: i + 1, text: line, url: m[0] });
+    });
+  }
+  assert(hits.length >= 2,
+    `README 与 deploy.sh 头注释都应给出一键安装命令（实际命中 ${hits.length} 处）`);
+
+  for (const h of hits) {
+    const where = `${h.file}:${h.line}`;
+
+    // ① 地址必须指向本仓库 main 分支下的 deploy.sh —— 写错就是 404
+    assertEqual(h.url, `raw.githubusercontent.com/${owner}/${repo}/main/deploy.sh`,
+      `${where} 的下载地址与本仓库不一致（package.json → ${owner}/${repo}）：地址写错即 404，用户只会收到一句 404:: command not found`);
+
+    // ② 必须带 -f / --fail
+    const flags = [...h.text.matchAll(/(?:^|\s)(-[A-Za-z]+)\b/g)].map((x) => x[1]);
+    assert(flags.some((f) => f.includes('f')) || /--fail/.test(h.text),
+      `${where} 的 curl 缺少 -f/--fail：不带它时 404 也返回 0，会把「404: Not Found」存成脚本再执行`);
+
+    // ③ 不得用裸管道把下载内容直接喂给解释器
+    assert(!/\|\s*(?:sudo\s+)?(?:bash|sh)\b/.test(h.text),
+      `${where} 不得写成 \`curl … | bash\`：管道下 $? 是右侧 bash 的 0，下载失败会被当成成功；应改成先落盘、再 && 执行`);
+  }
+});

@@ -189,7 +189,7 @@ main/
 │   ├── share-deleted.test.js # 分享链接「对象已删除」标记与惰性探测
 │   ├── config-verify-permission.test.js # POST /config/verify 的权限边界
 │   ├── docs-sync.test.js   # 文档清单同步护栏（目录结构 / 模块数 / 环境变量表）
-│   ├── deploy-script.test.js # 部署脚本护栏：状态持久化 / 全局 kepler 命令 / 菜单编号与分支对应、改初始管理员凭据的内联脚本（vm 内跑真实 config-store）、改密取值必须原样落盘、Nginx 站点目录探测（Debian modules-enabled 陷阱）、nginx 装不上时的兜底可达性、域名带端口校验
+│   ├── deploy-script.test.js # 部署脚本护栏：状态持久化 / 全局 kepler 命令 / 菜单编号与分支对应、改初始管理员凭据的内联脚本（vm 内跑真实 config-store）、改密取值必须原样落盘、Nginx 站点目录探测（Debian modules-enabled 陷阱）、nginx 装不上时的兜底可达性、域名带端口校验、重装前对安装目录脚本的完整性预检（shebang + bash -n 双检）
 │   ├── audit-regressions.test.js  # 回归护栏
 │   ├── audit3-regressions.test.js # 第三轮审计护栏
 │   ├── audit5-regressions.test.js # 第五轮审计护栏

@@ -14,6 +14,10 @@
     "node": ">=18"
   },
   "license": "WTFPL",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xingsenfirst/Kepler.git"
+  },
   "dependencies": {
     "cos-nodejs-sdk-v5": "^2.14.0",
     "express": "^4.19.2",

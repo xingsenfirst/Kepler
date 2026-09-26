@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# shell 脚本必须是 LF。CRLF 会让首行变成 "#!/usr/bin/env bash\r"，在 Linux / MSYS 上
+# 直接报 bad interpreter；而上面的 `* text=auto` 只管「入库时归一化」，检出成什么换行
+# 取决于各人机器的 core.autocrlf（Git for Windows 的默认值就是 true）。
+# 显式钉住 eol=lf，任何人 clone 下来拿到的都是可直接执行的脚本。
+*.sh text eol=lf

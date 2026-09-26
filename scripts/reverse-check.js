@@ -1329,6 +1329,37 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * 删掉重装前的完整性预检后，安装目录里若躺着一个坏掉的 deploy.sh
+       * （最典型：curl 不带 -f 把 14 字节的「404: Not Found」存成了它），
+       * exec 出去就是一句「404: line 1: 404:: command not found」—— 用户完全无从下手。
+       */
+      name: 'D1-06 · 删掉重装前的脚本完整性预检（坏脚本被直接 exec）',
+      file: 'deploy.sh',
+      anchor: '  if ! head -n1 "$target" | grep -qE \'^#!.*(bash|sh)\\b\' || ! bash -n "$target" 2>/dev/null; then\n'
+        + '    die "安装目录内的部署脚本不完整或已损坏：${target}（无法重装，请重新执行一键部署）"\n'
+        + '  fi',
+      replacement: '  : # 完整性预检已被反向对照移除',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 一键安装命令退回「裸管道 + 不带 -f」：curl 收到 404 仍返回 0，
+       * 会把 14 字节的「404: Not Found」原样存成 deploy.sh；即使带 -f，
+       * 管道下 $? 取到的也是右侧 bash 的 0，下载失败会被当成成功。
+       * 注意锚点必须落在 README（.md 只剥 HTML 注释）——deploy.sh 里这条命令
+       * 整段都是 `#` 注释，纯注释锚点会被不变量检查判为「剥注释后无法验证」。
+       */
+      name: 'D1-07 · 一键安装命令退回「curl … | sudo bash」（去掉 -f 后 404 会被存成脚本）',
+      file: 'README.md',
+      anchor: 'curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh \\\n'
+        + '  && sudo bash /tmp/kepler-deploy.sh --domain cos.example.com',
+      replacement: 'curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh | sudo bash -s -- --domain cos.example.com',
+      testFile: 'docs-sync.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

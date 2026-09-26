@@ -3,7 +3,13 @@
 # deploy.sh —— Kepler 对象存储管理系统 · 一键部署脚本
 #
 # 目标：在一台全新的 Linux 服务器上，只执行一条命令即可完成部署：
-#   curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh | sudo bash -s -- --domain cos.example.com
+#   curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh \
+#     && sudo bash /tmp/kepler-deploy.sh --domain cos.example.com
+#
+#   这里刻意用「先落盘、校验通过再执行」而不是 `curl … | sudo bash`：不带 -f 时 curl 收到
+#   404 仍返回 0，会把 14 字节的 "404: Not Found" 原样存成脚本，执行时报
+#   `./deploy.sh: line 1: 404:: command not found`；而纯管道写法连失败都测不出来
+#   （$? 取到的是右侧 bash 的 0）。地址/分支/仓库名任一写错都会走到这一条。
 #
 # 脚本会依次完成：
 #   1) 自动识别包管理器并安装 git、curl、ca-certificates、tar 等基础工具
@@ -22,7 +28,8 @@
 #     而不是只甩一段日志。装不了的东西（Node/Nginx/依赖）都能用 --skip-* 跳过。
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh | sudo bash -s -- --domain cos.example.com
+#   curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh \
+#     && sudo bash /tmp/kepler-deploy.sh --domain cos.example.com
 #   sudo bash deploy.sh --domain cos.example.com [选项]
 #   kepler                    # 安装完成后的交互式管理菜单
 #
@@ -2447,6 +2454,16 @@ prompt_port_change() {
 reinstall_now() {
   local target="${INSTALL_DIR}/deploy.sh"
   [[ -f "$target" ]] || die "未找到安装目录内的部署脚本：${target}（无法重装，请重新执行一键部署）"
+  # 完整性预检：安装目录里的脚本可能已被覆盖成非脚本内容（最典型的是把下载到的
+  # 「404: Not Found」响应体存成了它）。不预检就直接 exec，用户只会看到一句莫名其妙的
+  # 「404: line 1: 404:: command not found」，完全无从下手。
+  #   · shebang 检查 —— 拦「内容不是脚本」：`404: Not Found` 在 bash 眼里是一条**语法合法**
+  #     的命令（bash -n 会放行），只有首行不是 shebang 才能识破；
+  #   · bash -n —— 拦「是脚本但被截断/改坏」：首行 shebang 还在、后面引号没闭合。
+  # 两者互补，缺一不可。
+  if ! head -n1 "$target" | grep -qE '^#!.*(bash|sh)\b' || ! bash -n "$target" 2>/dev/null; then
+    die "安装目录内的部署脚本不完整或已损坏：${target}（无法重装，请重新执行一键部署）"
+  fi
   info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装。"
   plain "  数据目录 ${DATA_DIR} 不会被触碰；重装结束后会重跑健康检查。"
   trap - EXIT

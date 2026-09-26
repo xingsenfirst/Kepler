@@ -585,3 +585,47 @@ done
   assert(/rc=0 放行/.test(line('cos.example.com')), '正常域名必须放行');
   assert(/rc=0 放行/.test(line('2001:db8::1')), 'IPv6 字面量必须放行（不能把冒号一律当成端口）');
 });
+
+test('deploy.sh：重装前必须识破「安装目录里的脚本已损坏」（不得把它当脚本执行）', async () => {
+  const body = codeOnly(fnBody(readDeploy(), 'reinstall_now'));
+  assert(/head -n1 "\$target" \| grep -qE/.test(body),
+    'reinstall_now 必须检查首行 shebang：「404: Not Found」在 bash 眼里是一条**语法合法**的命令（bash -n 会放行），只有 shebang 检查能识破它');
+  assert(/bash -n "\$target"/.test(body),
+    'reinstall_now 还必须用 bash -n 兜住另一种坏法：shebang 还在、内容被截断或改坏');
+  assert(/die /.test(body), '预检不通过必须给人话错误，而不是继续 exec 一个坏文件');
+
+  const { tmp } = tempDataDir('kepler-deploy-reinstall-');
+  try {
+    const installDir = path.join(tmp, 'install').replace(/\\/g, '/');
+    fs.mkdirSync(installDir, { recursive: true });
+    const target = path.join(installDir, 'deploy.sh');
+    const snippet = `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+INSTALL_DIR=${JSON.stringify(installDir)}
+reinstall_now
+`;
+
+    // 反面：内容是「下载到的 404 响应体」—— 这正是 curl 不带 -f 的后果。
+    // 不预检就 exec，用户看到的只有 `deploy.sh: line 1: 404:: command not found`。
+    fs.writeFileSync(target, '404: Not Found');
+    const bad = await spawnBashSnippet(snippet);
+    if (bad.unavailable) return;
+    const badAll = bad.out + bad.err;
+    assert(!/404:: command not found/.test(badAll),
+      `不得把损坏的脚本当成脚本来执行（这句报错用户完全无从下手）：${badAll.slice(0, 300)}`);
+    assert(/不完整或已损坏/.test(badAll),
+      `必须给出人话错误并指明路径：${badAll.slice(0, 300)}`);
+
+    // 正面：正常的脚本必须照常放行并交接执行（否则预检就成了「永远拒绝」）
+    fs.writeFileSync(target, "#!/usr/bin/env bash\nprintf 'STUB_REINSTALL %s\\n' \"$*\"\n");
+    const good = await spawnBashSnippet(snippet);
+    if (good.unavailable) return;
+    assert(/STUB_REINSTALL --reinstall/.test(good.out),
+      `正常脚本必须被放行（预检不得误伤）：${(good.out + good.err).slice(0, 300)}`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -1360,6 +1360,88 @@ const CASES = [
       testFile: 'docs-sync.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * 把 git 退回「必需包」：git 混进 pkg_install 后，dnf 一失败就整段 die，
+       * prepare_source 里那段「没有 git 也能装（把源码打包上传）」的提示永远执行不到。
+       * CentOS/RHEL 8 的模块流过滤恰好会让 git 装不上 —— 用户被卡死在第一步。
+       */
+      name: 'D1-08 · 基础工具把 git 退回「必需包」（CentOS 8 上装不上即中断）',
+      file: 'deploy.sh',
+      anchor: '    if ((${#hard_pkgs[@]})); then pkg_install "${hard_pkgs[@]}"; fi\n'
+        + '    if ! have git; then pkg_install_opt git || true; fi',
+      replacement: '    pkg_install "${to_install[@]}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 删掉「模块流被过滤」诊断分支 → 用户日志掉进通用兜底，只被告知"未能自动识别原因"，
+       * 拿不到 dnf module reset/enable 这条真正的修复命令，也不知道"没有 git 也能部署"。
+       */
+      name: 'D1-09 · 删掉「模块流被过滤」诊断（CentOS 8 装包失败的诊断退回通用兜底）',
+      file: 'deploy.sh',
+      anchor: '  elif grep -qiE \'filtered out by modular filtering|modular filtering|requires module\\(|conflicts with module\\(\' <<<"$tail_log"; then',
+      replacement: '  elif false; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 不再识别「机器上已有 nodejs 与新版互斥」→ Node 装不上的**真原因**被埋掉。
+       * 用户真实日志（CentOS Linux 8）里，dnf 明明写了
+       *   cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and nodejs-1:16.13.1-3.module_el8…
+       * 但脚本只给「三种方式都没装上」的通用指引，用户无从知道要先卸掉系统那份 nodejs。
+       * 变异成恒 false：冲突分支不再触发，行为断言（module reset nodejs / remove -y nodejs）全部落空。
+       */
+      name: 'D1-10 · Node 冲突判据失效（已有 nodejs 互斥的真原因不再被点出）',
+      file: 'deploy.sh',
+      anchor: '  log_since_mark | grep -qiE \'cannot install both|conflicts? with|obsoletes?|--allowerasing\'',
+      replacement: '  return 1',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 删掉「临时无视 exclude」那条可敲命令 → 用户被 exclude=nginx 挡住时，只被告知去
+       * grep 配置、去 ls 面板路径，却没有任何一条能直接执行的命令；日志现象
+       * `All matches were filtered out by exclude filtering for argument: nginx` 就此卡死。
+       */
+      name: 'D1-11 · 删掉 nginx 被 exclude 过滤时的绕开命令（--disableexcludes）',
+      file: 'deploy.sh',
+      anchor: '          add_hint "    ${PM} install -y --disableexcludes=all nginx"',
+      replacement: '          add_hint ""',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把锁文件根条目的 devDependencies 掏空 —— 重现「包清单加了依赖、锁文件没跟着更新」。
+       * 这正是 CentOS 8 日志里 `npm ci` 每次 EUSAGE 的真因（Missing: eslint@9.39.5 from lock file）：
+       * 部署脚本第一枪打的就是 npm ci --omit=dev，锁文件不同步则这一枪**必然**落空，
+       * 只能靠兜底 npm install 侥幸装上。锁文件是构建产物，没人会主动看 → 必须由护栏钉住。
+       */
+      name: 'D1-12 · 锁文件与 package.json 脱同步（npm ci 必然 EUSAGE，只能靠兜底碰运气）',
+      file: 'package-lock.json',
+      anchor: '      "devDependencies": {\n        "eslint": "^9.0.0"\n      }',
+      replacement: '      "devDependencies": {}',
+      testFile: 'invariants.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 让「shell 的 `/*` 不是块注释开头」这条判据失效 → 剥注释再次吞掉大段代码。
+       * deploy.sh 的 `[[ "$INSTALL_DIR" == /* ]]`（862 行）、`#  include …/*.conf;`（1396 行）、
+       * `"$INSTALL_DIR"/*`（2711 行）会各吞掉 330 / 16 / 85 行，落在里面的反向变异 anchor
+       * 永远"未命中" —— 台账全绿，但是假绿。变异后 `每个函数定义都必须还在` 必须变红。
+       */
+      name: 'D1-13 · 剥注释把 shell 的 /* 当块注释（大段代码从锚点视图里消失）',
+      file: 'tests/invariants.test.js',
+      anchor: 'function isShellPatternAt(src, i) {',
+      replacement: 'function isShellPatternAt(src, i) {\n  return false;\n}\nfunction _deadShellPattern(src, i) {',
+      testFile: 'invariants.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

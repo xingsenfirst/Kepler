@@ -61,6 +61,34 @@ function jsFiles(dir) {
  * @param {{md?:boolean}} [opts] `md:true` 时只剥 HTML 注释（`<!-- -->`）——
  *   markdown 里 `/*` 是普通文本，按 JS 语义剥会把整篇文档当注释。
  */
+/**
+ * 位置 `i` 上的 `/*` 其实是 **shell 文本**，而不是 JS 块注释开头吗？
+ *
+ * 为什么非分不可：`[[ "$INSTALL_DIR" == /* ]]` 这种「判断绝对路径」的写法里，
+ * `/*` 后面找不到就近的闭合符，扫描器会一路吞到文件里下一个闭合符 —— 实测让
+ * deploy.sh 的 862..1188 与 2711..2796 两段共约 **470 行代码**从「剥注释后的代码」
+ * 里整体消失。后果不是报错，而是**静默失效**：落在那两段里的反向变异 anchor
+ * 永远"未命中"，各类静态不变量也看不见那段代码（"绿"得毫无意义）。
+ *
+ * 判据（全仓实测：`/*` 只出现在 shell 行里，且这些行要么带 `[[`、要么是 `#` 注释）：
+ *   ① 同一行里有 `[[`   —— `[[ "$x" == /* ]]`、`[[ "$x" == "$d"/* ]]`
+ *   ② 行首是 shell 的 `case` / `in`
+ *   ③ 行首（去空白后）是 `#` —— 例如 `#   include /etc/nginx/modules-enabled/*.conf;`
+ *      这一行整行本来就是 shell 注释，`/*.conf` 只是注释里的路径，绝不该往后吞代码
+ *   ④ `/*` 紧跟在 `=` / `!` 之后（只在**同一行内**回看，不跨行）
+ * JS 里真正的块注释从不出现在这种行上，故不会误伤（`__test__` 里另有护栏盯着）。
+ */
+function isShellPatternAt(src, i) {
+  const ls = src.lastIndexOf('\n', i - 1) + 1;
+  const nl = src.indexOf('\n', i);
+  const line = src.slice(ls, nl < 0 ? src.length : nl);
+  if (/\[\[/.test(line)) return true;
+  if (/^\s*(?:case\b|in\b|#)/.test(line)) return true;
+  let k = i - 1;
+  while (k >= ls && (src[k] === ' ' || src[k] === '\t')) k -= 1;
+  return k >= ls && (src[k] === '=' || src[k] === '!');
+}
+
 function stripComments(src, opts) {
   const md = !!(opts && opts.md);
   let out = '';
@@ -111,6 +139,12 @@ function stripComments(src, opts) {
          * 块注释必须**有闭合**才认。没有闭合的起始符更可能是 glob 文本
          * （`routes/*.js` 这样的路径后面不会再出现闭合符）——当注释会把剩余全文抹白。
          */
+        /**
+         * R15 复核新增：`/*` 也可能是 shell 的**通配符 / 注释里的路径**，而不是注释开头 ——
+         * 详见 `isShellPatternAt()`。只看"有闭合"不够：`[[ "$INSTALL_DIR" == /* ]]`
+         * 与 `#   include …/modules-enabled/*.conf;` 附近的闭合符远在天边，一吞就是几百行。
+         */
+        if (isShellPatternAt(src, i)) { out += c; i += 1; continue; }
         const end = src.indexOf('*/', i + 2);
         if (end < 0) { out += c; i += 1; continue; }
         const j = end + 2;
@@ -2265,4 +2299,120 @@ test('R14 系列：第十四轮修复的静态不变量（每条自带扫描范�
     `扫描范围下界自检未通过（命中归零同样显示为"绿"）：\n  ${lowerFails.join('\n  ')}`);
   assertEqual(hits.length, 0,
     `命中 ${hits.length} 处（第十四轮已修复项的回归）：\n  ${hits.join('\n  ')}`);
+});
+
+/**
+ * 剥注释不得「吞掉」大段代码 —— 否则护栏静默失效。
+ *
+ * 事故原型：`stripComments()` 把 shell 的 `/*` 当作 JS 块注释开头，一路吞到文件里
+ * 下一个闭合符。deploy.sh 第 862 行 `[[ "$INSTALL_DIR" == /* ]]` 让 862..1188 行
+ * 消失（约 330 行），第 1396 行 shell 注释里的 `#  include …/modules-enabled/*.conf;`
+ * 又吞掉 1396..1411，第 2711 行 `"$INSTALL_DIR"/*` 再吞掉 2711..2796（约 85 行）。
+ * 表现不是报错，而是：落在这些区间的**反向变异 anchor 永远"未命中"**、各类静态
+ * 不变量看不见那段代码 —— 台账于是"全绿"，但全是假绿。
+ *
+ * 判据取「**每个函数定义都必须还在**」这种结构性事实（比行数/比例稳定得多）：
+ * 一次误吞会让成片的函数整体消失，跑不掉。
+ */
+test('剥注释不得吞掉代码：脚本里每个函数定义都必须还在（否则护栏静默失效）', () => {
+  const deploy = fs.readFileSync(path.join(ROOT, 'deploy.sh'), 'utf8');
+  const stripped = stripComments(deploy);
+
+  assertEqual(stripped.length, deploy.length,
+    '抹白必须**等长**（否则所有按行号定位的诊断都会漂移）');
+
+  const names = [];
+  const re = /^([A-Za-z_][A-Za-z0-9_]*)\(\) \{/gm;
+  let m;
+  while ((m = re.exec(deploy)) !== null) names.push(m[1]);
+
+  // 下界自检：函数名一个都没提出来时，"全部还在"与"检查失效"长得一样
+  // （下界取 80 —— 本判据只认 `^name() {` 这种无参定义，实测 deploy.sh 有 95 个）
+  assert(names.length >= 80,
+    `扫描范围自检：只从 deploy.sh 提到 ${names.length} 个函数定义，预期 ≥ 80 —— 检查很可能已失效`);
+
+  const lost = names.filter((n) => !stripped.includes(`\n${n}() {`));
+  assertEqual(lost.length, 0,
+    `有 ${lost.length} 个函数在"剥注释后的代码"里整体消失：${lost.join('、')}\n`
+    + '  原因几乎总是 `/*` 被误判成块注释开头（shell 的 `[[ "$x" == /* ]]`、'
+    + '`# … include …/*.conf` 里的 `/*`），于是从那里吞到下一个闭合符。\n'
+    + '  修法是 `isShellPatternAt()` —— 别去改 anchor，改判据。');
+
+  // 具体盲区逐个点名：这几行原文里就有 shell 形态的 `/*`，其后必须仍是可扫的代码
+  const globLines = deploy.split('\n')
+    .map((l, idx) => [idx + 1, l])
+    .filter(([, l]) => /\[\[[^\n]*\/\*|\/\* *\]\]/.test(l));
+  assert(globLines.length >= 3,
+    `扫描范围自检：带 [[ 与 /* 的 shell 行应至少 3 处，实际 ${globLines.length} 处`);
+  const strippedLines = stripped.split('\n');
+  const stillBlank = globLines
+    .filter(([no, l]) => strippedLines[no - 1].trim() === '' && l.trim() !== '')
+    .map(([no]) => no);
+  assertEqual(stillBlank.length, 0,
+    `这些行是 shell 通配符判断（\`== /*\`），却被当成块注释开头抹白了：第 ${stillBlank.join('、')} 行`);
+});
+
+/**
+ * 依赖清单必须与锁文件同步 —— 否则 `npm ci` 在**任何**机器上都必然失败。
+ *
+ * 事故原型（CentOS 8 部署日志）：`package.json` 里加了 `devDependencies.eslint`， * 事故原型（CentOS 8 部署日志）：`package.json` 里加了 `devDependencies.eslint`，
+ * 却没同时更新 `package-lock.json`，于是
+ *   npm error `npm ci` can only install packages when your package.json and
+ *   package-lock.json … are in sync. Missing: eslint@9.39.5 from lock file
+ * 部署脚本第一枪打的就是 `npm ci --omit=dev`，这一枪每次都落空（会走兜底 `npm install`，
+ * 但那是**运气**，不是设计）。锁文件是构建产物、没人会主动看，所以必须由护栏钉住。
+ *
+ * 判据严格照 `npm ci` 的校验来（它比的就是根条目里的 spec 字符串）：
+ *   ① 声明过的每个依赖都要在 `packages[""]` 同名字段出现，且**取值（版本范围）逐字相同**；
+ *   ② 每个依赖在 `packages` 里都要有对应的 `node_modules/<name>` 实体条目；
+ *   ③ 根条目的 engines / license 也要跟 package.json 走（否则文档里的版本要求会跟锁文件打架）。
+ * 另加下界自检：依赖数扫到 0 时，"通过"与"检查失效"长得一样。
+ */
+test('依赖清单必须与锁文件同步（否则 npm ci 必然失败）', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
+  const packages = lock.packages || {};
+  const root = packages[''];
+  const bad = [];
+
+  assert(root && typeof root === 'object',
+    'package-lock.json 缺少 packages[""] 根条目（lockfileVersion 1 的旧格式请先执行 `npm install --package-lock-only` 升级）');
+
+  let scanned = 0;
+  for (const field of ['dependencies', 'devDependencies']) {
+    const declared = pkg[field] || {};
+    for (const [name, range] of Object.entries(declared)) {
+      scanned++;
+      const inRoot = (root[field] || {})[name];
+      if (inRoot === undefined) {
+        bad.push(`${field}.${name} 未出现在锁文件根条目里（npm ci 会直接 EUSAGE 退出）`);
+      } else if (inRoot !== range) {
+        bad.push(`${field}.${name} 版本范围不一致：package.json 为「${range}」，锁文件为「${inRoot}」`);
+      }
+      const key = `node_modules/${name}`;
+      if (!Object.prototype.hasOwnProperty.call(packages, key)) {
+        bad.push(`${field}.${name} 在锁文件里没有 ${key} 实体条目（声明了却装不上）`);
+      }
+    }
+  }
+
+  // 下界自检：一个依赖都没扫到，说明上面两个字段的读取方式已失效，此时"0 处问题"毫无意义
+  assert(scanned >= 2,
+    `扫描范围自检：只从 package.json 读到 ${scanned} 个依赖，预期至少 2 个 —— 检查很可能已失效`);
+
+  assertEqual(bad.length, 0,
+    `依赖清单与锁文件不同步（部署脚本的 npm ci 会每次失败，只能靠兜底 npm install 侥幸装上）：\n  ${bad.join('\n  ')}\n`
+    + '  修法：npm install --package-lock-only（纯增量同步锁文件，不改已装的依赖）');
+
+  // engines 是文档里「Node ≥ 18」那条要求的单一事实源，锁文件根条目也必须跟它一致
+  if (pkg.engines) {
+    const same = JSON.stringify(root.engines || null) === JSON.stringify(pkg.engines);
+    assert(same,
+      `锁文件根条目的 engines（${JSON.stringify(root.engines || null)}）与 package.json（${JSON.stringify(pkg.engines)}）不一致 —— `
+      + '文档与部署校验都以 package.json 为准，锁文件留着旧值会让人对「到底要哪个版本」产生分歧');
+  }
+  if (pkg.license) {
+    assert(root.license === pkg.license,
+      `锁文件根条目的 license（${root.license}）与 package.json（${pkg.license}）不一致`);
+  }
 });

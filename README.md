@@ -151,6 +151,8 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/K
 
 脚本会自动安装 git / curl / Node.js 等依赖、从 `https://github.com/xingsenfirst/Kepler.git` 拉取源码、配置 Nginx 反代与 HTTPS 证书、注册 systemd 服务并做健康检查。**只需提供域名**，用户名与密码在打开页面后的首次初始化流程中设置。脚本幂等，重复执行等价于升级 / 修复。
 
+> **CentOS 8 用户注意**：CentOS Linux 8 已于 2021-12-31 EOL，官方镜像站（含 `mirrorlist.centos.org`，2024-06-30 下线）不再为 8 提供仓库，且 AppStream 模块流容易进入不一致状态 —— 典型症状是安装 `git` 时报 `perl-libs … is filtered out by modular filtering`。脚本会给出对症命令；手动修复：`dnf module reset perl && dnf module enable -y perl:5.26 && dnf clean all && dnf makecache`。长期建议迁到 Rocky / AlmaLinux。
+
 安装完成会注册全局 `kepler` 命令，输入编号回车即可执行（也可直接 `kepler 4` 一步到位）：
 
 | 编号 | 作用 | 说明 |

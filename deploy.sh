@@ -621,9 +621,39 @@ on_pkg_failure() {
 
   if grep -qiE 'could not resolve|temporary failure resolving|failed to fetch|could not connect|network is unreachable|no route to host|timed out|connection refused|无法连接|超时' <<<"$tail_log"; then
     add_hint "【判断】网络 / DNS 不可达，或软件源超时。"
-    add_hint "  1) 检查出网：curl -sI https://$(pm_mirror_host) -m 8 ; echo \$?"
-    add_hint "  2) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）"
-    add_hint "  3) 国内服务器建议把软件源换成国内镜像后重试（node/npm 下载可加 --mirror cn）"
+    case "$PM" in
+      dnf|yum)
+        # mirrorlist.centos.org 已随 CentOS 7 EOL（2024-06-30）正式下线，
+        # 拿它当探针会**恒失败**，把"源不可达"误报成"网络不通"，白折腾一轮。
+        # RHEL 系如今没有统一的公共镜像入口了，只能看用户实际配置的源。
+        add_hint "  1) 检查出网：curl -sI https://mirrors.aliyun.com -m 8 ; echo \$?"
+        add_hint "  2) 看你实际配置的源：grep -rhE '^(baseurl|mirrorlist)=' /etc/yum.repos.d/ | head -n 5"
+        add_hint "  3) CentOS 7/8 均已 EOL，官方镜像站下线 —— 源要改指 vault（旧包不再更新）："
+        add_hint "       sed -i 's/^mirrorlist/#mirrorlist/' /etc/yum.repos.d/CentOS-*.repo"
+        add_hint "       sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/CentOS-*.repo"
+        add_hint "       ${PM} clean all && ${PM} makecache"
+        add_hint "  4) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）" ;;
+      *)
+        add_hint "  1) 检查出网：curl -sI https://$(pm_mirror_host) -m 8 ; echo \$?"
+        add_hint "  2) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）"
+        add_hint "  3) 国内服务器建议把软件源换成国内镜像后重试（node/npm 下载可加 --mirror cn）" ;;
+    esac
+  elif grep -qiE 'filtered out by modular filtering|modular filtering|requires module\(|conflicts with module\(' <<<"$tail_log"; then
+    # RHEL/CentOS 8 特有：AppStream 的「模块流」状态与仓库期望不一致，
+    # 依赖包被 modular filtering 静默过滤 → 报 "none of the providers can be installed"。
+    # 最经典的受害者就是 git（它依赖 perl-Git → perl-libs）。CentOS 8 已于 2021-12-31 EOL，
+    # 仓库迁到 vault 之后这种不一致更常见；别处启用/禁用过某个模块流也会导致同样结果。
+    add_hint "【判断】RHEL/CentOS 8 的模块流（module stream）状态与仓库不一致，依赖包被 modular filtering 过滤掉了。"
+    case "$PM" in
+      dnf|yum)
+        add_hint "  报错里 perl-libs 后面那个 5.26 就是它期望的流版本，按它来："
+        add_hint "  1) 复位并重新启用 perl 模块流："
+        add_hint "       ${PM} module reset perl && ${PM} module enable -y perl:5.26"
+        add_hint "  2) 再重试安装：$(pm_install_cmd) ${pkg_list}"
+        add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list perl" ;;
+      *)
+        add_hint "  1) 刷新索引后重试：$(pm_install_cmd) ${pkg_list}" ;;
+    esac
   elif grep -qiE 'unable to locate package|no package .* available|unable to find a match|no match for argument|nothing provides|not found|没有可用的软件包' <<<"$tail_log"; then
     add_hint "【判断】当前软件源里没有这个包（索引未更新 / 缺扩展源）。"
     case "$PM" in
@@ -661,6 +691,15 @@ on_pkg_failure() {
   fi
 
   add_hint ""
+  # git 只是「把源码弄到服务器上」的一种手段，装不上不该把人堵死 —— 手动带源码即可。
+  # 这条逃生口必须在这里给出：CentOS/RHEL 8 的模块流问题会让 git 根本装不上，
+  # 而用户此时最容易以为"部署彻底做不下去了"。
+  case "$pkg_list" in
+    *git*)
+      add_hint "  · git 装不上也能继续：把项目打包上传到服务器，解压后在该目录内执行本脚本"
+      add_hint "    （脚本会识别同目录源码，全程不需要 git）" ;;
+  esac
+
   local flag; flag="$(skip_flag_for_pkgs "$pkg_list")"
   add_hint "【或自己装】$(pm_install_cmd) ${pkg_list}"
   if [[ -n "$flag" ]]; then
@@ -679,10 +718,14 @@ on_pkg_failure() {
   die_with_hint "软件包安装失败：${pkg_list}" "${HINTS[@]}"
 }
 
+# 一个「外网是否通」的稳定探测目标。
+# 注意：这里曾经给 dnf 返回 mirrorlist.centos.org —— 该域名已随 CentOS 7 EOL
+# （2024-06-30）被官方正式下线，当探针会**恒失败**，把"源不可达"误报成"网络不通"。
+# RHEL 系如今没有统一的公共镜像入口，所以只挑一个确实可达的镜像站即可。
 pm_mirror_host() {
   case "$PM" in
     apt) printf 'deb.debian.org' ;;
-    dnf|yum) printf 'mirrorlist.centos.org' ;;
+    dnf|yum) printf 'mirrors.aliyun.com' ;;
     apk) printf 'dl-cdn.alpinelinux.org' ;;
     *) printf 'download.opensuse.org' ;;
   esac
@@ -731,16 +774,33 @@ need_pkgs_base() {
 
   if ((${#to_install[@]})); then
     info "检测到缺少基础工具，将自动安装：${to_install[*]}"
-    pkg_install "${to_install[@]}"
+    # git 单独走「可选」通道，不混进必需包：它只服务于「从仓库拉源码」这一条路径，
+    # 源码已在当前目录时压根用不到。若混在一起装，dnf 一失败就整段中断，
+    # prepare_source 里那段「没有 git 也能装（把源码打包上传）」的提示永远执行不到 ——
+    # 用户只能看到一段 dnf 的原始求解报错（CentOS/RHEL 8 的模块流问题正落在这里）。
+    local -a hard_pkgs=()
+    local p
+    for p in "${to_install[@]}"; do
+      [[ "$p" == git ]] || hard_pkgs+=("$p")
+    done
+    if ((${#hard_pkgs[@]})); then pkg_install "${hard_pkgs[@]}"; fi
+    if ! have git; then pkg_install_opt git || true; fi
   fi
 
   local cmd
-  for cmd in curl git tar gzip sed awk grep mktemp date head tail; do
+  # 这份清单**不含 git**：缺 git 时交给 prepare_source 判断当前场景并给出对症提示
+  # （它知道是本地源码目录还是独立运行），比在这里一刀切 die 有用得多。
+  for cmd in curl tar gzip sed awk grep mktemp date head tail; do
     have "$cmd" || die_with_hint "基础工具自动安装后仍不可用：${cmd}" \
       "请检查软件源与系统镜像是否完整。" \
-      "可手工执行：$(pm_install_cmd) curl git ca-certificates tar gzip sed gawk grep coreutils"
+      "可手工执行：$(pm_install_cmd) curl ca-certificates tar gzip sed gawk grep coreutils"
   done
-  ok "基础工具已就绪：git / curl / tar / ca-certificates"
+  if have git; then
+    ok "基础工具已就绪：git / curl / tar / ca-certificates"
+  else
+    ok "基础工具已就绪：curl / tar / ca-certificates"
+    warn "未安装 git：仅影响「从仓库拉取源码」这一步；若源码已在当前目录则不受影响。"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -899,6 +959,39 @@ node_manual_hints() {
   add_hint "    $(rerun_cmd --skip-node)"
 }
 
+# 是否命中「机器上已有的 nodejs 包与新版本互斥」。
+# 判据取自用户真实日志（CentOS Linux 8 装 NodeSource 20 时）：
+#   cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and
+#                      nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64
+# 注意 `is already installed` 这句 dnf 也会在**装成功**之后打印
+# （"Package nodejs-1:16.13.1… is already installed."），单独拿它当判据会误报，
+# 所以必须要求同时出现 "cannot install both" 这类**冲突**措辞。
+node_conflict_detected() {
+  log_since_mark | grep -qiE 'cannot install both|conflicts? with|obsoletes?|--allowerasing'
+}
+
+# 命中冲突后，把「先卸掉系统那份」的可敲命令追加进 HINTS。
+# 只在 install_node 的失败出口调用，此时 HINTS 已由 node_manual_hints 填好。
+node_conflict_hints() {
+  add_hint ""
+  add_hint "  【首要原因】这台机器上已经装着一份 nodejs（日志里的 cannot install both …），"
+  add_hint "  新版本与它互斥，所以 NodeSource 一定装不上、node 会一直停在旧版本。按下面顺序来："
+  case "$PM" in
+    dnf|yum)
+      add_hint "    1) ${PM} module reset nodejs"
+      add_hint "    2) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"
+      add_hint "    3) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs" ;;
+    apt)
+      add_hint "    1) apt-get remove -y nodejs npm && apt-get autoremove -y"
+      add_hint "    2) curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs" ;;
+    *)
+      add_hint "    1) 先卸掉发行版自带的 nodejs/npm，再重新安装" ;;
+  esac
+  add_hint "    （若第 2 步卸不掉：说明有别的包依赖它，看 ${PM} repoquery --whatrequires nodejs）"
+  add_hint "    · 不想动系统包就用下面【C】的官方二进制包：它装进 /usr/local，"
+  add_hint "      完全不经过包管理器，与系统里那份 nodejs 互不冲突 —— 最省事的一条路。"
+}
+
 install_node() {
   local required="18"
   NODE_BIN="$(command -v node || true)"
@@ -922,6 +1015,8 @@ install_node() {
 
   # 4.1 优先尝试系统包（失败不致命，继续尝试下一级）
   info "尝试通过 ${PM} 安装 Node.js…"
+  # 记下日志行数：下面要判断「这次安装是不是撞上了已有的 nodejs 包」
+  mark_log
   case "$PM" in
     apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm' ;;
     dnf|yum) run_soft "$PM" install -y nodejs npm ;;
@@ -955,6 +1050,17 @@ install_node() {
     warn "NodeSource 仓库安装未成功（常见于已 EOL 的发行版或网络受限），继续尝试官方二进制包。"
   fi
 
+  # 到这里「系统包 + NodeSource」都试过了。若日志里出现「已有 nodejs 与新版本互斥」，
+  # 卡点就是系统里那份 nodejs（RHEL/CentOS 8 上多为 AppStream 的 nodejs:16 模块包）——
+  # 不卸掉它，走包管理器的两条路都必然失败。
+  # 但**不能就此中断**：下面的官方二进制包（4.3）装进 /usr/local、不经过包管理器，
+  # 通常仍能成功。所以这里只记下事实，等真正失败时再把原因放到提示最前面。
+  local node_conflict=0
+  if node_conflict_detected; then
+    node_conflict=1
+    warn "检测到已有 nodejs 包与新版本互斥（cannot install both …），稍后会给出处理指引。"
+  fi
+
   # 4.3 官方二进制包（通用兜底，支持 cn 镜像）
   local ver base url tmp
   ver="$(resolve_node_version)"
@@ -974,6 +1080,7 @@ install_node() {
   if ((rc != 0)); then
     rm -rf "$tmp"
     node_manual_hints
+    if ((node_conflict)); then node_conflict_hints; fi
     HINTS+=("" "下载失败的地址：${url}" "  检查连通性：curl -sI ${url} -m 8 ; echo \$?")
     die_with_hint "Node.js 二进制包下载失败" "${HINTS[@]}"
   fi
@@ -992,6 +1099,7 @@ install_node() {
   NODE_BIN="$(command -v node || true)"
   if [[ -z "$NODE_BIN" ]] || ! version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
     node_manual_hints
+    if ((node_conflict)); then node_conflict_hints; fi
     die_with_hint "Node.js 自动安装失败（三种方式都没装上 v${required}+）" "${HINTS[@]}"
   fi
   ok "Node.js 安装完成（二进制包）：$("$NODE_BIN" -v) → ${NODE_BIN}"
@@ -1259,6 +1367,13 @@ install_nginx() {
         add_hint "    grep -rn '^exclude' /etc/yum.conf /etc/dnf/dnf.conf /etc/yum.repos.d/ 2>/dev/null"
         add_hint "    ls -l /www/server/nginx/sbin/nginx /usr/local/nginx/sbin/nginx 2>/dev/null"
         add_hint "  找到后加进 PATH 再重跑（脚本会自动识别）：export PATH=\$PATH:<nginx 所在目录>"
+        if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+          add_hint ""
+          add_hint "  确实没有现成 Nginx、就要用包管理器装的话，可以临时无视 exclude："
+          add_hint "    ${PM} install -y --disableexcludes=all nginx"
+          add_hint "  注意：这会**再装一份** nginx，容易和面板/自编译那份抢 80/443 端口，"
+          add_hint "  装完先确认 systemctl status nginx 与 80/443 的监听者，别把原来的站点打挂。"
+        fi
       fi
       add_hint "  4) 查看包管理器报错：tail -n 80 ${LOG_FILE}"
       add_hint ""

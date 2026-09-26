@@ -526,7 +526,7 @@ test('deploy.sh：nginx 装不上时必须走到对症提示（不得被通用�
   assert(body.indexOf('epel-release') < body.indexOf('die_with_hint "Nginx 安装失败"'),
     'EPEL 兜底必须夹在「尝试安装」与「判失败」之间');
 
-  // 行为验证：系统装包一律失败 + RHEL 系，非交互执行
+  // 行为验证：系统装包一律失败 + RHEL 系 + 日志显示「nginx 被 exclude 过滤」+ 非交互执行
   const r = await spawnBashSnippet(`
 set -Eeuo pipefail
 source ./deploy.sh
@@ -538,6 +538,8 @@ pkg_run_pm() { return 1; }
 run_soft() { return 0; }
 locate_nginx() { return 1; }
 have() { case "$1" in nginx) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+# 用户真实日志（CentOS 8）：包管理器把 nginx 排除掉了
+log_since_mark() { printf '%s\\n' 'All matches were filtered out by exclude filtering for argument: nginx' 'Error: Unable to find a match: nginx'; }
 out="$( install_nginx 2>&1 </dev/null )"
 rc=$?
 printf '%s\\n' "$out"
@@ -552,6 +554,10 @@ printf 'RC=%s\\n' "$rc"
     `必须给出对症提示与 --skip-nginx 逃生口（以前只会看到「软件包安装失败：nginx」）：${all.slice(0, 400)}`);
   assert(!/软件包安装失败：nginx/.test(all),
     '不得掉进通用失败出口：那意味着 nginx 专属诊断全部不可达');
+  assert(/--disableexcludes=all/.test(all),
+    `必须给出「临时无视 exclude」的可敲命令：只让人去 grep exclude= 配置而不给命令，用户还是装不上：${all.slice(0, 600)}`);
+  assert(/\/www\/server\/nginx\/sbin\/nginx/.test(all),
+    `被 exclude 过滤时要让人去确认「这台机器本来就有 Nginx，只是没进 PATH」（面板路径）：${all.slice(0, 600)}`);
 });
 
 test('deploy.sh：域名带端口必须当场拒绝（否则静默降级 + nginx -t 失败）', async () => {
@@ -628,4 +634,128 @@ reinstall_now
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('deploy.sh：git 装不上不得中断部署（CentOS 8 上它恰恰最容易装不上）', async () => {
+  const body = codeOnly(fnBody(readDeploy(), 'need_pkgs_base'));
+  assert(!/for cmd in [^;]*\bgit\b/.test(body),
+    '必需工具清单里不得含 git：它只是「把源码弄到服务器」的一种手段，当成硬依赖会让部署死在第一步');
+  assert(/pkg_install_opt git/.test(body),
+    'git 必须走「可选」通道（pkg_install_opt）：失败只降级，prepare_source 里有完整的无 git 替代方案');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+have() { if [[ "$1" == git ]]; then return 1; fi; command -v "$1" >/dev/null 2>&1; }
+pkg_install()     { printf 'REQ %s\\n' "$*"; return 0; }
+pkg_install_opt() { printf 'OPT-FAIL %s\\n' "$*"; return 1; }
+out="$( need_pkgs_base 2>&1 )"
+rc=$?
+printf '%s\\n' "$out"
+printf 'RC=%s\\n' "$rc"
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert(/RC=0/.test(all),
+    `git 装不上时基础工具这步必须正常返回 —— 否则用户直接被卡死在第一步：${all.slice(0, 300)}`);
+  assert(/OPT-FAIL git/.test(all), 'git 必须真的走可选通道去尝试安装（而不是悄悄跳过）');
+  assert(/未安装 git/.test(all),
+    `必须明确告知「缺 git 只影响拉源码这一步」：${all.slice(0, 300)}`);
+});
+
+test('deploy.sh：RHEL 系装包失败必须识别「模块流被过滤」并给出 module 修复命令', async () => {
+  // 剥注释再判：本文件多处注释**特意**提到 mirrorlist.centos.org 说明它为何不能用，
+  // 不剥注释会把这些讲解当成"仍在用它"。
+  const src = codeOnly(readDeploy());
+  assert(/filtered out by modular filtering/.test(src),
+    '诊断链必须识别 modular filtering：RHEL/CentOS 8 的 git 装不上十有八九是它，掉进通用兜底则用户得不到任何有用信息');
+  assert(!/mirrorlist\.centos\.org/.test(src),
+    '不得再拿 mirrorlist.centos.org 当探针：该域名已随 CentOS 7 EOL（2024-06-30）正式下线，探针恒失败会把「源不可达」误报成「网络不通」');
+
+  const snippetFor = (fakeLog) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+PM=dnf; VERSION_ID=8
+FAKE_LOG='${fakeLog}'
+log_since_mark() { printf '%s' "$FAKE_LOG"; }
+log_key_lines()  { sed -n '1,5p' <<<"$FAKE_LOG"; }
+out="$( on_pkg_failure git 1 2>&1 )"
+printf '%s\\n' "$out"
+`;
+
+  // 用户真实日志（CentOS Linux 8 / dnf）
+  const modular = await spawnBashSnippet(snippetFor(`Error:
+Problem: package git-2.27.0-1.el8.x86_64 requires perl(Git), but none of the providers can be installed
+- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+(try to add '--skip-broken' to skip uninstallable packages)`));
+  if (modular.unavailable) return;
+  const all = modular.out + modular.err;
+  assert(/module reset perl/.test(all),
+    `必须给出「复位 perl 模块流」的命令：${all.slice(0, 500)}`);
+  assert(/module enable -y perl:5\.26/.test(all),
+    `必须按报错里期望的流版本重新启用（perl-libs 5.26）：${all.slice(0, 500)}`);
+  assert(/不需要 git/.test(all),
+    `必须同时给出「不用 git 也能部署」的逃生口，否则用户以为部署做不下去了：${all.slice(0, 500)}`);
+
+  // 对照：网络类日志仍要走网络分支（别把诊断写成一刀切）
+  const net = await spawnBashSnippet(snippetFor('Could not resolve host: mirrors.example.com; Name or service not known'));
+  if (net.unavailable) return;
+  assert(/网络 \/ DNS 不可达/.test(net.out + net.err),
+    '普通网络类失败仍要落到网络分支，不能被新分支截胡');
+});
+
+test('deploy.sh：Node 装不上必须先点出「机器上已有 nodejs 与新版互斥」这个真原因', async () => {
+  const src = readDeploy();
+  const body = codeOnly(fnBody(src, 'install_node'));
+  assert(/mark_log/.test(body),
+    'install_node 必须在「尝试装包」前记日志位点：否则事后分不清冲突是这次发生的还是历史遗留');
+  assert(/node_conflict_detected/.test(body) && /node_conflict_hints/.test(body),
+    'install_node 必须识别并给出「已有 nodejs 包互斥」的指引，否则用户拿到的只是无关的通用提示');
+  assert(/if \(\(node_conflict\)\); then node_conflict_hints; fi/.test(body),
+    '冲突指引必须挂在**失败出口**上（node_manual_hints 会先 HINTS=() 清空，提前 add 会被冲掉）');
+
+  // 判据本身：`is already installed` 是 dnf **装成功后**也会打印的一句
+  // （"Package nodejs-1:16.13.1… is already installed."），单独拿它当判据会误报
+  assert(!/already installed/.test(codeOnly(fnBody(src, 'node_conflict_detected'))),
+    '不得用「already installed」单独当冲突判据：装成功时 dnf 也这么打印，会把正常情况误报成冲突');
+
+  const snippet = (fakeLog) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+PM=dnf
+FAKE_LOG='${fakeLog}'
+log_since_mark() { printf '%s' "$FAKE_LOG"; }
+HINTS=()
+if node_conflict_detected; then node_conflict_hints; fi
+printf '%s\\n' "\${HINTS[@]}"
+`;
+
+  // 用户真实日志（CentOS Linux 8：NodeSource 20 撞上 AppStream 的 nodejs:16 模块包）
+  const conflict = await spawnBashSnippet(snippet(
+    ' - cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64',
+  ));
+  if (conflict.unavailable) return;
+  const all = conflict.out + conflict.err;
+  assert(/cannot install both/.test(all),
+    `指引里应复述日志里的冲突措辞，让人一眼对上自己看到的那行：${all.slice(0, 400)}`);
+  assert(/module reset nodejs/.test(all),
+    `必须给出「复位 nodejs 模块流」的命令：${all.slice(0, 600)}`);
+  assert(/remove -y nodejs npm/.test(all),
+    `必须给出「卸掉系统那份 nodejs」的命令 —— 不卸它，NodeSource 永远装不上：${all.slice(0, 600)}`);
+  assert(/\/usr\/local/.test(all),
+    `必须同时给出「用官方二进制包绕开包管理器」这条最省事的路：${all.slice(0, 600)}`);
+
+  // 对照：装成功时 dnf 打的那句「is already installed」不得被当成冲突
+  const okLog = await spawnBashSnippet(snippet(
+    'Package nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64 is already installed.',
+  ));
+  if (okLog.unavailable) return;
+  assert(!/cannot install both/.test(okLog.out + okLog.err),
+    '「is already installed」是安装成功的正常输出，不得据此误报冲突（会把人引去卸掉刚装好的包）');
 });

@@ -28,6 +28,8 @@
 
 > **适用边界（请先读这一句）**：本系统的定位是**个人或小团队自托管的多云存储管理**场景。它由一人开发、未经企业级安全审计，且存在若干**设计层面**的硬约束——加密密钥不可轮换、不支持多实例 / 集群部署、会话令牌不做滚动续期、审计日志非取证级（明文且会轮转）。这些约束各自在开发文档里有完整理由，但**叠加之后的实际含义是**：它不适合用于需要合规审计、密钥轮换能力或高可用承诺的企业生产环境。若你的场景落在边界内（自用 / 小团队 / 可接受的停机窗口），它才是称手的工具。
 
+**一键部署**：在终端执行 `curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh | sudo bash` 即可一键安装，完全安装完毕后，执行 `kepler` 即可进入数字选单，执行重新安装、更改配置和卸载等操作。
+
 ---
 
 <h1 id="readme-section1">一、功能特性</h1>
@@ -139,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/xingsenfirst/Kepler/main/deploy.sh 
 
 脚本会自动安装 git / curl / Node.js 等依赖、从 `https://github.com/xingsenfirst/Kepler.git` 拉取源码、配置 Nginx 反代与 HTTPS 证书、注册 systemd 服务并做健康检查。**只需提供域名**，用户名与密码在打开页面后的首次初始化流程中设置。脚本幂等，重复执行等价于升级 / 修复。
 
-安装完成会注册全局 `kepler` 命令，输入编号回车即可执行：
+安装完成会注册全局 `kepler` 命令，输入编号回车即可执行（也可直接 `kepler 4` 一步到位）：
 
 | 编号 | 作用 | 说明 |
 | --- | --- | --- |

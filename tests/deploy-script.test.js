@@ -25,6 +25,7 @@ const vm = require('vm');
 const Module = require('module');
 const assert = require('node:assert');
 const test = require('node:test');
+const { spawn } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
 const DEPLOY = path.join(ROOT, 'deploy.sh');
@@ -140,6 +141,119 @@ function tempDataDir(prefix) {
   return { tmp, dataDir };
 }
 
+/**
+ * 起一个真实 bash 跑 deploy.sh，拿到 stdout/stderr/退出码。
+ *
+ * 为什么值得起子进程：`set -Eeuo pipefail` 下有一类坑**静态扫描看不出来** ——
+ * `shift 2` 越界、`exec` 跳过 EXIT trap、裸调用返回 1 的函数被 ERR trap 当成失败。
+ * 这里只喂**参数错误**和**管理编号**：这两类都在 detect_env 之前就结束，
+ * 不需要 root、不写任何系统路径，所以在开发机（Windows + Git Bash）上也能安全跑。
+ *
+ * 用**异步 spawn**：本机 spawnSync 恒 EBUSY（与 audit13 同一处环境问题），
+ * 拿不到输出就会把「没跑起来」误判成「输出为空」→ 假绿。
+ * bash 不存在时返回 { unavailable }，调用方跳过运行期断言（静态断言仍然生效）。
+ */
+function spawnBash(args) {
+  return new Promise((resolve) => {
+    const child = spawn('bash', [DEPLOY, ...args], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => resolve({ unavailable: e.code || String(e) }));
+    child.on('close', (code) => resolve({ code, out, err }));
+  });
+}
+
+/** 取某个 shell 函数的函数体（函数体以行首 `}` 结束） */
+function fnBody(src, name) {
+  const start = src.indexOf(`\n${name}() {`);
+  assert.notEqual(start, -1, `deploy.sh 里应存在函数 ${name}`);
+  const end = src.indexOf('\n}', start);
+  assert.notEqual(end, -1, `${name}() 应有正常的函数体结束`);
+  return src.slice(start, end);
+}
+
+/**
+ * 去掉整行注释再断言。
+ * 脚本里的注释经常**举反例**（比如「这里刻意不用 /home/* 这类通配」），
+ * 不剥注释就会把"注释里提到的坏写法"当成真的坏写法，护栏自己把自己搞红。
+ */
+function codeOnly(body) {
+  return body.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+}
+
+/**
+ * 列出每个函数的「最后一条有效语句」。
+ *
+ * 用于抓一类极隐蔽的 shell 陷阱：`set -Eeuo pipefail` 下，函数**最后一条语句**
+ * 若为 `[[ ... ]] && VAR=...` 这类短路写法，条件为假时函数返回 1 —— 调用点
+ * 便会被 ERR trap 当成「脚本意外失败」直接退出。
+ * 实测：`apply_env_overrides()` 在**未设置任何环境变量**时就是这个情况，
+ * 表现为全新服务器上一执行就报「脚本在第 N 行意外失败（退出码 1）」。
+ */
+function lastStatements(src) {
+  const lines = src.split('\n');
+  const out = [];
+  let name = null;
+  let last = '';
+  for (const line of lines) {
+    if (/^(function )?[A-Za-z_][A-Za-z0-9_]*\(\) \{/.test(line)) {
+      name = line.replace(/ \{$/, '');
+      last = '';
+      continue;
+    }
+    if (line === '}' && name) {
+      out.push({ fn: name, last });
+      name = null;
+      continue;
+    }
+    if (name && line.trim() && !/^\s*#/.test(line)) last = line.trim();
+  }
+  return out;
+}
+
+test('deploy.sh：任何函数都不得以「短路条件」结尾（set -e 误杀护栏）', () => {
+  // 只判「裸条件语句」：if/while 包裹的返回 0，带 `|| true` / `|| return 0` / `|| die` 的已显式兜底
+  const SAFE_SUFFIX = /(\|\| true|\|\| return 0|\|\| exit|\|\| die )$/;
+  const risky = lastStatements(readDeploy()).filter(({ last }) => (
+    !/^(if|while|until|for|case) /.test(last)
+    && /^(\[\[|\[ |test |! )/.test(last)
+    && !SAFE_SUFFIX.test(last)
+  ));
+  assert.deepStrictEqual(risky.map((r) => `${r.fn} → ${r.last}`), [],
+    '函数最后一条语句不得是 `[[ ... ]] && ...` 这类短路写法：条件为假时返回 1，会被 ERR trap 当成脚本失败');
+  assert(/function apply_env_overrides\(\)[\s\S]*?\n  return 0\n\}/.test(readDeploy()),
+    'apply_env_overrides() 必须以 return 0 结束（默认值来自内置常量时所有条件都为假）');
+});
+
+/**
+ * 命令替换里的管道必须有 `|| true` 兜底。
+ *
+ * 开了 `pipefail` 后，`VAR="$(cmd | grep ... )"` 在 grep **没匹配到**时整条赋值
+ * 返回 1，同样会被 ERR trap 当成脚本失败。实测 `diagnose_service()` 里那句
+ * `who="$(ss -ltnp | grep ":PORT" | head -n1)"` 正是如此：服务没起来（最需要
+ * 诊断输出的时候）端口上必然没有监听，脚本反而自杀在健康检查那一步。
+ * 只扫描**同一行内**的替换，跨行的多行替换天然带 `|| true`（已逐条确认）。
+ */
+test('deploy.sh：命令替换里的管道必须有 || true 兜底（pipefail 误杀护栏）', () => {
+  const risky = [];
+  readDeploy().split('\n').forEach((line, i) => {
+    const re = /\$\(/g;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (m.index > 0 && line[m.index - 1] === '\\') continue; // 提示语里被转义的 $(...) 是字面文本
+      const inner = line.slice(m.index, line.indexOf(')', m.index) + 1);
+      // `||` 是布尔或，不是管道：先剔除再判断是否真的有管道
+      if (!inner.replace(/\|\|/g, '').includes('|')) continue;
+      if (/\|\|\s*(true|echo|:)/.test(inner)) continue;
+      risky.push(`${i + 1}: ${line.trim()}`);
+    }
+  });
+  assert.deepStrictEqual(risky, [],
+    '命令替换里出现管道时必须加 `|| true`（或其他 || 兜底）：pipefail 下 grep 无匹配会返回 1，被 ERR trap 当成脚本失败');
+});
+
 test('deploy.sh：持久化状态、全局命令与菜单入口齐备', () => {
   const src = readDeploy();
 
@@ -204,4 +318,75 @@ test('deploy.sh：未初始化时改管理员应报错而不是新建一个账�
     delete process.env.COS_DATA_DIR;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('deploy.sh：取值型参数缺值必须给人话错误（不得退化成「意外失败」）', async () => {
+  const src = readDeploy();
+
+  // 静态：禁止 `--x) VAR="${2:-}"; shift 2` —— 只给选项不给值时 shift 越界返回 1，
+  // 会被 ERR trap 报成「脚本在第 N 行意外失败」，而不是「你少给了一个值」。
+  assert.strictEqual(
+    src.match(/^\s*--\S+\)\s*\w+="\$\{2:-\}";\s*shift 2\s*;;/m),
+    null,
+    '取值型参数不得用 `VAR="${2:-}"; shift 2`：shift 越界会触发 ERR trap，报错信息完全看不懂',
+  );
+  assert(/\[\[ \$# -lt 2 \|\| -z "\$\{2-\}" \]\]/.test(src),
+    '取值型参数必须校验「确实给了取值」（`$#` 够且非空）');
+  assert(/--domain\|--port\|[^\n]*--mirror\)/.test(src),
+    '所有取值型选项应走同一个校验分支，避免漏掉某一个');
+
+  const r = await spawnBash(['--domain']);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert.strictEqual(r.code, 1, '参数缺值应以 1 退出');
+  assert(/缺少取值/.test(all), `应明确指出是哪个参数缺值，实际输出：${all.slice(0, 200)}`);
+  assert(!/意外失败/.test(all), '参数写错属于用户输入问题，不该报成「脚本意外失败」（那会让人以为脚本坏了）');
+});
+
+test('deploy.sh：kepler <编号> 必须解析成管理动作（否则 README 里的用法不可用）', async () => {
+  const src = readDeploy();
+  assert(/MANAGE_ACTION=""/.test(src), '必须初始化 MANAGE_ACTION（set -u 下未定义会直接报 unbound variable）');
+  assert(/^\s*\[0-9\]\)\s+MANAGE=1;\s*MANAGE_ACTION="\$1";\s*shift/m.test(src),
+    'parse_args 必须把裸数字识别为「执行该编号的管理动作」');
+  assert(/"\$MANAGE_ACTION"/.test(src) || /\$\{MANAGE_ACTION\}/.test(src),
+    'main 必须按 MANAGE_ACTION 分发，不能靠位置参数个数猜（--manage 2 时位置参数是 --manage）');
+
+  const r = await spawnBash(['2']);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert(!/未知参数/.test(all),
+    `kepler 2 应进入管理流程而不是被当成未知参数（被当成未知参数就意味着全局命令「kepler <编号>」完全不可用）：${all.slice(0, 200)}`);
+});
+
+test('deploy.sh：重装必须把单实例锁交接给新进程（exec 不触发 EXIT trap）', () => {
+  const src = readDeploy();
+
+  assert(/"\$\{KEPLER_LOCK_HELD:-\}" == "\$LOCK_FILE"/.test(fnBody(src, 'detect_env')),
+    'detect_env 必须识别父进程交接过来的锁，否则重装一启动就误判「另一个部署进程正在运行」');
+  assert(/exec env KEPLER_LOCK_HELD="\$LOCK_FILE" bash "\$target" --reinstall/.test(fnBody(src, 'reinstall_now')),
+    '重装必须用 KEPLER_LOCK_HELD 交接锁，并清掉自己的 EXIT trap');
+  assert(!/exec bash "\$\{INSTALL_DIR\}\/deploy\.sh"/.test(src),
+    '不得再有「裸 exec 安装目录脚本」的重装写法：exec 会跳过 EXIT trap，锁文件留在磁盘上，重装必然自锁失败');
+
+  // 菜单与命令行两条路径必须走同一个 helper（历史上只有菜单那条做了清理）
+  const menu = src.slice(src.indexOf('\nmanage_menu() {'), src.indexOf('# 命令行直接执行编号'));
+  const dispatch = src.slice(src.indexOf('\nmanage_action() {'));
+  assert(/^ *1\) reinstall_now/m.test(menu), '菜单的重装项必须走 reinstall_now()');
+  assert(/^ *1\) reinstall_now/m.test(dispatch), '命令行的重装项必须走 reinstall_now()');
+});
+
+test('deploy.sh：可选依赖安装失败只能降级，不得中断部署', () => {
+  const body = codeOnly(fnBody(readDeploy(), 'pkg_install_opt'));
+  assert(/on_pkg_failure[^\n]*\|\| true/.test(body),
+    'on_pkg_failure 在「可选」分支返回 1，裸调用会被 ERR trap 判成脚本失败 —— 明明设计成降级，实际却中断');
+  assert(/return 0/.test(body), '成功路径必须显式 return 0');
+});
+
+test('deploy.sh：卸载白名单不得误伤正常安装目录', () => {
+  const body = codeOnly(fnBody(readDeploy(), 'safe_remove_tree'));
+  assert(!/\/home\/\*|\/root\/\*/.test(body),
+    '不得使用 /home/* 这类通配：case 的 * 会跨 "/" 匹配，把 /home/<用户>/kepler 正常安装目录一起拦掉，卸载永远失败');
+  assert(/\(Desktop\|Downloads\|Documents\)/.test(body),
+    '个人目录要按路径组件精确匹配（Desktop/Downloads/Documents）');
+  assert(/拒绝递归删除系统目录|\/usr\/local/.test(body), '系统目录白名单必须显式列出并拒绝');
 });

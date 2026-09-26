@@ -54,6 +54,7 @@
 #
 # 安装后的全局命令：
 #   kepler                   编号菜单：重装、改管理员用户名/密码、改端口、卸载、退出
+#   kepler <编号>            直接执行菜单项（如 kepler 4 改端口 / kepler 5 卸载 / kepler 0 退出）
 #
 # 环境变量（与命令行参数等价，参数优先级更高）：
 #   DOMAIN APP_PORT HTTPS_PORT HTTP_PORT INSTALL_DIR DATA_DIR MODE TLS_MODE
@@ -92,6 +93,7 @@ SERVICE_READY=0            # 健康检查：本地应用是否就绪
 EXT_OK=0                   # 健康检查：外网访问是否通过
 NGINX_OK=1                 # Nginx 是否已配置成功
 MANAGE=0                   # 打开 kepler 管理菜单
+MANAGE_ACTION=""           # kepler <编号>：直接执行某个菜单项（与菜单编号一致）
 REINSTALL=0                # 强制从远程仓库重新获取源码
 STATE_LOADED=0
 
@@ -231,7 +233,10 @@ confirm_continue() {
   local ans=""
   if [[ "$ASSUME_YES" == "1" || ! -t 0 ]]; then return 1; fi
   read -r -p "$(printf '%s  ↳ 若你已手工处理完，可直接继续 [y/N]: %s' "$C_YELLOW" "$C_RESET")" ans || true
-  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+  # 显式返回：不要用 `[[ ... ]]` 作为函数最后一条语句（条件为假时返回 1，
+  # 若哪天被裸调用就会被 set -e 的 ERR trap 当成脚本失败）
+  if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then return 0; fi
+  return 1
 }
 
 # 重跑命令（保留用户原本传的全部参数，再追加跳过的开关）
@@ -327,7 +332,13 @@ CERT_KEY=""
 
 usage() {
   local source="${BASH_SOURCE[0]:-$0}"
-  if [[ -r "$source" ]]; then sed -n '2,60p' "$source" | sed 's/^# \{0,1\}//'; else log "Kepler 一键部署：请使用 --domain <域名>，安装后执行 kepler 管理。"; fi
+  if [[ -r "$source" ]]; then
+    # 打印脚本头部的注释块（到第一个非注释行前为止）。不再写死行号：
+    # 头注释一改行数，写死的 `sed -n '2,60p'` 就会把帮助文本截断。
+    awk 'NR>1 { if ($0 !~ /^#/) exit; print }' "$source" | sed 's/^# \{0,1\}//' | sed '$d'
+  else
+    log "Kepler 一键部署：请使用 --domain <域名>，安装后执行 kepler 管理。"
+  fi
   exit 0
 }
 
@@ -363,23 +374,28 @@ function load_state() {
     esac
   done < "$STATE_FILE"
   STATE_LOADED=1
+  return 0
 }
 
 function apply_env_overrides() {
-  [[ -n "$ENV_DOMAIN" ]] && DOMAIN="$ENV_DOMAIN"
-  [[ -n "$ENV_APP_PORT" ]] && APP_PORT="$ENV_APP_PORT"
-  [[ -n "$ENV_HTTPS_PORT" ]] && HTTPS_PORT="$ENV_HTTPS_PORT"
-  [[ -n "$ENV_HTTP_PORT" ]] && HTTP_PORT="$ENV_HTTP_PORT"
-  [[ -n "$ENV_INSTALL_DIR" ]] && INSTALL_DIR="$ENV_INSTALL_DIR"
-  [[ -n "$ENV_DATA_DIR" ]] && DATA_DIR="$ENV_DATA_DIR"
-  [[ -n "$ENV_MODE" ]] && MODE="$ENV_MODE"
-  [[ -n "$ENV_TLS_MODE" ]] && TLS_MODE="$ENV_TLS_MODE"
-  [[ -n "$ENV_EMAIL" ]] && EMAIL="$ENV_EMAIL"
-  [[ -n "$ENV_SUB_PATH" ]] && SUB_PATH="$ENV_SUB_PATH"
-  [[ -n "$ENV_REPO_URL" ]] && REPO_URL="$ENV_REPO_URL"
-  [[ -n "$ENV_NODE_VERSION" ]] && NODE_VERSION="$ENV_NODE_VERSION"
-  [[ -n "$ENV_MIRROR" ]] && MIRROR="$ENV_MIRROR"
-  [[ -n "$ENV_STAGING" ]] && STAGING="$ENV_STAGING"
+  # 注意：这里必须用 if 而不是 `[[ ... ]] && ...` 的简写 —— 简写形式在条件为假时
+  # 整条语句返回 1，若它恰好是函数最后一条语句，就会被 set -e 的 ERR trap 当成
+  # 「脚本意外失败」（未设置任何环境变量时正是这种情况，实测必现）。
+  if [[ -n "$ENV_DOMAIN" ]]; then DOMAIN="$ENV_DOMAIN"; fi
+  if [[ -n "$ENV_APP_PORT" ]]; then APP_PORT="$ENV_APP_PORT"; fi
+  if [[ -n "$ENV_HTTPS_PORT" ]]; then HTTPS_PORT="$ENV_HTTPS_PORT"; fi
+  if [[ -n "$ENV_HTTP_PORT" ]]; then HTTP_PORT="$ENV_HTTP_PORT"; fi
+  if [[ -n "$ENV_INSTALL_DIR" ]]; then INSTALL_DIR="$ENV_INSTALL_DIR"; fi
+  if [[ -n "$ENV_DATA_DIR" ]]; then DATA_DIR="$ENV_DATA_DIR"; fi
+  if [[ -n "$ENV_MODE" ]]; then MODE="$ENV_MODE"; fi
+  if [[ -n "$ENV_TLS_MODE" ]]; then TLS_MODE="$ENV_TLS_MODE"; fi
+  if [[ -n "$ENV_EMAIL" ]]; then EMAIL="$ENV_EMAIL"; fi
+  if [[ -n "$ENV_SUB_PATH" ]]; then SUB_PATH="$ENV_SUB_PATH"; fi
+  if [[ -n "$ENV_REPO_URL" ]]; then REPO_URL="$ENV_REPO_URL"; fi
+  if [[ -n "$ENV_NODE_VERSION" ]]; then NODE_VERSION="$ENV_NODE_VERSION"; fi
+  if [[ -n "$ENV_MIRROR" ]]; then MIRROR="$ENV_MIRROR"; fi
+  if [[ -n "$ENV_STAGING" ]]; then STAGING="$ENV_STAGING"; fi
+  return 0
 }
 
 function save_state() {
@@ -414,24 +430,36 @@ CERT_FULLCHAIN=${CERT_FULLCHAIN}
 CERT_KEY=${CERT_KEY}"
   mkdir -p "$STATE_DIR"
   write_file "$STATE_FILE" "$content" 0600
+  return 0
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --domain)       DOMAIN="${2:-}"; shift 2 ;;
-      --port)         APP_PORT="${2:-}"; shift 2 ;;
-      --https-port)   HTTPS_PORT="${2:-}"; shift 2 ;;
-      --http-port)    HTTP_PORT="${2:-}"; shift 2 ;;
-      --dir)          INSTALL_DIR="${2:-}"; shift 2 ;;
-      --data-dir)     DATA_DIR="${2:-}"; shift 2 ;;
-      --mode)         MODE="${2:-}"; shift 2 ;;
-      --tls)          TLS_MODE="${2:-}"; shift 2 ;;
-      --email)        EMAIL="${2:-}"; shift 2 ;;
-      --path)         SUB_PATH="${2:-}"; shift 2 ;;
-      --repo)         REPO_URL="${2:-}"; shift 2 ;;
-      --node-version) NODE_VERSION="${2:-}"; shift 2 ;;
-      --mirror)       MIRROR="${2:-}"; shift 2 ;;
+      # —— 取值型参数：统一在这里校验「确实给了值」——
+      # 不能写成 `X="${2:-}"; shift 2`：只给选项不给值时 shift 越界返回 1，
+      # 会被 set -e 的 ERR trap 当成「脚本在第 N 行意外失败」，用户看到的是崩溃
+      # 而不是「你少给了一个值」。十几个选项同一个坑，所以合并成一个分支处理。
+      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror)
+        if [[ $# -lt 2 || -z "${2-}" ]]; then
+          die "参数 $1 缺少取值（示例：bash ${SCRIPT_NAME} $1 <值>；完整用法见 --help）"
+        fi
+        case "$1" in
+          --domain)       DOMAIN="$2" ;;
+          --port)         APP_PORT="$2" ;;
+          --https-port)   HTTPS_PORT="$2" ;;
+          --http-port)    HTTP_PORT="$2" ;;
+          --dir)          INSTALL_DIR="$2" ;;
+          --data-dir)     DATA_DIR="$2" ;;
+          --mode)         MODE="$2" ;;
+          --tls)          TLS_MODE="$2" ;;
+          --email)        EMAIL="$2" ;;
+          --path)         SUB_PATH="$2" ;;
+          --repo)         REPO_URL="$2" ;;
+          --node-version) NODE_VERSION="$2" ;;
+          --mirror)       MIRROR="$2" ;;
+        esac
+        shift 2 ;;
       --staging)      STAGING=1; shift ;;
       --skip-node)    SKIP_NODE=1; shift ;;
       --skip-deps)    SKIP_DEPS=1; shift ;;
@@ -439,6 +467,8 @@ parse_args() {
       --skip-service) SKIP_SERVICE=1; shift ;;
       --reinstall)    REINSTALL=1; ASSUME_YES=1; shift ;;
       --manage)       MANAGE=1; shift ;;
+      # kepler <编号> / deploy.sh <编号>：与菜单编号一致，直接执行对应管理动作
+      [0-9])          MANAGE=1; MANAGE_ACTION="$1"; shift ;;
       -y|--yes)       ASSUME_YES=1; shift ;;
       --verbose)      VERBOSE=1; shift ;;
       --uninstall)    UNINSTALL=1; shift ;;
@@ -467,9 +497,14 @@ detect_env() {
   chmod 0600 "$LOG_FILE"
   info "详细日志：${LOG_FILE}"
 
-  # 单实例锁，避免并发执行互相踩踏
+  # 单实例锁，避免并发执行互相踩踏。
+  # 注意：`kepler 1`（重装）用 exec 把自己换成新进程，而 exec 不会触发 EXIT trap，
+  # 锁文件会留在磁盘上 —— 新进程一进来就会误判成「另一个部署进程正在运行」。
+  # 所以重装通过 KEPLER_LOCK_HELD 把锁**交接**给新进程，仍由新进程负责清理。
   mkdir -p "$(dirname "$LOCK_FILE")"
-  if ! (set -o noclobber; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
+  if [[ "${KEPLER_LOCK_HELD:-}" == "$LOCK_FILE" ]]; then
+    info "沿用父进程持有的部署锁：${LOCK_FILE}"
+  elif ! (set -o noclobber; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
     die "检测到另一个部署进程正在运行（锁文件 ${LOCK_FILE}）。若确认已退出，请删除该锁文件后重试。"
   fi
   trap 'rm -f "$LOCK_FILE"' EXIT
@@ -662,7 +697,13 @@ pkg_install_opt() {
   [[ ${#pkgs[@]} -gt 0 ]] || return 0
   local rc=0
   pkg_run_pm "${pkgs[@]}" || rc=$?
-  if ((rc != 0)); then on_pkg_failure "${pkgs[*]}" 1; return 1; fi
+  if ((rc != 0)); then
+    # on_pkg_failure 在「可选」分支里 return 1（表示未装上）。这里是**裸调用**，
+    # 返回 1 会被 set -e 的 ERR trap 直接判成「脚本意外失败」，调用点的 `|| true`
+    # 根本来不及生效 —— 明明设计成"装不上就降级"，实际却会中断部署。
+    on_pkg_failure "${pkgs[*]}" 1 || true
+    return 1
+  fi
   return 0
 }
 
@@ -710,11 +751,14 @@ ask() {
 }
 
 is_ip_addr() {
-  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" == *:* ]]
+  if [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then return 0; fi
+  if [[ "$1" == *:* ]]; then return 0; fi
+  return 1
 }
 
 is_valid_domain() {
-  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+  if [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then return 0; fi
+  return 1
 }
 
 collect_config() {
@@ -846,7 +890,7 @@ install_node() {
   local required="18"
   NODE_BIN="$(command -v node || true)"
   if [[ -n "$NODE_BIN" ]]; then
-    local cur; cur="$("$NODE_BIN" -v | sed 's/^v//')"
+    local cur; cur="$("$NODE_BIN" -v | sed 's/^v//' || true)"
     if version_ge "$cur" "$required"; then
       ok "Node.js 已安装：v${cur}（$NODE_BIN）"
       return 0
@@ -872,7 +916,7 @@ install_node() {
     zypper) run_soft zypper --non-interactive install nodejs npm ;;
   esac
   NODE_BIN="$(command -v node || true)"
-  if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//')" "$required"; then
+  if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
     ok "Node.js 安装完成：$("$NODE_BIN" -v)"
     return 0
   fi
@@ -891,7 +935,7 @@ install_node() {
         && run_soft "$PM" install -y nodejs
     fi
     NODE_BIN="$(command -v node || true)"
-    if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//')" "$required"; then
+    if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
       ok "Node.js 安装完成（NodeSource）：$("$NODE_BIN" -v)"
       return 0
     fi
@@ -933,7 +977,7 @@ install_node() {
   fi
   if have ldconfig; then run_soft ldconfig; fi
   NODE_BIN="$(command -v node || true)"
-  if [[ -z "$NODE_BIN" ]] || ! version_ge "$("$NODE_BIN" -v | sed 's/^v//')" "$required"; then
+  if [[ -z "$NODE_BIN" ]] || ! version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
     node_manual_hints
     die_with_hint "Node.js 自动安装失败（三种方式都没装上 v${required}+）" "${HINTS[@]}"
   fi
@@ -1020,7 +1064,9 @@ install_app() {
     done
   fi
   if [[ -f "${INSTALL_DIR}/package.json" ]]; then
-    APP_VERSION="$(grep -m1 '"version"' "${INSTALL_DIR}/package.json" | sed 's/.*: *"//;s/".*//')"
+    # 取不到就回落默认值，绝不因 grep/sed 的返回码让部署中断（pipefail 下会）
+    APP_VERSION="$(grep -m1 '"version"' "${INSTALL_DIR}/package.json" 2>/dev/null | sed 's/.*: *"//;s/".*//' || true)"
+    [[ -n "$APP_VERSION" ]] || APP_VERSION="1.0.0"
   else
     warn "安装目录中未找到 package.json，请确认源码同步是否完整。"
   fi
@@ -1151,7 +1197,7 @@ install_nginx() {
   fi
   if ! have nginx; then locate_nginx; fi
   if have nginx; then
-    ok "Nginx 已安装：$(nginx -v 2>&1 | sed 's/.*nginx\///')"
+    ok "Nginx 已安装：$(nginx -v 2>&1 | sed 's/.*nginx\///' || true)"
   else
     info "安装 Nginx…"
     pkg_install nginx
@@ -1277,7 +1323,7 @@ verify_conf_loaded() {
 
 nginx_http2_directive() {
   # nginx ≥ 1.25.1 使用独立指令 http2 on; 旧版本写在 listen 行内
-  local v; v="$(nginx -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n1)"
+  local v; v="$(nginx -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n1 || true)"
   if [[ -n "$v" ]] && version_ge "$v" "1.25.1"; then printf 'http2 on;'; else printf ''; fi
 }
 
@@ -1466,7 +1512,7 @@ check_server_name_conflict() {
   files="$(awk -v d="${DOMAIN}" '
       /^# configuration file / { f = $4; sub(/:$/, "", f) }
       index($0, "server_name") && index($0, d) { if (f != "") print f }
-    ' <<<"$dumped" | sort -u | wc -l)"
+    ' <<<"$dumped" | sort -u | wc -l || true)"
   files="${files//[[:space:]]/}"
   if [[ "${files:-0}" =~ ^[0-9]+$ ]] && ((files > 1)); then
     warn "Nginx 里有 ${files} 个配置文件都用到了域名 ${DOMAIN}（可能在面板里已建过同名站点）"
@@ -1573,7 +1619,7 @@ gen_self_signed() {
 }
 
 ensure_certbot() {
-  if have certbot; then ok "certbot 已安装：$(certbot --version 2>/dev/null | head -n1)"; return 0; fi
+  if have certbot; then ok "certbot 已安装：$(certbot --version 2>/dev/null | head -n1 || true)"; return 0; fi
   info "安装 certbot…"
   case "$PM" in
     apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot' ;;
@@ -1592,9 +1638,11 @@ ensure_certbot() {
 
 domain_resolves_here() {
   local ip="" pub=""
-  if have getent; then ip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1)"; fi
-  [[ -z "$ip" ]] && have dig && ip="$(dig +short A "$DOMAIN" 2>/dev/null | head -n1)"
-  [[ -z "$ip" ]] && have nslookup && ip="$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: /{print $2}' | tail -n1)"
+  # 这几条解析命令在「域名没解析 / 没装 dig」时都会返回非 0；pipefail 下必须显式兜底，
+  # 否则还没轮到签发证书，脚本就被 ERR trap 打断了。
+  if have getent; then ip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1 || true)"; fi
+  [[ -z "$ip" ]] && have dig && ip="$(dig +short A "$DOMAIN" 2>/dev/null | head -n1 || true)"
+  [[ -z "$ip" ]] && have nslookup && ip="$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: /{print $2}' | tail -n1 || true)"
   [[ -z "$ip" ]] && return 2                     # 无法解析（未知）
   pub="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "$pub" ]] && pub="$(curl -fsS --max-time 8 http://ifconfig.me 2>/dev/null || true)"
@@ -1739,6 +1787,17 @@ port_in_use() {
   return 1
 }
 
+# 建议的「换一个端口」值：避开对外端口与应用内置端口（3443/8443），并注意 65535 上界
+next_port() {
+  local p=$((APP_PORT + 1))
+  if ((p > 65535)); then p=$((APP_PORT - 1)); fi
+  while [[ "$p" == "$HTTP_PORT" || "$p" == "$HTTPS_PORT" || "$p" == "3443" || "$p" == "8443" ]]; do
+    p=$((p + 1))
+  done
+  if ((p < 1 || p > 65535)); then p=3000; fi
+  printf '%s' "$p"
+}
+
 # 服务起不来时的排查指引（非致命，交给 wait_for_service 兜底）
 service_failure_hints() {
   local kind="$1"
@@ -1766,10 +1825,10 @@ service_failure_hints() {
 check_port_free() {
   if port_in_use "$APP_PORT"; then
     local owner=""
-    if have ss; then owner="$(ss -ltnp 2>/dev/null | grep -E ":${APP_PORT}\b" | head -n1)"; fi
+    if have ss; then owner="$(ss -ltnp 2>/dev/null | grep -E ":${APP_PORT}\b" | head -n1 || true)"; fi
     warn "端口 ${APP_PORT} 已被占用：${owner:-（未能识别进程）}"
     warn "  · 若占用者就是本服务的旧实例，脚本会重启它，无需处理；"
-    warn "  · 若是其它程序，请用 --port <其它端口> 重跑，例如：$(rerun_cmd --port $((APP_PORT + 1)))"
+    warn "  · 若是其它程序，请用 --port <其它端口> 重跑，例如：$(rerun_cmd --port "$(next_port)")"
   fi
 }
 
@@ -2017,7 +2076,7 @@ diagnose_service() {
     add_hint "服务日志最后几行："
     local l
     while IFS= read -r l; do [[ -n "$l" ]] && add_hint "    | ${l}"; done \
-      <<<"$(printf '%s\n' "$j" | grep -viE '^\s*$' | tail -n 12)"
+      <<<"$(printf '%s\n' "$j" | grep -viE '^\s*$' | tail -n 12 || true)"
   else
     add_hint ""
     add_hint "（没读到服务日志，可能服务从未真正启动过）"
@@ -2028,7 +2087,7 @@ diagnose_service() {
     add_hint "【结论】端口 ${APP_PORT} 已被占用。"
     add_hint "  · ss -ltnp | grep ':${APP_PORT}'      # 看是谁占着"
     add_hint "  · ps aux | grep 'server/index.js' | grep -v grep   # 本应用只允许一个实例"
-    add_hint "  · 换端口重跑：$(rerun_cmd --port $((APP_PORT + 1)))"
+    add_hint "  · 换端口重跑：$(rerun_cmd --port "$(next_port)")"
   elif grep -qiE 'Cannot find module|MODULE_NOT_FOUND' <<<"$j"; then
     add_hint "【结论】依赖缺失：node_modules 不完整。"
     add_hint "  · cd ${INSTALL_DIR} && npm ci --omit=dev"
@@ -2060,7 +2119,9 @@ diagnose_service() {
   fi
 
   local who=""
-  if have ss; then who="$(ss -ltnp 2>/dev/null | grep ":${APP_PORT}\b" | head -n1)"; fi
+  # 端口没人监听时 grep 返回 1；开了 pipefail 会让整条赋值语句失败，
+  # 被 ERR trap 当成「脚本意外失败」—— 而这里恰恰是服务没起来时才会走到。
+  if have ss; then who="$(ss -ltnp 2>/dev/null | grep ":${APP_PORT}\b" | head -n1 || true)"; fi
   [[ -n "$who" ]] && add_hint "  端口现状：${who}"
   if have pgrep; then
     local pids; pids="$(pgrep -f 'server/index.js' 2>/dev/null | tr '\n' ' ' || true)"
@@ -2335,6 +2396,18 @@ prompt_port_change() {
   apply_port_change "$value"
 }
 
+# 重装：就地切换到安装目录里的脚本（--reinstall 会复用已保存状态）。
+# exec 不会触发 EXIT trap，所以显式把单实例锁交接给新进程（KEPLER_LOCK_HELD），
+# 否则新进程一启动就会撞上自己留下的锁文件、直接判「另一个部署进程正在运行」。
+reinstall_now() {
+  local target="${INSTALL_DIR}/deploy.sh"
+  [[ -f "$target" ]] || die "未找到安装目录内的部署脚本：${target}（无法重装，请重新执行一键部署）"
+  info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装。"
+  plain "  数据目录 ${DATA_DIR} 不会被触碰；重装结束后会重跑健康检查。"
+  trap - EXIT
+  exec env KEPLER_LOCK_HELD="$LOCK_FILE" bash "$target" --reinstall
+}
+
 manage_menu() {
   [[ "$STATE_LOADED" == "1" ]] || die "未找到部署状态 ${STATE_FILE}，请先执行一键部署。"
   while true; do
@@ -2349,11 +2422,7 @@ manage_menu() {
     local choice=""
     read -r -p "请输入编号并回车: " choice || { log "已退出。"; return 0; }
     case "$choice" in
-      1)
-        info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装（数据目录不会被删除）。"
-        rm -f "$LOCK_FILE"
-        trap - EXIT
-        exec bash "${INSTALL_DIR}/deploy.sh" --reinstall ;;
+      1) reinstall_now ;;
       2) prompt_admin_username ;;
       3) prompt_admin_password ;;
       4) prompt_port_change ;;
@@ -2367,10 +2436,7 @@ manage_menu() {
 # 命令行直接执行编号：kepler 2（与菜单编号一致）
 manage_action() {
   case "$1" in
-    1)
-      [[ -f "${INSTALL_DIR}/deploy.sh" ]] || die "未找到安装目录脚本：${INSTALL_DIR}/deploy.sh"
-      info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装（数据目录不会被删除）。"
-      exec bash "${INSTALL_DIR}/deploy.sh" --reinstall ;;
+    1) reinstall_now ;;
     2) prompt_admin_username ;;
     3) prompt_admin_password ;;
     4) prompt_port_change ;;
@@ -2388,9 +2454,15 @@ safe_remove_tree() {
   [[ -n "$path" && "$path" == /* && "$path" != / ]] || [[ "$path" =~ ^[A-Za-z]:[\\/][^\\/] ]] \
     || die "拒绝删除无效${label}路径（必须是非根的绝对路径）：${path}"
   case "$path" in
-    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/home/*|/root/*|*/Desktop|*/Desktop/*|*/Downloads|*/Downloads/*|*/Documents|*/Documents/*)
-      die "安全保护：拒绝递归删除高风险${label}路径 ${path}，请人工核对后处理。" ;;
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
+      die "安全保护：拒绝递归删除系统目录（${label}）：${path}" ;;
   esac
+  # 家目录本身（/home/<用户>、/Users/<用户>）与个人目录下的任何路径都不动。
+  # 这里刻意不用 /home/* 这类通配：case 的 * 会跨 "/" 匹配，会把
+  # /home/deploy/kepler 这种正常安装目录一起拦掉，导致卸载永远失败。
+  if [[ "$path" =~ ^/(home|Users)/[^/]+/?$ || "$path" =~ /(Desktop|Downloads|Documents)(/|$) ]]; then
+    die "安全保护：拒绝递归删除家目录或个人目录下的${label}路径 ${path}，请人工核对后处理。"
+  fi
   [[ ${#path} -ge 8 ]] || die "安全保护：${label}路径过短，拒绝删除：${path}"
   # 先尝试系统 rm；某些环境（如 Git Bash / MSYS2）会拒绝带盘符前缀的路径，
   # 此时退回到 Node 的递归删除（跨平台语义一致，同样只针对上面校验过的绝对路径）。
@@ -2456,6 +2528,9 @@ do_uninstall() {
   if [[ -x /root/.acme.sh/acme.sh ]]; then run_soft /root/.acme.sh/acme.sh --remove -d "$DOMAIN"; fi
 
   rm -f -- "$GLOBAL_COMMAND"
+  # 脚本可能正站在安装目录里（install_app 会 cd 进去），先把工作目录挪走，
+  # 否则删掉 CWD 之后任何相对路径都会失效。
+  cd / 2>/dev/null || true
   if [[ "$data" == "$INSTALL_DIR" || "$data" == "$INSTALL_DIR"/* ]]; then
     safe_remove_tree "$INSTALL_DIR" "安装目录（含数据）"
   else
@@ -2595,8 +2670,16 @@ main() {
   fi
   if [[ "$MANAGE" == "1" ]]; then
     detect_env
-    if [[ $# -gt 0 ]]; then
-      manage_action "$1"
+    # 没有部署状态时，下面的「改端口 / 重装」会拿着内置默认值去写 .env、写状态文件、
+    # 重启一个并不存在的服务 —— 提前拦住，直接说清楚该先做什么。
+    if [[ "$STATE_LOADED" != "1" ]]; then
+      die_with_hint "未找到部署状态 ${STATE_FILE}，无法进入管理" \
+        "  · 本机可能还没有用本脚本部署过，或状态文件已被清理" \
+        "  · 首次部署：bash ${SCRIPT_NAME} --domain <域名>（部署完成后才会注册 kepler 命令）" \
+        "  · 若安装目录与数据目录仍在，可用 --dir/--data-dir 重新部署以恢复管理能力"
+    fi
+    if [[ -n "$MANAGE_ACTION" ]]; then
+      manage_action "$MANAGE_ACTION"
     else
       manage_menu
     fi

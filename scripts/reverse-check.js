@@ -1752,6 +1752,82 @@ const CASES = [
       testFile: 'audit17-regressions.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * D3-01（第 18 轮）：把 `acme_issue_skipped` 的退出码判据退回「认不出的码」。
+       *
+       * acme.sh 的 `RENEW_SKIP=2` 是「证书未到续期时间」的**成功**语义（源码第 93 行
+       * `RENEW_SKIP=2`，`issue()` 打印 "Skipping. Next renewal time is: …" 后 `return $RENEW_SKIP`）。
+       * 丢掉这个判据后就只剩「措辞」那一层兜底 —— 而现场日志里退出码是被放大到
+       * `[错误] 命令执行失败（退出码 2）` 呈现的，用户看到的正是这一行。
+       * 后果：`issue_acme_sh` 判签发失败 → `setup_tls` 回退自签名 → 点「重新安装」SSL 掉级。
+       */
+      name: 'D3-01 · acme_issue_skipped 不再认退出码 2（重装把正式证书降级为自签名）',
+      file: 'deploy.sh',
+      anchor: '  if ((rc == 2)); then return 0; fi\n',
+      replacement: '  if ((rc == 99)); then return 0; fi\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-02（第 18 轮）：绕过 `_run_impl` 的「容忍列表」—— 无论调用方声明了什么退出码，
+       * 一律打 `[错误] 命令执行失败（退出码 N）`。
+       * 现场表现就是「上一行：已存在 ZeroSSL 的 ACME 账户，跳过注册。下一行：[错误] 命令执行失败」，
+       * 明明两行说的是同一件正常的事，读起来却像证书坏了。
+       */
+      name: 'D3-02 · run_allow_rc 的容忍列表失效（被允许的退出码照样打成错误）',
+      file: 'deploy.sh',
+      anchor: '    if ((tolerated == 0)); then\n',
+      replacement: '    if ((1)); then\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-03（第 18 轮）：`tls_cert_reusable` 的文件判据退回「存在即算」更狠的一档 ——
+       * 直接 `return 0`，等于「有目录就算有证书」。空文件、垃圾内容、缺失的 privkey
+       * 全部被判成「可复用」→ 跳过申请 → Nginx 拿一张读不出来的证书起不来，
+       * 而「已跳过证书申请」的输出看着一切正常，现场很难往证书上想。
+       */
+      name: 'D3-03 · tls_cert_reusable 退回「有文件即算可复用」（空/垃圾证书被跳过申请）',
+      file: 'deploy.sh',
+      anchor: '  [[ -s "${dir}/fullchain.pem" && -s "${dir}/privkey.pem" ]] || return 1\n'
+        + '  have openssl || return 1\n',
+      replacement: '  return 0\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-04（第 18 轮）：`setup_tls` 的 auto|acme 分支退回「无条件申请」（跳过分支失效）。
+       * 证书明明装好且在有效期内，重装还是跑去 `--issue`；只要那次申请失败
+       * （CA 配额 / 网络 / EAB 任何一项），后面就接 `gen_self_signed` —— 正式证书被降级。
+       * 这正是用户报的「重新安装后 SSL 又只能退回自签名」的后半段：
+       * 症状的根因是「不该跑的步骤跑了」，而不是「申请本身有 bug」。
+       */
+      name: 'D3-04 · setup_tls 退回「无条件申请」（已完成步骤被重做，失败即降级）',
+      file: 'deploy.sh',
+      anchor: '      if [[ "$FORCE_CERT" != "1" ]] && tls_cert_reusable "$ACME_CERT_DIR"; then\n',
+      replacement: '      if false; then\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-05（第 18 轮）：把 CERT_REUSE_MIN_DAYS 从 30 抬到 365。
+       * 分工是「本脚本只负责首次签发 / 补签，续期归 acme.sh 的每日任务（它在到期前
+       * 60 天自己续）」。阈值一旦越过 acme.sh 的续期窗口，两边就都不可信：
+       * 90 天有效期的证书被判成「不够新」而去重签，而真正的边界含义也随之上移。
+       * 阈值是「跳过申请」这件事的**唯一尺度**，尺度错了，跳过与不跳过都失去意义。
+       */
+      name: 'D3-05 · CERT_REUSE_MIN_DAYS 越过 acme.sh 的续期窗口（两边的分工被打乱）',
+      file: 'deploy.sh',
+      anchor: 'CERT_REUSE_MIN_DAYS=30\n',
+      replacement: 'CERT_REUSE_MIN_DAYS=365\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

@@ -1178,3 +1178,320 @@ printf 'RC=%s\\n' "$?"
   assert(/RC=0/.test(r.out),
     `证书已落盘时，即使 acme.sh 的 --install-cert（reloadcmd）失败也不该判「安装失败」：${(r.out + r.err).slice(0, 400)}`);
 });
+
+/**
+ * ------------------------------------------------------------------
+ * 重装不得把正式证书降级成服务器自签名（2026-09 现场故障）
+ *
+ * 现场原始日志：
+ *   [信息] 已存在 ZeroSSL 的 ACME 账户，跳过注册（无需再次提供 EAB）。
+ *   [错误] 命令执行失败（退出码 2）
+ *   → SSL 证书退回服务器自签名。
+ *
+ * 两处根因，各钉一组：
+ *   ① acme.sh 的退出码 2 是 `RENEW_SKIP`（源码第 93 行 `RENEW_SKIP=2`；`issue()` 在证书
+ *      未到续期时间时打印 "Domains not changed. / Skipping. Next renewal time is: … /
+ *      Add '--force' to force renewal." 之后 `return $RENEW_SKIP`）——**正常跳过，不是失败**。
+ *      旧 `issue_acme_sh` 用裸 `run` 判「非零即失败」→ 回退自签名。
+ *   ② 证书已装好且仍在有效期内时，重装压根不该再跑一遍申请：它可能失败（降级），
+ *      也会白占 CA 的速率配额。`setup_tls` 必须**先判可复用、再决定是否申请**。
+ *
+ * 修完必须能回答的一句话：*「重装时，已经做完且没坏的事不再重做。」*
+ * ------------------------------------------------------------------
+ */
+test('deploy.sh：acme.sh 退出码 2（RENEW_SKIP）不得被当成签发失败', async () => {
+  const src = readDeploy();
+
+  assert(hasFn(src, 'run_allow_rc'),
+    '必须提供「可容忍指定退出码的 run」：否则无法既让调用方声明 2 属正常、又不掩盖真失败');
+  assert(hasFn(src, 'acme_issue_skipped'),
+    '「acme.sh 是否只是跳过续期」必须抽成独立判据函数（退出码 + 措辞双证据）');
+  assert(/\nrun\(\) \{ _run_impl "" "\$@"; \}/.test(src),
+    'run 必须等价于「不容忍任何退出码」，否则其他调用点的失败会被静默吞掉');
+
+  const issue = codeOnly(fnBody(src, 'issue_acme_sh'));
+  assert(/run_allow_rc 2 /.test(issue),
+    '`acme.sh --issue` 必须以 run_allow_rc 2 调用 —— RENEW_SKIP 的退出码就是 2');
+  assert(/acme_issue_skipped "\$rc"/.test(issue),
+    '非零退出码必须先交给 acme_issue_skipped 判定，而不是直接当失败');
+  assert(!/if ! run .*acme_bin.*\$\{args\[@\]\}/.test(issue),
+    '不得再对 --issue 用裸 run 判失败：那正是把退出码 2 误判成「签发失败 → 回退自签名」的写法');
+  assert(/RENEW_SKIP/.test(fnBody(src, 'issue_acme_sh')),
+    '注释里要写明退出码 2 的语义（RENEW_SKIP），否则下一个人会把「容忍 2」那行当冗余删掉');
+
+  const skipFn = codeOnly(fnBody(src, 'acme_issue_skipped'));
+  assert(/rc == 2/.test(skipFn), 'acme_issue_skipped 必须把退出码 2 直接判为「跳过续期」');
+  assert(/next renewal time is/i.test(skipFn) && /domains not changed/i.test(skipFn),
+    '除退出码外还要认 acme.sh 的措辞：退出码可能被包装层改写，措辞才是它的直接证据');
+
+  // 行为验证：三种输入 → 三种结论。措辞一路靠 log_since_mark 这个「日志来源」接缝注入，
+  // 判据本体（哪些措辞、退出码怎么处理）仍跑真实代码。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+if acme_issue_skipped 2; then printf 'RC2=skip\\n'; else printf 'RC2=fail\\n'; fi
+FAKE_LOG=''
+log_since_mark() { printf '%s\\n' "$FAKE_LOG"; }
+FAKE_LOG='Domains not changed.
+Skipping. Next renewal time is: Sun Oct 25 00:00:00 UTC 2026
+Add --force to force renewal.'
+if acme_issue_skipped 1; then printf 'TEXT=skip\\n'; else printf 'TEXT=fail\\n'; fi
+FAKE_LOG='Error, can not get domain token.'
+if acme_issue_skipped 1; then printf 'REAL=skip\\n'; else printf 'REAL=fail\\n'; fi
+`);
+  if (r.unavailable) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/RC2=skip/.test(r.out),
+    `退出码 2 必须判为「跳过续期」而不是失败：${seen.slice(0, 300)}`);
+  assert(/TEXT=skip/.test(r.out),
+    `退出码被改写、但日志里是 acme.sh 的跳过措辞时，也必须判为跳过：${seen.slice(0, 300)}`);
+  assert(/REAL=fail/.test(r.out),
+    `真正的失败（如拿不到域名校验 token）不得被判成「跳过续期」——那会让重装悄悄复用一张不存在的证书：${seen.slice(0, 300)}`);
+});
+
+test('deploy.sh：被允许的退出码不得打成 [错误]（误导用户的直接来源）', async () => {
+  const src = readDeploy();
+  const impl = codeOnly(fnBody(src, '_run_impl'));
+  assert(/for code in \$allow/.test(impl),
+    '「容忍哪些退出码」必须逐个比对（allow 是退出码列表），而不是只判非零');
+  assert(/tolerated/.test(impl), '必须真的按 tolerated 分支决定打不打错误块');
+  assert(/\nrun_allow_rc\(\) \{ .*_run_impl "\$allow" "\$@"; \}/.test(src),
+    'run_allow_rc 必须把允许列表原样交给 _run_impl，不能自己吞掉返回码');
+  const occurrences = (codeOnly(src).match(/命令执行失败/g) || []).length;
+  assert(occurrences === 1,
+    `「命令执行失败」只应出现在 _run_impl 里（实测 ${occurrences} 处）：多一处就意味着有别的路径绕过 allow 列表自己判失败`);
+
+  // 行为验证：LOG_FILE 是 readonly 常量，测试改不了它 —— 不可写就跳过运行期断言
+  // （脚本本体会 mkdir -p 它的目录，root 下必然可写；只影响开发机/CI）。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then printf 'LOG_UNAVAILABLE\\n'; exit 0; fi
+run_allow_rc 2 bash -c 'exit 2'   2>&1 | grep -c '命令执行失败' | sed 's/^/TOLERATED=/'
+run bash -c 'exit 3'              2>&1 | grep -c '命令执行失败' | sed 's/^/STRICT=/'
+run_allow_rc 2 bash -c 'exit 3'   2>&1 | grep -c '命令执行失败' | sed 's/^/OTHER=/'
+`);
+  if (r.unavailable || /LOG_UNAVAILABLE/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/TOLERATED=0/.test(r.out),
+    `被允许的退出码（2）不该打印任何「命令执行失败」块 —— 这正是用户看到的「信息：跳过注册 / 错误：退出码 2」：${seen.slice(0, 300)}`);
+  assert(/STRICT=1/.test(r.out),
+    `未被允许的退出码仍必须打印错误块：容忍机制不能把真失败一起吞掉：${seen.slice(0, 300)}`);
+  assert(/OTHER=1/.test(r.out),
+    `只允许 2 时，退出码 3 仍要报错（不能退化成「只要声明了 allow 就全都放过」）：${seen.slice(0, 300)}`);
+});
+
+test('deploy.sh：tls_cert_reusable 的判据与阈值（「跳过申请」的前提）', async () => {
+  const src = readDeploy();
+  const m = /^CERT_REUSE_MIN_DAYS=(\d+)/m.exec(src);
+  assert(m, '必须有 CERT_REUSE_MIN_DAYS 常量，作为「证书还够新、不必再申请」的天数阈值');
+  const days = Number(m[1]);
+  assert(days >= 1 && days <= 60,
+    `阈值应落在 1..60 天：acme.sh 自己的每日任务在到期前 60 天续期，脚本不该越过它（当前 ${days}）`);
+
+  const body = codeOnly(fnBody(src, 'tls_cert_reusable'));
+  assert(/-checkend/.test(body),
+    '必须用 openssl x509 -checkend 判「未来 N 天内会不会过期」：解析 notAfter 文本会撞上 BSD/GNU 的 date 语法差异');
+  assert(/-s "\$\{dir\}\/fullchain\.pem"/.test(body) && /-s "\$\{dir\}\/privkey\.pem"/.test(body),
+    'fullchain 与 privkey 两个文件都必须「存在且非空」才算可复用（缺一个就起不了 TLS）');
+
+  // 行为验证：阈值两侧各留余量（90 天 ≫ 30、10 天 ≪ 30），外加三类「看似有文件其实不可用」
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+if ! command -v openssl >/dev/null 2>&1; then printf 'NO_OPENSSL\\n'; exit 0; fi
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+D="$T/acme"; mkdir -p "$D"
+mkcert() {
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days "$1" \\
+    -keyout "$D/privkey.pem" -out "$D/fullchain.pem" -subj '/CN=cos.example.com' >/dev/null 2>&1
+}
+rep() { if tls_cert_reusable "$D"; then printf '%s=reusable\\n' "$1"; else printf '%s=notreusable\\n' "$1"; fi; }
+mkcert 90
+rep FRESH_90D
+mkcert 10
+rep SOON_10D
+rm -f "$D/privkey.pem"
+rep NO_KEY
+: > "$D/fullchain.pem"; printf 'k' > "$D/privkey.pem"
+rep EMPTY_CHAIN
+printf 'not a certificate' > "$D/fullchain.pem"
+rep BAD_CERT
+`);
+  if (r.unavailable || /NO_OPENSSL/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/FRESH_90D=reusable/.test(r.out),
+    `90 天有效期的证书必须判为可复用（阈值 ${days} 天）：${seen.slice(0, 300)}`);
+  assert(/SOON_10D=notreusable/.test(r.out),
+    `只剩 10 天的证书必须判为不可复用，不能因为「文件在」就跳过申请：${seen.slice(0, 300)}`);
+  assert(/NO_KEY=notreusable/.test(r.out),
+    `缺 privkey.pem 必须判为不可复用（只查 fullchain 会让 Nginx 起不来）：${seen.slice(0, 300)}`);
+  assert(/EMPTY_CHAIN=notreusable/.test(r.out),
+    `空的 fullchain.pem 必须判为不可复用（判据是「非空」-s，不是「存在」-e）：${seen.slice(0, 300)}`);
+  assert(/BAD_CERT=notreusable/.test(r.out),
+    `不是证书的文件必须判为不可复用：判据不能只看文件大小，得真让 openssl 读一遍：${seen.slice(0, 300)}`);
+});
+
+test('deploy.sh：证书已装好且仍在有效期内 → 重装跳过申请（不重跑已完成步骤）', async () => {
+  const src = readDeploy();
+  const tls = codeOnly(fnBody(src, 'setup_tls'));
+  const iReuse = tls.indexOf('tls_cert_reusable "$ACME_CERT_DIR"');
+  const iIssue = tls.indexOf('issue_cert');
+  assert(iReuse !== -1,
+    'setup_tls 的 auto|acme 分支必须先用 tls_cert_reusable 判「证书是否可复用」');
+  assert(iIssue !== -1 && iReuse < iIssue,
+    '「可复用就跳过」的判定必须排在 issue_cert 之前：排在后面等于照样跑一遍申请（照样可能降级）');
+  assert(/FORCE_CERT/.test(tls),
+    '必须有逃生门 FORCE_CERT：用户想强制重签时不能被「跳过」挡住');
+  assert(!/SELF_SIGNED_DIR/.test(tls),
+    '可复用判据只能认 ACME_CERT_DIR（正式证书）这一个来源：把自签名目录也算进去，「正式证书掉了」就永远修不回来');
+
+  // 行为验证：四个场景 —— 够新则跳过、临近到期则申请、没有则申请、--force-cert 则强制申请
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+if ! command -v openssl >/dev/null 2>&1; then printf 'NO_OPENSSL\\n'; exit 0; fi
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+OUTF="$T/setup-tls.out"
+ACME_CERT_DIR="$T/acme"
+SELF_SIGNED_DIR="$T/self"
+TLS_MODE=auto
+
+ISSUE_CALLS=0
+issue_cert() { ISSUE_CALLS=$((ISSUE_CALLS + 1)); CERT_FULLCHAIN="$ACME_CERT_DIR/fullchain.pem"; CERT_KEY="$ACME_CERT_DIR/privkey.pem"; return 0; }
+gen_self_signed() { printf 'SELFSIGNED\\n'; }
+write_nginx_conf() { :; }
+nginx_apply() { :; }
+
+mkcert() {
+  mkdir -p "$ACME_CERT_DIR"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days "$1" \\
+    -keyout "$ACME_CERT_DIR/privkey.pem" -out "$ACME_CERT_DIR/fullchain.pem" \\
+    -subj '/CN=cos.example.com' >/dev/null 2>&1
+}
+
+# 注意：setup_tls 的输出**不能**用 out="$(setup_tls ...)" 接 —— 命令替换是子 shell，
+# issue_cert 里的 ISSUE_CALLS 计数与 CERT_FULLCHAIN 赋值都传不回来，四个场景会
+# 一律显示 ISSUE=0、把「该申请时没申请」变成假绿。改为重定向到文件再读。
+case_run() {
+  local label="$1" force="$2" src=OTHER skip=0 back=0
+  ISSUE_CALLS=0
+  CERT_FULLCHAIN=""
+  FORCE_CERT="$force"
+  setup_tls >"$OUTF" 2>&1
+  if [[ "$CERT_FULLCHAIN" == "$ACME_CERT_DIR/fullchain.pem" ]]; then src=ACMECERT; fi
+  if grep -q '跳过证书申请' "$OUTF"; then skip=1; fi
+  if grep -q '改用自签名' "$OUTF"; then back=1; fi
+  printf '%s|ISSUE=%s|CERT=%s|SKIPMSG=%s|FALLBACK=%s\\n' "$label" "$ISSUE_CALLS" "$src" "$skip" "$back"
+}
+
+mkcert 90
+case_run FRESH_90D 0
+mkcert 10
+case_run SOON_10D 0
+rm -rf "$ACME_CERT_DIR"
+case_run NO_CERT 0
+mkcert 90
+case_run FORCE_CERT 1
+`);
+  if (r.unavailable || /NO_OPENSSL/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/FRESH_90D\|ISSUE=0\|CERT=ACMECERT\|SKIPMSG=1\|FALLBACK=0/.test(r.out),
+    `证书还在有效期内时，重装必须一条申请命令都不发（ISSUE=0）、打出跳过提示、且绝不回退自签名：${seen.slice(0, 400)}`);
+  assert(/SOON_10D\|ISSUE=1\|/.test(r.out),
+    `证书临近到期时必须照旧去申请（ISSUE=1），「跳过」不能变成永久不续期：${seen.slice(0, 400)}`);
+  assert(/NO_CERT\|ISSUE=1\|/.test(r.out),
+    `没有证书时必须去申请（ISSUE=1）：跳过分支不能把「首次部署」也一起跳过：${seen.slice(0, 400)}`);
+  assert(/FORCE_CERT\|ISSUE=1\|/.test(r.out),
+    `--force-cert 必须能压过「可复用就跳过」（ISSUE=1），否则用户没有任何手段重签：${seen.slice(0, 400)}`);
+});
+
+/**
+ * 用户现场那条日志的**端到端**复现：
+ *   [信息] 已存在 ZeroSSL 的 ACME 账户，跳过注册（无需再次提供 EAB）。
+ *   [错误] 命令执行失败（退出码 2）
+ * 上面的第 29 条只单独验了 `acme_issue_skipped` 的判据；这一条把 `issue_acme_sh` 整条路径
+ * 跑一遍（账户已存在 → --issue → --install-cert），确认它最终返回 0、不打错误块、
+ * 并把 CERT_FULLCHAIN 指到 `ACME_CERT_DIR` —— 也就是「重装不再降级为自签名」。
+ *
+ * 三个输入各钉一件事：
+ *   · RENEWAL_2（回放 acme.sh 的真实措辞 + 退出码 2）→ 措辞与退出码任一成立即判跳过；
+ *   · SILENT_2（什么都不打印，只退出 2）→ **只有退出码这一条证据**，
+ *     这正是「判据必须认退出码 2」的最小反例（撤掉它这条必红）；
+ *   · ERROR_1（真失败）→ 仍要判失败并打「签发失败」，容忍机制不能把真失败一起吞掉。
+ */
+test('deploy.sh：账户已存在 + --issue 退出码 2 → 重装判成功并复用证书（现场日志端到端）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then printf 'LOG_UNAVAILABLE\\n'; exit 0; fi
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+ACME_CERT_DIR="$T/acme"; mkdir -p "$ACME_CERT_DIR"
+DOMAIN=cos.example.com
+EMAIL=you@example.com
+CA_PROVIDER=zerossl
+
+# 把 acme.sh 换成一个假体：措辞照抄 acme.sh issue() 的真实输出，退出码由环境变量给。
+# 用带引号的 heredoc（'FAKE'）—— 里面必须保持字面，不能被展开。
+fake_acme() {
+  cat > "$T/acme.sh" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "$FAKE_MODE" == "renewal" ]]; then
+  echo "Domains not changed."
+  echo "Skipping. Next renewal time is: Sun Oct 25 00:00:00 UTC 2026"
+  echo "Add '--force' to force renewal."
+elif [[ "$FAKE_MODE" == "error" ]]; then
+  echo "Error, can not get domain token."
+fi
+exit "$FAKE_RC"
+FAKE
+  chmod +x "$T/acme.sh"
+  acme_bin() { printf '%s' "$T/acme.sh"; }
+}
+
+install_acme_sh() { return 0; }
+ca_server() { printf 'https://acme.zerossl.com/v2/DV90'; }
+ca_label() { printf 'ZeroSSL'; }
+acme_account_exists() { return 0; }
+acme_install_cert() { return 0; }
+
+probe() {
+  local label="$1" mode="$2" frc="$3" out="$T/out.txt" rc=0
+  fake_acme
+  FAKE_MODE="$mode"; export FAKE_MODE
+  FAKE_RC="$frc"; export FAKE_RC
+  CERT_FULLCHAIN=""
+  issue_acme_sh >"$out" 2>&1
+  rc=$?
+  printf '%s|RC=%s|ERRBLOCK=%s|SKIPMSG=%s|FAILMSG=%s|SIGNED=%s\\n' "$label" "$rc" \\
+    "$(grep -c '命令执行失败' "$out")" \\
+    "$(grep -c '跳过续期' "$out")" \\
+    "$(grep -c '签发失败' "$out")" \\
+    "$(if [[ "$CERT_FULLCHAIN" == "$ACME_CERT_DIR/fullchain.pem" ]]; then printf ok; else printf bad; fi)"
+}
+
+probe RENEWAL_2 renewal 2
+probe SILENT_2  silent  2
+probe ERROR_1   error   1
+`);
+  if (r.unavailable || /LOG_UNAVAILABLE/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/RENEWAL_2\|RC=0\|ERRBLOCK=0\|SKIPMSG=1\|FAILMSG=0\|SIGNED=ok/.test(r.out),
+    `现场那条「跳过注册 + 退出码 2」必须判成功：不打错误块、打印「跳过续期」、并把证书指向 ACME_CERT_DIR：${seen.slice(0, 500)}`);
+  assert(/SILENT_2\|RC=0\|ERRBLOCK=0\|SKIPMSG=1\|/.test(r.out),
+    `acme.sh 什么也不打印、只以退出码 2 收场时，也必须判「跳过续期」——退出码是这条判据的主证据，不能只靠日志措辞：${seen.slice(0, 500)}`);
+  assert(/ERROR_1\|RC=1\|ERRBLOCK=1\|SKIPMSG=0\|FAILMSG=1\|SIGNED=bad/.test(r.out),
+    `真失败（拿不到域名校验 token）仍须判失败并打「签发失败」：容忍退出码 2 不能把真失败一起吞掉：${seen.slice(0, 500)}`);
+});

@@ -173,6 +173,7 @@ HTTPS 证书默认向 **ZeroSSL** 申请（acme.sh 可用 `--email` 自动换取
 | `--ca zerossl\|letsencrypt\|litessl` | 选择 CA | 默认 `zerossl`；`litessl` 是亚数 TrustAsia 的免费 DV 证书，国内可直连 |
 | `--eab-kid <KID>` | EAB 凭据 | LiteSSL 必需；到 [litessl.com](https://www.litessl.com) 注册后生成 |
 | `--eab-hmac-key <密钥>` | EAB 凭据 | LiteSSL 必需；只经命令行交给 acme.sh，**不写入部署状态文件** |
+| `--force-cert` | 强制重签证书 | 默认策略是「已装好且仍在有效期内的正式证书 → 重装直接跳过申请」，本开关压过该跳过 |
 
 > 换 CA **不等于**换个接口地址：LiteSSL 与 ZeroSSL 的 ACME 接口都声明 `externalAccountRequired: true`，必须带 EAB（外部账户绑定）凭据。ZeroSSL 可由 acme.sh 用 `--email` 自动换取 EAB；LiteSSL 必须手工取。`--tls` 也可以直接写 CA 名，如 `--tls litessl`。
 >

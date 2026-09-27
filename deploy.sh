@@ -52,6 +52,7 @@
 #   --node-version <版本>   指定 Node.js 版本（默认解析最新的 20.x LTS）
 #   --mirror <auto|cn|official> 下载镜像：cn 走 npmmirror 加速；auto 先走官方源，失败自动改走国内
 #   --staging               使用 Let's Encrypt 测试环境（仅在 CA 为 letsencrypt 时生效）
+#   --force-cert            强制重新申请 HTTPS 证书（默认：已有可用证书则跳过申请）
 #   --skip-node             跳过 Node.js 安装（只校验版本；适合用 nvm/自建运行时的人）
 #   --skip-deps             跳过 npm 依赖安装
 #   --skip-nginx            跳过 Nginx 安装与反代配置（自行用 Caddy/Nginx 反代）
@@ -70,7 +71,7 @@
 # 环境变量（与命令行参数等价，参数优先级更高）：
 #   DOMAIN APP_PORT HTTPS_PORT HTTP_PORT INSTALL_DIR DATA_DIR MODE TLS_MODE
 #   EMAIL SUB_PATH REPO_URL NODE_VERSION MIRROR STAGING ASSUME_YES VERBOSE
-#   CA_PROVIDER EAB_KID EAB_HMAC_KEY
+#   CA_PROVIDER EAB_KID EAB_HMAC_KEY FORCE_CERT
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -104,6 +105,7 @@ SKIP_NODE="${SKIP_NODE:-0}"       # 跳过 Node.js 安装（用户自行管理�
 SKIP_DEPS="${SKIP_DEPS:-0}"       # 跳过 npm 依赖安装
 SKIP_NGINX="${SKIP_NGINX:-0}"     # 跳过 Nginx 安装与反代配置（用户自建反代）
 SKIP_SERVICE="${SKIP_SERVICE:-0}" # 跳过服务创建（用户用 pm2/supervisor 等自行守护）
+FORCE_CERT="${FORCE_CERT:-0}"     # 强制重签证书（默认：已有可用证书就跳过申请）
 SERVICE_READY=0            # 健康检查：本地应用是否就绪
 EXT_OK=0                   # 健康检查：外网访问是否通过
 NGINX_OK=1                 # Nginx 是否已配置成功
@@ -146,7 +148,16 @@ redact_args() {
 }
 
 # 执行子命令：正常输出写日志，失败时回显尾部日志并返回真实退出码
-run() {
+run() { _run_impl "" "$@"; }
+
+# 同 run，但把「调用方明确允许」的退出码当作正常结果（不打印错误块）。
+# 目前唯一的使用者：acme.sh --issue 的 RENEW_SKIP(2) —— 那是「证书还在有效期内、
+# 无需续期」，属于成功语义。若照旧在 run 里打成 `[错误] 命令执行失败（退出码 2）`，
+# 用户会以为证书出了问题（这正是现场那次误判的来源）。
+run_allow_rc() { local allow="$1"; shift; _run_impl "$allow" "$@"; }
+
+_run_impl() {
+  local allow="$1"; shift
   local rc=0
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   if [[ "$VERBOSE" == "1" ]]; then
@@ -155,10 +166,16 @@ run() {
     "$@" >>"$LOG_FILE" 2>&1 || rc=$?
   fi
   if ((rc != 0)); then
-    # 回显命令行时必须过一遍脱敏：acme.sh 的 EAB HMAC 密钥是从命令行传进去的
-    err "命令执行失败（退出码 ${rc}）：$(redact_args "$*")"
-    err "—— 本次操作的日志（完整日志：${LOG_FILE}）——"
-    log_since_mark | tail -n 30 >&2 || true
+    local tolerated=0 code
+    for code in $allow; do
+      if [[ "$rc" == "$code" ]]; then tolerated=1; break; fi
+    done
+    if ((tolerated == 0)); then
+      # 回显命令行时必须过一遍脱敏：acme.sh 的 EAB HMAC 密钥是从命令行传进去的
+      err "命令执行失败（退出码 ${rc}）：$(redact_args "$*")"
+      err "—— 本次操作的日志（完整日志：${LOG_FILE}）——"
+      log_since_mark | tail -n 30 >&2 || true
+    fi
   fi
   return "$rc"
 }
@@ -532,6 +549,7 @@ parse_args() {
         esac
         shift 2 ;;
       --staging)      STAGING=1; shift ;;
+      --force-cert)   FORCE_CERT=1; shift ;;
       --skip-node)    SKIP_NODE=1; shift ;;
       --skip-deps)    SKIP_DEPS=1; shift ;;
       --skip-nginx)   SKIP_NGINX=1; shift ;;
@@ -1908,6 +1926,12 @@ ACME_CERT_DIR="${SELF_SIGNED_DIR}/acme"     # acme.sh 签发的证书安装到�
 CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
 CERT_KEY="${CERT_KEY:-}"
 
+# 重装/重跑时「证书还够新，不必再申请」的天数阈值。
+# 分工：**续期归 acme.sh 的每日 cron**（它在到期前 60 天自己续），本脚本只负责「首次签发」
+# 与「证书缺失/临近到期时的补签」。故阈值不必等于 60 —— 取 30 天：既不会在证书快到期时
+# 盲目跳过，也不会因为阈值过大而白白多发一次 ACME 请求（每次请求都算 CA 的速率配额）。
+CERT_REUSE_MIN_DAYS=30
+
 # ------------------------------------------------------------------------------
 # 8.0 ACME 证书颁发机构（CA）注册表
 #
@@ -2012,6 +2036,51 @@ nginx_reload_cmd() {
 # acme.sh 可执行文件路径。现算而不缓存常量：ACME_HOME 允许被环境变量覆盖，
 # 在加载期缓存成常量会拿到覆盖前的旧值（表现为「明明指到临时目录，却读了真实账户」）。
 acme_bin() { printf '%s/acme.sh' "$ACME_HOME"; }
+
+# 证书是否「还够新」：够新就跳过申请，直接复用。
+#
+# 为什么需要一个判据而不是每次都去签发：重装/升级时把没坏的东西重做一遍，除了浪费一次
+# ACME 请求（占 CA 的速率配额），更糟的是**它可能失败**——acme.sh 在证书未到续期时间时
+# 会以退出码 2 收场（见 acme_issue_skipped），旧实现把它当失败就回退自签名，于是「重装」
+# 反而把好好的正式证书降级了（2026-09 现场故障）。
+#
+# 判据只用 openssl 的 -checkend：它直接回答「未来 N 天内会不会过期」，
+# 不必解析 notAfter 文本（BSD 与 GNU 的 date 语法不同，解析一换机器就翻车）。
+# 拿不到结论时返回 1 —— 那就照旧去申请，退化成原有流程，不冒险跳过。
+tls_cert_reusable() {
+  local dir="$1"
+  [[ -s "${dir}/fullchain.pem" && -s "${dir}/privkey.pem" ]] || return 1
+  have openssl || return 1
+  openssl x509 -in "${dir}/fullchain.pem" -noout \
+    -checkend $((CERT_REUSE_MIN_DAYS * 86400)) >/dev/null 2>&1
+}
+
+# 证书到期时间（仅用于打印；取不到就打印「未知」，不参与任何判断）
+cert_not_after() {
+  local crt="$1"
+  have openssl || { printf '未知'; return 0; }
+  # 剥 `notAfter=` 前缀用参数展开而不是 `| sed`：命令替换里的管道在 pipefail 下
+  # 无匹配即返回 1，会被 ERR trap 当脚本失败（本仓已有一条全局护栏扫这个写法）。
+  local v; v="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null || true)"
+  v="${v#notAfter=}"
+  printf '%s' "${v:-未知}"
+}
+
+# acme.sh 的「跳过续期」退出码判据。
+#
+# acme.sh 源码（acme.sh 第 93 行）里 `RENEW_SKIP=2`；`issue()` 在证书未到 Le_NextRenewTime
+# 时打印 "Domains not changed." / "Skipping. Next renewal time is: …" /
+# "Add '--force' to force renewal." 之后 `return $RENEW_SKIP`。
+# **这是正常跳过，不是失败** —— 但它的退出码是 2，旧实现把非零码一律当「签发失败」，
+# 于是「重装 → 账户已存在（跳过注册）→ --issue 退出 2 → 判失败 → 回退自签名」，
+# 现场表现为「选重新安装后 SSL 又变成自签名」。
+# 除退出码外再认一次措辞：退出码可能被包装层改写，措辞才是 acme.sh 的直接证据。
+acme_issue_skipped() {
+  local rc="${1:-}"
+  if ((rc == 2)); then return 0; fi
+  local tail_log; tail_log="$(log_since_mark)"
+  grep -qiE 'next renewal time is|domains not changed|to force renew' <<<"$tail_log"
+}
 
 # EAB 缺失/不可用时的指引（凭据要从 CA 控制台取，脚本变不出来）。
 # 拆成「只追加」与「重置后追加」两个入口：签发失败诊断路径已经在 HINTS 里写好了抬头，
@@ -2342,9 +2411,18 @@ issue_acme_sh() {
   local args=(--issue --home "$ACME_HOME" --server "$server" -d "$DOMAIN" --webroot "$WEBROOT" --keylength 2048)
   [[ "$STAGING" == "1" ]] && args+=(--staging)
   mark_log
-  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then
-    warn "acme.sh 在 $(ca_label "$CA_PROVIDER") 签发失败。"
-    return 1
+  local rc=0
+  run_allow_rc 2 "$(acme_bin)" "${args[@]}" </dev/null || rc=$?
+  # 退出码 2 = acme.sh 的 RENEW_SKIP（证书仍在有效期内，无需续期），**不是失败**。
+  # 判据见 acme_issue_skipped：把 2 当失败会让「重装」必然回退自签名，把正式证书降级掉。
+  if ((rc != 0)); then
+    if acme_issue_skipped "$rc"; then
+      info "acme.sh 判定证书仍在有效期内、无需续期（退出码 ${rc} = 跳过续期，不是失败）。"
+      info "  复用 acme.sh 里已存的证书（下次续期由它的每日任务负责）。"
+    else
+      warn "acme.sh 在 $(ca_label "$CA_PROVIDER") 签发失败。"
+      return 1
+    fi
   fi
   if ! acme_install_cert "$ACME_CERT_DIR"; then
     warn "证书安装到 ${ACME_CERT_DIR} 失败。"
@@ -2366,12 +2444,32 @@ setup_tls() {
     selfsigned)
       gen_self_signed ;;
     auto|acme)
-      # 先写入「仅 HTTP」配置并启动 Nginx，让 ACME 的 HTTP-01 校验能通过
-      write_nginx_conf 0 "" ""
-      nginx_apply
-      if issue_cert; then :; else
-        warn "回退：改用自签名证书（浏览器会提示不安全，可在网络就绪后重跑本脚本自动升级为正式证书）。"
-        gen_self_signed
+      # 幂等：已经装好可用的正式证书就**直接跳过申请**。
+      # 重装/升级时这一步最贵的不是那几秒，而是「本来没坏的东西被重做一遍」——
+      # 旧实现每次重装都去 --issue，而 acme.sh 在证书未到续期时间时以退出码 2 收场
+      # （见 acme_issue_skipped），一旦判失败就回退自签名，把正式证书降级成了自签名
+      # （2026-09 现场故障：用户点「重新安装」，SSL 反而掉了）。
+      # 注意自签名与正式证书**分开存**（SELF_SIGNED_DIR / ACME_CERT_DIR），
+      # 所以这里只认 ACME_CERT_DIR：手上有自己签的自签名证书不会被误当正式证书复用。
+      if [[ "$FORCE_CERT" != "1" ]] && tls_cert_reusable "$ACME_CERT_DIR"; then
+        ok "检测到已安装的正式证书且仍在有效期内，跳过证书申请（重装不再重签）。"
+        info "  证书：${ACME_CERT_DIR}/fullchain.pem"
+        info "  到期：$(cert_not_after "${ACME_CERT_DIR}/fullchain.pem")"
+        info "  续期：acme.sh 的每日任务会在到期前自动续期并重载 Nginx，无需在这里重签"
+        info "  要强制重签：$(rerun_cmd --force-cert)"
+        CERT_FULLCHAIN="${ACME_CERT_DIR}/fullchain.pem"
+        CERT_KEY="${ACME_CERT_DIR}/privkey.pem"
+      else
+        if [[ "$FORCE_CERT" == "1" ]]; then
+          info "已指定 --force-cert：无论如何都重新申请证书。"
+        fi
+        # 先写入「仅 HTTP」配置并启动 Nginx，让 ACME 的 HTTP-01 校验能通过
+        write_nginx_conf 0 "" ""
+        nginx_apply
+        if issue_cert; then :; else
+          warn "回退：改用自签名证书（浏览器会提示不安全，可在网络就绪后重跑本脚本自动升级为正式证书）。"
+          gen_self_signed
+        fi
       fi ;;
   esac
   write_nginx_conf 1 "$CERT_FULLCHAIN" "$CERT_KEY"

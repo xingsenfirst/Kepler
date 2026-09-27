@@ -685,6 +685,208 @@ pkg_run_pm() {
   return "$rc"
 }
 
+# ------------------------------------------------------------------------------
+# 0.2 包安装失败的「自动修复」
+#
+# 与 0.1 的分工：**能自己修的就自己修，修不了的才把原因和命令交给用户。**
+#
+# 为什么必须有这一层：光有诊断是不够的。识别出原因、却只打印一段让用户去敲的
+# module reset，等于把「最基础的一步」又推回给人 —— 用户的原话是
+# 「脚本自动安装 git 失败。这种最基础的操作不应该出问题。」
+# CentOS/RHEL 8 上 git 装不上十有八九是 perl 模块流状态与仓库不一致
+# （git → perl-Git → perl-libs 被 modular filtering 过滤），而这件事脚本
+# 完全有能力自己修好：reset 模块流、按报错里期望的流重新 enable、再重试。
+#
+# 边界：只对**能确定原因**的失败动手（判据见 pkg_failure_kind），
+# 拿不准就不碰系统，老实走诊断。
+# ------------------------------------------------------------------------------
+
+# 失败原因分类。**唯一实现点** —— on_pkg_failure 用它选诊断分支，
+# pkg_auto_repair 用它决定要不要动手自动修。两边判据必须一致，
+# 否则会出现「诊断说是 A、自动修复却去修 B」这种最难查的错位。
+pkg_failure_kind() {
+  local t="$1"
+  if grep -qiE 'could not resolve|temporary failure resolving|failed to fetch|could not connect|network is unreachable|no route to host|timed out|connection refused|无法连接|超时' <<<"$t"; then
+    printf 'network'; return 0
+  fi
+  if grep -qiE 'filtered out by modular filtering|modular filtering|modulefailsafe|module_hotfixes|requires module\(|conflicts with module\(' <<<"$t"; then
+    printf 'modular'; return 0
+  fi
+  if grep -qiE 'unable to locate package|no package .* available|unable to find a match|no match for argument|nothing provides|not found|没有可用的软件包' <<<"$t"; then
+    printf 'missing'; return 0
+  fi
+  if grep -qiE 'could not get lock|lock held|waiting for|another process|is being used by|占用' <<<"$t"; then
+    printf 'lock'; return 0
+  fi
+  if grep -qiE 'no space left|disk full|空间不足' <<<"$t"; then
+    printf 'space'; return 0
+  fi
+  if grep -qiE 'permission denied|are you root|not permitted' <<<"$t"; then
+    printf 'perm'; return 0
+  fi
+  if grep -qiE 'gpg|NO_PUBKEY|public key|signature' <<<"$t"; then
+    printf 'gpg'; return 0
+  fi
+  printf 'unknown'
+}
+
+# 把包版本收敛成模块「流」号：5.26.3 → 5.26（纯函数，可直接验证）。
+stream_from_version() {
+  local v="$1"
+  [[ -n "$v" ]] || return 0
+  local a b rest
+  IFS='.' read -r a b rest <<<"$v"
+  if [[ -n "${b:-}" ]]; then printf '%s.%s' "$a" "$b"; else printf '%s' "$a"; fi
+}
+
+# 由包名推候选模块名：perl-libs → perl-libs / perl（纯函数）。
+#
+# 报错里给的是**包名**，而 `module reset` 要的是**模块名**；两者常常差一层后缀
+# （包 perl-libs 属于模块 perl）。这里只生成候选，存在与否交给 module_exists
+# 去问 dnf —— 不靠猜（`perl-libs` 不是模块，硬 reset 它只会多刷一行错）。
+module_name_candidates() {
+  local base="$1"
+  printf '%s\n' "$base"
+  while [[ "$base" == *-* ]]; do
+    base="${base%-*}"
+    printf '%s\n' "$base"
+  done
+}
+
+# 从报错日志里找出「被 modular filtering 过滤掉的包」及其期望的流版本。
+# 输出每行：<包名> <流版本或空>。
+#
+# 样例（CentOS 8 的真实报错）：
+#   - package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+# → perl-libs 5.26
+modular_suspects() {
+  local log="$1"
+  local line pkg ver
+  while IFS= read -r line; do
+    [[ "$line" == *"filtered out by modular filtering"* ]] || continue
+    pkg="$(sed -nE 's/^.*package[[:space:]]+(.+)-([0-9]+:)?[0-9][0-9.]*-[^[:space:]]+[[:space:]]+is[[:space:]]+filtered out.*/\1/p' <<<"$line")"
+    ver="$(sed -nE 's/^.*package[[:space:]]+.+-([0-9]+:)?([0-9][0-9.]*)-[^[:space:]]+[[:space:]]+is[[:space:]]+filtered out.*/\2/p' <<<"$line")"
+    [[ -n "$pkg" ]] || continue
+    printf '%s %s\n' "$pkg" "$(stream_from_version "$ver")"
+  done <<<"$log"
+}
+
+# 这个名字是不是真正的模块（`module list` 的 Name 列认得它才算）。
+module_exists() {
+  local m="$1"
+  have "$PM" || return 1
+  local out
+  out="$("$PM" module list "$m" 2>/dev/null || true)"
+  # 输出形如（第二行起是 Name/Stream/Profiles/Summary 四列）：
+  #   perl  5.26  common  Practical Extraction and Report Language
+  # 只认**行首那列**：Summary 里偶然提到同名词不算。
+  grep -qE "^[[:space:]]*${m//./\\.}[[:space:]]" <<<"$out"
+}
+
+# 自动修复模块流，然后重试装包。返回 0 = 修好了而且这次装上了。
+pkg_repair_modular_streams() {
+  local -a pkgs=("$@")
+  local suspects; suspects="$(modular_suspects "$(log_since_mark)")"
+  [[ -n "$suspects" ]] || return 1
+
+  local pkg stream mod cand did=0
+  while read -r pkg stream; do
+    [[ -n "$pkg" ]] || continue
+    mod=""
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] || continue
+      if module_exists "$cand"; then mod="$cand"; break; fi
+    done <<<"$(module_name_candidates "$pkg")"
+    [[ -n "$mod" ]] || continue
+    info "检测到模块流不一致：${pkg} 被 modular filtering 过滤（它属于模块 ${mod}）"
+    info "  自动复位并按报错里期望的流重新启用：${mod}${stream:+:${stream}}"
+    run_soft "$PM" module reset -y "$mod"
+    if [[ -n "$stream" ]]; then run_soft "$PM" module enable -y "${mod}:${stream}"; fi
+    did=1
+  done <<<"$suspects"
+  ((did == 1)) || return 1
+
+  run_soft "$PM" clean all
+  run_soft "$PM" makecache
+  info "模块流已修复，重新尝试安装：${pkgs[*]}"
+  local rc=0
+  pkg_run_pm "${pkgs[@]}" || rc=$?
+  if ((rc == 0)); then ok "模块流修复后安装成功：${pkgs[*]}"; return 0; fi
+  # 模块流修好了仍装不上 —— 这时才轮到 dnf 自己建议的 --nobest（放宽候选版本）。
+  # 特意放在这里而不是无条件先试：**只有确认了 modular 问题**才值得放宽版本选择。
+  # 否则就是在没搞清原因的情况下换一个版本装上，把问题推给下一个环节。
+  if pkg_run_pm_nobest "${pkgs[@]}"; then return 0; fi
+  return 1
+}
+
+# 同 pkg_run_pm，但让 dnf 放宽「最佳候选」的选择。
+#
+# 这是 dnf 自己在求解失败时给出的建议（报错尾部的
+# "(try to add '--skip-broken' … or '--nobest' …)"）。
+# **绝不用 --skip-broken**：它会「跳过装不上的包」却仍返回 0 —— pkg_install
+# 于是以为装好了，而 `have git` 依旧是假。错误被吞进返回码里，是本项目最忌讳的
+# 一种假成功。--nobest 只是允许选非最佳版本，装不上仍会如实返回非零。
+pkg_run_pm_nobest() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  case "$PM" in
+    dnf|yum)
+      local rc=0
+      mark_log
+      info "安装软件包（--nobest：放宽候选版本；装不上仍会如实失败）：${pkgs[*]}"
+      run "$PM" install -y --nobest "${pkgs[@]}" || rc=$?
+      return "$rc" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 绕过 RHEL/CentOS 8 的模块过滤，直接把包装上。
+#
+# 这是 dnf 官方给出的处理方式（`module_hotfixes` 表示「该仓库按**包级**视图参与求解，
+# 不套模块过滤」）——它只影响**本次事务**，不写任何持久状态，因此比
+# `module reset/enable`（那是**全局**地改机器上的模块流状态）安全得多。
+#
+# 为什么它必须排在 reset/enable **之前**：RHEL 8 的 module failsafe 会把 perl-libs
+# 这类包屏蔽掉，**即使是全新安装的纯净系统**也一样 —— 此时机器上的模块流状态本来就与
+# 仓库期望一致，`reset` + `enable` 全是空转，只有这一档能过。用户现场（干净 CentOS 8）
+# 正是这种情形：先前那套「复位模块流」在那台机器上永远不会成功。
+#
+# ⚠️ 那个 `*` 的引号必须留：不引起来的话 shell 会把它当通配符，在当前工作目录里做 glob
+# 展开，dnf 收到的是被换成文件名的垃圾参数 —— 而失败信息完全看不出是这个原因。
+pkg_run_pm_hotfixes() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  case "$PM" in
+    dnf|yum)
+      local rc=0
+      mark_log
+      info "安装软件包（module_hotfixes：本次事务绕过模块过滤，不改机器上的模块流状态）：${pkgs[*]}"
+      run "$PM" install -y --setopt='*.module_hotfixes=true' "${pkgs[@]}" || rc=$?
+      return "$rc" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 装包失败后的「自动修复 + 重试」。返回 0 = 修好并且这次装上了。
+PKG_AUTO_REPAIR_TRIED=0
+pkg_auto_repair() {
+  local -a pkgs=("$@")
+  PKG_AUTO_REPAIR_TRIED=1
+  case "$(pkg_failure_kind "$(log_since_mark)")" in
+    modular)
+      case "$PM" in
+        dnf|yum)
+          # 第一档：绕过模块过滤。零副作用（不改机器状态），而且对「纯净系统上的
+          # module failsafe」是**唯一**对症的一档 —— 所以它必须排在最前面。
+          if pkg_run_pm_hotfixes "${pkgs[@]}"; then return 0; fi
+          # 第二档：机器上的模块流**确实**与仓库期望不一致时（例如有人手动 enable 过别的流），
+          # 才需要真的去 reset/enable —— 这一步会改全局模块状态，所以只能排在后面。
+          if pkg_repair_modular_streams "${pkgs[@]}"; then return 0; fi ;;
+      esac ;;
+  esac
+  return 1
+}
+
 # 包安装失败：判断原因 → 给出可敲的修复命令 → 询问/退出
 # 用法：on_pkg_failure <包名列表> <1=可选依赖(仅警告) | 0=必需>
 HINTS=()
@@ -693,6 +895,7 @@ add_hint() { HINTS+=("$1"); }
 on_pkg_failure() {
   local pkg_list="$1" optional="${2:-0}"
   local tail_log; tail_log="$(log_since_mark)"
+  local kind; kind="$(pkg_failure_kind "$tail_log")"
 
   HINTS=()
   add_hint "失败的包：${pkg_list}"
@@ -701,7 +904,7 @@ on_pkg_failure() {
   while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
   add_hint ""
 
-  if grep -qiE 'could not resolve|temporary failure resolving|failed to fetch|could not connect|network is unreachable|no route to host|timed out|connection refused|无法连接|超时' <<<"$tail_log"; then
+  if [[ "$kind" == "network" ]]; then
     add_hint "【判断】网络 / DNS 不可达，或软件源超时。"
     case "$PM" in
       dnf|yum)
@@ -720,23 +923,49 @@ on_pkg_failure() {
         add_hint "  2) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）"
         add_hint "  3) 国内服务器建议把软件源换成国内镜像后重试（node/npm 下载可加 --mirror cn）" ;;
     esac
-  elif grep -qiE 'filtered out by modular filtering|modular filtering|requires module\(|conflicts with module\(' <<<"$tail_log"; then
-    # RHEL/CentOS 8 特有：AppStream 的「模块流」状态与仓库期望不一致，
-    # 依赖包被 modular filtering 静默过滤 → 报 "none of the providers can be installed"。
+  elif [[ "$kind" == "modular" ]]; then
+    # RHEL/CentOS 8 特有：模块化的过滤机制（module failsafe）把依赖包静默屏蔽了，
+    # dnf 只报 "none of the providers can be installed" / "filtered out by modular filtering"。
     # 最经典的受害者就是 git（它依赖 perl-Git → perl-libs）。CentOS 8 已于 2021-12-31 EOL，
-    # 仓库迁到 vault 之后这种不一致更常见；别处启用/禁用过某个模块流也会导致同样结果。
-    add_hint "【判断】RHEL/CentOS 8 的模块流（module stream）状态与仓库不一致，依赖包被 modular filtering 过滤掉了。"
+    # 仓库迁到 vault 之后更常见。
+    # ⚠️ 这**不一定**是「模块流状态与仓库不一致」—— 全新安装的纯净系统同样会中招，
+    # 那时模块流本身是好的，reset/enable 根本修不动它（用户现场就是这种）。
+    add_hint "【判断】RHEL/CentOS 8 的模块过滤（module failsafe）把依赖包屏蔽了：dnf 报 filtered out by modular filtering。"
+    add_hint "  纯净系统上也会发生（模块流状态本身没问题），别只往「模块流不一致」上想。"
+    if ((PKG_AUTO_REPAIR_TRIED)); then
+      add_hint "  脚本已自动依次试过「绕过模块过滤 → 复位模块流并重试 → 放宽候选版本」，仍未成功。"
+    fi
     case "$PM" in
       dnf|yum)
-        add_hint "  报错里 perl-libs 后面那个 5.26 就是它期望的流版本，按它来："
-        add_hint "  1) 复位并重新启用 perl 模块流："
-        add_hint "       ${PM} module reset perl && ${PM} module enable -y perl:5.26"
-        add_hint "  2) 再重试安装：$(pm_install_cmd) ${pkg_list}"
-        add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list perl" ;;
+        # 手工命令按**解析出来的**包与流版本来写，绝不硬编码 perl：
+        # 换成别的被过滤包（nodejs 等）时，写死的提示会直接把人带偏。
+        local sp="" sv=""
+        # `|| true` 必须写在**替换内部**：pipefail 下 `modular_suspects | head -n 1`
+        # 里任何一环返回非零（head 提前关闭管道时上游会吃到 SIGPIPE）都会让整条赋值返回 1，
+        # 被 ERR trap 当成脚本失败。外层的 `|| true` 只管 `read` 在空输入上返回 1 这一种情况，
+        # 拦不住管道那一半 —— 只写外层正是本项目已经栽过的那个坑。
+        read -r sp sv <<<"$(modular_suspects "$tail_log" | head -n 1 || true)" || true
+        add_hint "  1) 首选：本次事务绕过模块过滤 —— 不改机器上的模块流状态，无副作用："
+        add_hint "       ${PM} install -y --setopt='*.module_hotfixes=true' ${pkg_list}"
+        add_hint "     （那个星号的引号必须留：不引会被 shell 当通配符展开成文件名）"
+        if [[ -n "$sp" ]]; then
+          # perl-libs → perl：与 module_name_candidates 同一套「剥后缀」推导。
+          local m="${sp%%-*}"
+          add_hint "  2) 若上一步不行（机器上的模块流确实与仓库期望不一致），再复位并按期望流重新启用："
+          add_hint "       报错里被过滤的是 ${sp}${sv:+（期望流 ${sv}）}，它属于模块 ${m}"
+          add_hint "       ${PM} module reset -y ${m}${sv:+ && ${PM} module enable -y ${m}:${sv}}"
+          add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list ${m}"
+        else
+          add_hint "  2) 若上一步不行，复位出问题的模块再按它需要的流重新启用"
+          add_hint "     （报错里 perl-libs-4:5.26.3 这种写法：模块名是 perl-libs 去掉后缀的 perl，流是 5.26）"
+          add_hint "       ${PM} module reset -y <模块名> && ${PM} module enable -y <模块名>:<流>"
+          add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list"
+        fi
+        add_hint "  4) 再重试安装：$(pm_install_cmd) ${pkg_list}" ;;
       *)
         add_hint "  1) 刷新索引后重试：$(pm_install_cmd) ${pkg_list}" ;;
     esac
-  elif grep -qiE 'unable to locate package|no package .* available|unable to find a match|no match for argument|nothing provides|not found|没有可用的软件包' <<<"$tail_log"; then
+  elif [[ "$kind" == "missing" ]]; then
     add_hint "【判断】当前软件源里没有这个包（索引未更新 / 缺扩展源）。"
     case "$PM" in
       apt)
@@ -753,15 +982,15 @@ on_pkg_failure() {
       zypper)
         add_hint "  1) 刷新索引：zypper refresh" ;;
     esac
-  elif grep -qiE 'could not get lock|lock held|waiting for|another process|is being used by|占用' <<<"$tail_log"; then
+  elif [[ "$kind" == "lock" ]]; then
     add_hint "【判断】另一个包管理进程正占用锁（常见于系统自动更新）。"
     add_hint "  1) 等它结束，或确认：ps aux | grep -E 'apt|dpkg|dnf|yum|apk'"
     add_hint "  2) 等待后重跑本脚本即可（幂等）"
-  elif grep -qiE 'no space left|disk full|空间不足' <<<"$tail_log"; then
+  elif [[ "$kind" == "space" ]]; then
     add_hint "【判断】磁盘空间不足：df -h 查看，清理后重试。"
-  elif grep -qiE 'permission denied|are you root|not permitted' <<<"$tail_log"; then
+  elif [[ "$kind" == "perm" ]]; then
     add_hint "【判断】权限不足：请用 root 或加 sudo 重跑本脚本。"
-  elif grep -qiE 'gpg|NO_PUBKEY|public key|signature' <<<"$tail_log"; then
+  elif [[ "$kind" == "gpg" ]]; then
     add_hint "【判断】软件源签名/公钥校验失败（源被替换过或密钥过期）。"
     case "$PM" in
       apt) add_hint "  修复：apt-get update --allow-insecure-repositories 或重新导入源的公钥" ;;
@@ -773,6 +1002,16 @@ on_pkg_failure() {
   fi
 
   add_hint ""
+  # CentOS 8 上最常见的一类**无害**噪音：repo 文件里留着旧版 yum 的 failovermethod
+  # 选项，dnf（libdnf）不认识它，于是每读一次仓库就打一行 "Invalid configuration value"。
+  # 它**不是**失败原因，但会刷屏、并让人以为这就是出错的地方 —— 必须明说，
+  # 否则用户会顺着它去查错方向（真实故障现场里这几行正是最显眼的）。
+  if grep -qiE 'Invalid configuration value.*failovermethod' <<<"$tail_log"; then
+    add_hint "  · 日志里那几行「Invalid configuration value: failovermethod=…」是无害警告："
+    add_hint "    该选项属于旧版 yum，dnf 不支持，读一次仓库配置就打一行 —— 与本次安装失败无关。"
+    add_hint "    想去掉它：sed -i '/^failovermethod=/d' /etc/yum.repos.d/*.repo"
+  fi
+
   # git 只是「把源码弄到服务器上」的一种手段，装不上不该把人堵死 —— 手动带源码即可。
   # 这条逃生口必须在这里给出：CentOS/RHEL 8 的模块流问题会让 git 根本装不上，
   # 而用户此时最容易以为"部署彻底做不下去了"。
@@ -818,8 +1057,13 @@ pkg_install() {
   local pkgs=("$@")
   [[ ${#pkgs[@]} -gt 0 ]] || return 0
   local rc=0
+  PKG_AUTO_REPAIR_TRIED=0
   pkg_run_pm "${pkgs[@]}" || rc=$?
-  ((rc == 0)) || on_pkg_failure "${pkgs[*]}" 0
+  if ((rc != 0)); then
+    # 先自己修一遍再谈失败：能自动解决的绝不留给人（见 0.2 节）
+    if pkg_auto_repair "${pkgs[@]}"; then return 0; fi
+    on_pkg_failure "${pkgs[*]}" 0
+  fi
   return 0
 }
 
@@ -828,8 +1072,13 @@ pkg_install_opt() {
   local pkgs=("$@")
   [[ ${#pkgs[@]} -gt 0 ]] || return 0
   local rc=0
+  PKG_AUTO_REPAIR_TRIED=0
   pkg_run_pm "${pkgs[@]}" || rc=$?
   if ((rc != 0)); then
+    # git 走的正是这条通道，所以自动修复必须在这里也生效 —— 否则「git 装不上」
+    # 这个最基础的场景仍然只会打印一段提示、不会自己修好，而重装时
+    # prepare_source 会因为拿不到 git 而整个中断。
+    if pkg_auto_repair "${pkgs[@]}"; then return 0; fi
     # on_pkg_failure 在「可选」分支里 return 1（表示未装上）。这里是**裸调用**，
     # 返回 1 会被 set -e 的 ERR trap 直接判成「脚本意外失败」，调用点的 `|| true`
     # 根本来不及生效 —— 明明设计成"装不上就降级"，实际却会中断部署。

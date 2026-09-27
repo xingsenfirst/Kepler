@@ -709,8 +709,8 @@ Problem: package git-2.27.0-1.el8.x86_64 requires perl(Git), but none of the pro
 (try to add '--skip-broken' to skip uninstallable packages)`));
   if (modular.unavailable) return;
   const all = modular.out + modular.err;
-  assert(/module reset perl/.test(all),
-    `必须给出「复位 perl 模块流」的命令：${all.slice(0, 500)}`);
+  assert(/module reset -y perl/.test(all),
+    `必须给出「复位 perl 模块流」的完整可敲命令（含 -y，且模块名由解析结果生成）：${all.slice(0, 500)}`);
   assert(/module enable -y perl:5\.26/.test(all),
     `必须按报错里期望的流版本重新启用（perl-libs 5.26）：${all.slice(0, 500)}`);
   assert(/不需要 git/.test(all),
@@ -1494,4 +1494,406 @@ probe ERROR_1   error   1
     `acme.sh 什么也不打印、只以退出码 2 收场时，也必须判「跳过续期」——退出码是这条判据的主证据，不能只靠日志措辞：${seen.slice(0, 500)}`);
   assert(/ERROR_1\|RC=1\|ERRBLOCK=1\|SKIPMSG=0\|FAILMSG=1\|SIGNED=bad/.test(r.out),
     `真失败（拿不到域名校验 token）仍须判失败并打「签发失败」：容忍退出码 2 不能把真失败一起吞掉：${seen.slice(0, 500)}`);
+});
+
+/**
+ * ------------------------------------------------------------------
+ * 「脚本自动安装 git 失败。这种最基础的操作不应该出问题。」
+ *
+ * 现场（CentOS 8）：`dnf install -y git` 失败，日志里
+ *   Invalid configuration value: failovermethod=priority …   ← 无害警告，刷了 5 行
+ *   Problem: package git-2.27.0-1.el8.x86_64 requires perl(Git) …
+ *   - package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+ *
+ * 旧实现**已经能识别**这是模块流问题，但只把 `dnf module reset perl` 打印给用户，
+ * 让用户自己去敲。而 git 走的是**可选**通道，装不上只降级不中断 —— 于是
+ * 重装时 `prepare_source` 才发现没有 git，整个部署卡在拉源码那一步。
+ *
+ * 修法：**能自己修的绝不推回给人。** 识别到模块流不一致就自己
+ * reset → 按报错里期望的流 enable → 重试；两个安装通道都要接上。
+ * 边界：只对**能确定原因**的失败动手，拿不准就不碰系统。
+ * ------------------------------------------------------------------
+ */
+test('deploy.sh：git 装不上时必须先自动修好模块流，而不是只打印提示', async () => {
+  const src = readDeploy();
+
+  // 1) 判据只能有一份：诊断与自动修复各判一次，迟早出现「诊断说 A、修复去修 B」
+  assert(hasFn(src, 'pkg_failure_kind'),
+    '失败原因分类必须抽成 pkg_failure_kind（唯一实现点），否则诊断与自动修复的两套判据会漂移');
+  assert(hasFn(src, 'pkg_auto_repair') && hasFn(src, 'pkg_repair_modular_streams'),
+    '必须有「自动修复 + 重试」这条路径：识别出原因却只打印命令，等于把最基础的一步推回给用户');
+  const diag = codeOnly(fnBody(src, 'on_pkg_failure'));
+  assert(/pkg_failure_kind/.test(diag),
+    'on_pkg_failure 必须直接用 pkg_failure_kind 的结论分支');
+  assert(!/elif grep -q/.test(diag),
+    'on_pkg_failure 里不得再留一份自己的 grep 判据 —— 两份判据必然漂移（这正是本仓反复中招的形态）');
+
+  // 2) 两个通道都要接上自动修复。**git 走的是 pkg_install_opt**，
+  //    只在 pkg_install 里修等于没修（用户看到的正是这条通道）。
+  for (const fn of ['pkg_install', 'pkg_install_opt']) {
+    const body = codeOnly(fnBody(src, fn));
+    assert(/pkg_auto_repair/.test(body),
+      `${fn} 必须先尝试自动修复：git 走的是可选通道，只在必需通道里修等于没修`);
+    assert(/PKG_AUTO_REPAIR_TRIED=0/.test(body),
+      `${fn} 每次调用前要重置「已尝试自动修复」标记，否则下一次失败会误报「脚本已自动尝试过」`);
+  }
+
+  // 3) 行为：git 装上（修复后成功）→ 返回 0、且**不输出任何失败诊断**
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then printf 'LOG_UNAVAILABLE\\n'; exit 0; fi
+# 清空日志：log_since_mark 是「失败日志」的唯一来源，残留内容会让 pkg_failure_kind
+# 读到上一次运行的东西（假绿假红都可能）。这是部署脚本自己的日志文件。
+: > "$LOG_FILE"
+T="$(mktemp -d)"; trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+CALLS="$T/calls.txt"
+
+PM=dnf
+FIXED=0
+# 假 dnf：install 先失败（照抄现场那两行），module enable 之后再装就成功。
+# 这样「自动修复到底有没有让它装上」是可观测的，而不是只看有没有打印提示。
+dnf() {
+  printf '%s\\n' "$*" >>"$CALLS"
+  case "$1" in
+    module) case "$2" in
+        list)   printf 'Name Stream Profiles Summary\\nperl 5.26 common Practical Extraction\\n'; return 0 ;;
+        reset)  return 0 ;;
+        enable) FIXED=1; return 0 ;;
+      esac ;;
+    clean|makecache) return 0 ;;
+    install)
+      if ((FIXED)); then printf 'Complete!\\n'; return 0; fi
+      printf 'Problem: package git-2.27.0-1.el8.x86_64 requires perl-Git\\n' >&2
+      printf -- '- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering\\n' >&2
+      return 1 ;;
+  esac
+  return 1
+}
+
+( pkg_install_opt git ) >"$T/opt" 2>&1 </dev/null
+printf 'OPT_RC=%s\\n' "$?"
+printf 'OPT_CALLS=%s\\n' "$(tr '\\n' '|' < "$CALLS")"
+printf 'OPT_DIAG=%s\\n' "$(grep -c '模块流（module stream）' "$T/opt")"
+printf 'OPT_WARN=%s\\n' "$(grep -c '可选依赖安装失败' "$T/opt")"
+
+: > "$CALLS"; FIXED=0
+( pkg_install perl-pack ) >"$T/hard" 2>&1 </dev/null
+printf 'HARD_RC=%s\\n' "$?"
+printf 'HARD_DIAG=%s\\n' "$(grep -c '模块流（module stream）' "$T/hard")"
+`);
+  if (r.unavailable || /LOG_UNAVAILABLE/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/OPT_RC=0/.test(r.out),
+    `git 必须在自动修复后真的装上（返回 0）：${seen.slice(0, 600)}`);
+  assert(/module reset -y perl/.test(r.out) && /module enable -y perl:5\.26/.test(r.out),
+    `自动修复必须复位模块流并按报错里期望的流重新启用（perl:5.26）：${seen.slice(0, 600)}`);
+  // 用「|module reset -y perl|」把边界一起钉住：否则 `..._reset -y perl-libs|`
+  // 会因为前缀相同而假绿 —— 而 perl-libs 根本不是模块名，reset 它只会多刷一行错。
+  assert(/OPT_CALLS=[^\n]*\|module reset -y perl\|[^\n]*\|makecache\|[^\n]*install -y git\|/.test(r.out),
+    `修复之后必须**重试安装**（否则 reset/enable 白做，git 还是没装上）：${seen.slice(0, 600)}`);
+  // 顺序断言：`printf '%s' "$*"` 打印的是**展开后**的参数，引号是 shell 语法、不在参数里，
+  // 所以这里不能带引号（引号属于源码层面的事，由「纯净系统」那条用例的静态部分钉住）。
+  const calls = (/OPT_CALLS=([^\n]*)/.exec(r.out) || [])[1] || '';
+  const iHot = calls.indexOf('--setopt=*.module_hotfixes=true');
+  const iReset = calls.indexOf('|module reset -y perl|');
+  assert(iHot >= 0 && iReset >= 0 && iHot < iReset,
+    `绕过模块过滤必须排在复位模块流**之前**（零副作用的一档在前）—— 实际调用序：${calls}`);
+  assert(/OPT_DIAG=0/.test(r.out) && /OPT_WARN=0/.test(r.out),
+    `自动修好之后不得再打失败诊断/降级警告：用户不该看到一个已经被自己解决的错误：${seen.slice(0, 600)}`);
+  assert(/HARD_RC=0/.test(r.out) && /HARD_DIAG=0/.test(r.out),
+    `必需通道同样要能自动修好（否则 nginx/nodejs 这类包一失败就走到 die）：${seen.slice(0, 600)}`);
+});
+
+test('deploy.sh：自动修复的边界 —— 只修能确定原因的，且不用 --skip-broken', async () => {
+  const src = readDeploy();
+
+  // --skip-broken 会「跳过装不上的包」却仍返回 0：pkg_install 于是以为装好了，
+  // 而 `have git` 依旧是假。错误被吞进返回码里 —— 本仓最忌讳的一种假成功。
+  assert(!/--skip-broken/.test(codeOnly(src)),
+    '不得使用 --skip-broken：它让「装不上」返回 0，pkg_install 会误判为成功，而 have git 仍为假');
+  assert(/--nobest/.test(codeOnly(src)),
+    '放宽候选版本要用 --nobest：它允许选非最佳版本，装不上仍会如实返回非零');
+
+  // --nobest 只能出现在「确认修过模块流之后」：没搞清原因就放宽版本，
+  // 等于换一个版本装上、把问题推给下一个环节。
+  const repair = codeOnly(fnBody(src, 'pkg_repair_modular_streams'));
+  const auto = codeOnly(fnBody(src, 'pkg_auto_repair'));
+  assert(/pkg_run_pm_nobest/.test(repair),
+    '--nobest 的降级重试要挂在「模块流修好但仍装不上」之后');
+  assert(!/pkg_run_pm_nobest/.test(auto),
+    '不得在 pkg_auto_repair 里无条件试 --nobest：那会在没识别出原因时也放宽版本选择');
+  assert(!/network|missing|lock|space|perm|gpg/.test(auto),
+    '自动修复只对「能确定原因且自己能解决」的失败动手（目前只有 modular）；把别的类别拉进来等于瞎改系统');
+
+  // 行为：「解析不到被过滤的包」时**一个 module 操作都不做**（退化成原有流程，不冒险）
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then printf 'LOG_UNAVAILABLE\\n'; exit 0; fi
+T="$(mktemp -d)"; trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+CALLS="$T/calls.txt"
+PM=dnf
+: > "$LOG_FILE"
+
+case_run() {
+  local label="$1" mode="$2"
+  : > "$CALLS"; : > "$LOG_FILE"
+  if [[ "$mode" == "network" ]]; then
+    dnf() { printf '%s\\n' "$*" >>"$CALLS"; printf 'Could not resolve host: mirrors.example.com\\n' >&2; return 1; }
+  elif [[ "$mode" == "moduleonly" ]]; then
+    dnf() { printf '%s\\n' "$*" >>"$CALLS"; case "$1" in install) printf 'Error: Problem: requires module(perl:5.26)\\n' >&2 ;; esac; return 1; }
+  else
+    dnf() {
+      printf '%s\\n' "$*" >>"$CALLS"
+      case "$1" in
+        module) case "$2" in list) printf 'Name Stream Profiles Summary\\nperl 5.26 common x\\n'; return 0 ;; reset|enable) return 0 ;; esac ;;
+        clean|makecache) return 0 ;;
+        install) printf -- '- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering\\n' >&2; return 1 ;;
+      esac
+      return 1
+    }
+  fi
+  ( pkg_install_opt git ) >"$T/$label.out" 2>&1 </dev/null
+  printf '%s_FIX_ACTS=%s\\n' "$label" "$(grep -c -E 'module (reset|enable)|nobest|setopt' "$CALLS")"
+  printf '%s_MODULE_ACTS=%s\\n' "$label" "$(grep -c -E 'module (reset|enable)' "$CALLS")"
+}
+
+case_run NETWORK network
+case_run MODULEONLY moduleonly
+case_run REPAIRFAIL repairfail
+`);
+  if (r.unavailable || /LOG_UNAVAILABLE/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/NETWORK_FIX_ACTS=0/.test(r.out),
+    `网络类失败时**一个修复动作都不该做** —— 绕过过滤/复位模块流/nobest 与原因毫无关系，只会白改一通系统：${seen.slice(0, 600)}`);
+  assert(/MODULEONLY_MODULE_ACTS=0/.test(r.out),
+    `日志里解析不出「哪个包被过滤」时，绝不去 reset/enable 模块流（那是全局状态变更，改错方向比不改更糟）：${seen.slice(0, 600)}`);
+  assert(/MODULEONLY_FIX_ACTS=1/.test(r.out),
+    `但零副作用的「绕过模块过滤」可以且只应该试一次（它不改机器状态，试它不冒险）：${seen.slice(0, 600)}`);
+  assert(/REPAIRFAIL_MODULE_ACTS=[1-9]/.test(r.out),
+    `反之，识别到被过滤的包就必须真的动手（否则这条护栏自己没打在修复路径上）：${seen.slice(0, 600)}`);
+  assert(/REPAIRFAIL_FIX_ACTS=[2-9]/.test(r.out),
+    `修不好时要走完「绕过过滤 → 复位模块流 → 放宽候选」这一串，而不是只试一档就放弃：${seen.slice(0, 600)}`);
+});
+
+test('deploy.sh：模块流判据与解析（纯函数）+ failovermethod 是无害警告', async () => {
+  const src = readDeploy();
+
+  // 「无人知晓的无害警告」比错误本身更耗时：它刷 5 行、最显眼，却不是失败原因。
+  // 真实故障现场里用户正是被它带偏的，所以脚本必须主动说清。
+  assert(/Invalid configuration value.*failovermethod/.test(src),
+    '必须识别并说明 CentOS 8 的 failovermethod 警告：它是旧版 yum 的选项，dnf 不支持，与安装失败无关');
+  const kindFn = codeOnly(fnBody(src, 'pkg_failure_kind'));
+  assert(!/failovermethod/.test(kindFn),
+    'failovermethod 不得参与失败原因分类 —— 它只是一行警告，进了判据会让分类整体走偏');
+
+  // 解析必须**动态**来做，不能硬编码 perl/5.26：换成别的被过滤包（nodejs 等）时，
+  // 写死的提示会直接把人带偏。
+  const modularBranch = codeOnly(fnBody(src, 'on_pkg_failure'));
+  assert(!/module reset -y perl/.test(modularBranch),
+    '诊断里的手工命令必须按解析结果生成，不得硬编码 perl —— 换个被过滤的包（如 nodejs）提示就全错了');
+  assert(/modular_suspects/.test(modularBranch),
+    '诊断分支必须复用 modular_suspects 的解析结果');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+printf 'SV3=%s\\n' "$(stream_from_version 5.26.3)"
+printf 'SV2=%s\\n' "$(stream_from_version 5.26)"
+printf 'SV1=%s\\n' "$(stream_from_version 7)"
+printf 'SV0=[%s]\\n' "$(stream_from_version '')"
+
+printf 'CAND=%s\\n' "$(module_name_candidates perl-libs | tr '\\n' ',')"
+printf 'CAND2=%s\\n' "$(module_name_candidates perl | tr '\\n' ',')"
+
+LOG='- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+- package perl-libs-4:5.26.3-420.el8.i686 is filtered out by modular filtering
+- package nodejs-npm-1:10.21.0-3.module_el8.x86_64 is filtered out by modular filtering
+Error: something else entirely'
+printf 'SUSPECTS=%s\\n' "$(modular_suspects "$LOG" | tr '\\n' ',')"
+
+# 现场那条完整日志（原样抄，含最容易把人带偏的 failovermethod 那几行）
+TMPLOG="$(mktemp)"; trap 'rm -f "$TMPLOG" 2>/dev/null || true' EXIT
+cat >"$TMPLOG" <<'USERLOG'
+Invalid configuration value: failovermethod=priority in /etc/yum.repos.d/CentOS-Base.repo; Configuration: OptionBinding with id "failovermethod" does not exist
+Last metadata expiration check: 1:23:03 ago on Sun 27 Sep 2026 01:34:05 PM CST.
+Error:
+ Problem: package git-2.27.0-1.el8.x86_64 requires perl(Git), but none of the providers can be installed
+ - package git-2.27.0-1.el8.x86_64 requires perl(Git::I18N), but none of the providers can be installed
+ - package perl-Git-2.27.0-1.el8.noarch requires perl(:MODULE_COMPAT_5.26.3), but none of the providers can be installed
+ - conflicting requests
+ - package perl-libs-4:5.26.3-420.el8.i686 is filtered out by modular filtering
+ - package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+USERLOG
+printf 'KIND_USER=%s\\n' "$(pkg_failure_kind "$(cat "$TMPLOG")")"
+
+FAKE_LOG='Invalid configuration value: failovermethod=priority in /etc/yum.repos.d/CentOS-Base.repo; Configuration: OptionBinding with id "failovermethod" does not exist
+- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering'
+log_since_mark() { printf '%s' "$FAKE_LOG"; }
+log_key_lines()  { sed -n '1,5p' <<<"$FAKE_LOG"; }
+PM=dnf; VERSION_ID=8
+on_pkg_failure git 1 2>&1 | grep -c -E 'failovermethod.*无害|无害警告' | sed 's/^/FOOTNOTE=/'
+`);
+  if (r.unavailable) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/SV3=5\.26/.test(r.out) && /SV2=5\.26/.test(r.out) && /SV1=7/.test(r.out),
+    `包版本必须收敛成模块流号（5.26.3 → 5.26）：${seen.slice(0, 400)}`);
+  assert(/CAND=perl-libs,perl,/.test(r.out),
+    `包名要能推出候选模块名（perl-libs → perl-libs/perl），存在与否交给 module list 验证、不靠猜：${seen.slice(0, 400)}`);
+  assert(/SUSPECTS=perl-libs 5\.26,perl-libs 5\.26,nodejs-npm 10\.21,/.test(r.out),
+    `必须从报错里解出「被过滤的包 + 期望流版本」（i686/x86_64 两条都命中、别的行不能混进来）：${seen.slice(0, 400)}`);
+  assert(/KIND_USER=modular/.test(r.out),
+    `现场那条日志必须被归类为 modular：${seen.slice(0, 400)}`);
+  assert(/FOOTNOTE=[1-9]/.test(r.out),
+    `failovermethod 出现时必须主动说明它是无害警告，否则用户会顺着它查错方向：${seen.slice(0, 400)}`);
+});
+
+/*
+ * ------------------------------------------------------------------
+ * 「即使是全新安装的纯净系统也出现这种情况」
+ *
+ * 这一句把上一版的修复方向整个推翻：先前认定 `perl-libs` 被过滤是「模块流状态与仓库
+ * 期望不一致」，于是自动修复只做 `module reset perl && module enable perl:5.26`。
+ * 但在**纯净系统**上模块流本来就是一致的 —— reset + enable 全是空转，
+ * 那台机器上永远不会成功。真正的机制是 RHEL 8 的 module failsafe：它按模块的
+ * 包级过滤清单屏蔽掉 `perl-libs`，与机器上的模块流状态无关。
+ *
+ * 对策是 dnf 官方的 `module_hotfixes`：让仓库按**包级**视图参与求解、不套模块过滤。
+ * 它只影响**本次事务**，不写任何持久状态 —— 因此比 reset/enable（**全局**改机器
+ * 模块流状态）安全得多，必须排在前面。
+ *
+ * ⚠️ 那个 `*` 的引号是必须的：不引会被 shell 当通配符在当前目录做 glob 展开，
+ * dnf 收到的是被换成文件名的垃圾参数，而失败信息完全看不出是这个原因。
+ * ------------------------------------------------------------------
+ */
+test('deploy.sh：纯净系统上的 module failsafe 必须靠 --setopt 绕过模块过滤直接装上（不动系统模块流）', async () => {
+  const src = readDeploy();
+  const code = codeOnly(src);
+
+  assert(hasFn(src, 'pkg_run_pm_hotfixes'),
+    '必须有「绕过模块过滤」这一档：纯净系统上模块流状态本来就是对的，reset/enable 修不动它');
+
+  // 引号：唯一能防住 shell glob 的东西。
+  // 判据必须是「**每一处** --setopt= 后面都紧跟引号」—— 用负向前瞻而不是枚举非法字符：
+  // `--setopt=[^*'"\s]` 那种写法在引号被去掉后紧跟的正是 `*`，会**恰好漏判**（本轮实测）。
+  const unquoted = code.match(/--setopt=(?!')/g) || [];
+  assert.deepStrictEqual(unquoted, [],
+    "`--setopt=` 后面必须紧跟引号（判据要覆盖**每一处**出现，不只实现处）：不引起来的话那个 * "
+    + '会被 shell 当通配符在当前目录做 glob 展开成文件名，dnf 收到垃圾参数且失败信息完全看不出原因');
+  assert((code.match(/--setopt='/g) || []).length >= 2,
+    '实现处与诊断提示处都要给出带引号的命令（用户会原样复制提示里的那条）');
+
+  // 首选：必须排在 reset/enable 之前（后者是全局状态变更，副作用大且对纯净系统无效）
+  const auto = codeOnly(fnBody(src, 'pkg_auto_repair'));
+  const iHot = auto.indexOf('pkg_run_pm_hotfixes');
+  const iReset = auto.indexOf('pkg_repair_modular_streams');
+  assert(iHot >= 0 && iReset >= 0 && iHot < iReset,
+    '自动修复必须先试「绕过模块过滤」，再试「复位模块流」——顺序反了的话纯净系统会先去空转一遍');
+
+  // 判据要认这个机制名（日志里可能出现 modulefailsafe / module_hotfixes 的措辞）
+  const kindFn = codeOnly(fnBody(src, 'pkg_failure_kind'));
+  assert(/modulefailsafe/.test(kindFn),
+    '失败判据必须认得 modulefailsafe：它才是纯净系统上 perl-libs 被屏蔽的机制名');
+
+  // 行为：纯净系统（模块流状态正常）—— 只有带 --setopt 的那次能装上，且**不许碰模块流**
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then printf 'LOG_UNAVAILABLE\\n'; exit 0; fi
+: > "$LOG_FILE"
+T="$(mktemp -d)"; trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+CALLS="$T/calls.txt"
+PM=dnf
+# 纯净 RHEL 8：模块流状态是好的（module list 也正常），但 failsafe 照样屏蔽 perl-libs。
+# 只有「绕过过滤」那一次能成功 —— 这正是用户现场。
+dnf() {
+  printf '%s\\n' "$*" >>"$CALLS"
+  case "$*" in *module_hotfixes*) printf 'Complete!\\n'; return 0 ;; esac
+  case "$1" in
+    module) printf 'Name Stream Profiles Summary\\nperl 5.26 common Practical Extraction\\n'; return 0 ;;
+    install)
+      printf 'Problem: package git-2.27.0-1.el8.x86_64 requires perl-Git\\n' >&2
+      printf -- '- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering\\n' >&2
+      return 1 ;;
+  esac
+  return 1
+}
+
+( pkg_install_opt git ) >"$T/opt" 2>&1 </dev/null
+printf 'PURE_RC=%s\\n' "$?"
+printf 'PURE_CALLS=%s\\n' "$(tr '\\n' '|' < "$CALLS")"
+printf 'PURE_MODULE_OPS=%s\\n' "$(grep -c -E 'module (reset|enable|list)|nobest' "$CALLS")"
+printf 'PURE_DIAG=%s\\n' "$(grep -c '【判断】' "$T/opt")"
+printf 'PURE_WARN=%s\\n' "$(grep -c '可选依赖安装失败' "$T/opt")"
+
+: > "$CALLS"
+( pkg_install git ) >"$T/hard" 2>&1 </dev/null
+printf 'HARD_RC=%s\\n' "$?"
+`);
+  if (r.unavailable || /LOG_UNAVAILABLE/.test(r.out)) return;
+  const seen = `${r.out}${r.err}`;
+  assert(/PURE_RC=0/.test(r.out),
+    `纯净系统上必须靠绕过过滤直接装上（返回 0）：${seen.slice(0, 600)}`);
+  // 桩里 `printf '%s' "$*"` 打印的是**展开后**的参数，引号不在其中（引号是 shell 语法）
+  // —— 引号那一层由本用例上半段的静态断言负责，这里只钉「确实发出了这条命令」。
+  assert(/PURE_CALLS=[^\n]*install -y --setopt=\*\.module_hotfixes=true git\|/.test(r.out),
+    `必须真的发出带 --setopt 的安装命令（而不是只打提示）：${seen.slice(0, 600)}`);
+  assert(/PURE_MODULE_OPS=0/.test(r.out),
+    `绕过过滤就够了的话，绝不该再去 reset/enable/list 模块流 —— 那是对**机器全局状态**的无谓改动：${seen.slice(0, 600)}`);
+  assert(/PURE_DIAG=0/.test(r.out) && /PURE_WARN=0/.test(r.out),
+    `修好之后不得再打失败诊断/降级警告：用户不该看到一个已经被自己解决的错误：${seen.slice(0, 600)}`);
+  assert(/HARD_RC=0/.test(r.out),
+    `必需通道同样要能靠绕过过滤装好（否则 nginx/nodejs 这类包一失败就走到 die）：${seen.slice(0, 600)}`);
+});
+
+test('deploy.sh：诊断给出的手工命令必须以 --setopt 绕过过滤为首选，且带引号、排在 reset 之前', async () => {
+  const src = readDeploy();
+  const diag = codeOnly(fnBody(src, 'on_pkg_failure'));
+  const iHot = diag.indexOf('module_hotfixes');
+  const iReset = diag.indexOf('module reset');
+  assert(iHot >= 0 && iReset >= 0 && iHot < iReset,
+    '诊断里的第 1 条手工命令必须是「绕过模块过滤」——用户要照着敲的是它，把 reset 放第一条等于又把人带回空转那条路');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+T="$(mktemp -d)"; trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+PM=dnf; VERSION_ID=8
+FAKE_LOG='Error:
+Problem: package git-2.27.0-1.el8.x86_64 requires perl(Git), but none of the providers can be installed
+- package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering'
+log_since_mark() { printf '%s' "$FAKE_LOG"; }
+log_key_lines()  { sed -n '1,5p' <<<"$FAKE_LOG"; }
+on_pkg_failure git 1 >"$T/diag" 2>&1 || true
+printf 'HF_LINE=%s\\n' "$(grep -n -m1 'module_hotfixes' "$T/diag" | cut -d: -f1)"
+printf 'RESET_LINE=%s\\n' "$(grep -n -m1 'module reset' "$T/diag" | cut -d: -f1)"
+printf 'QUOTED=%s\\n' "$(grep -c -F -- "--setopt='*.module_hotfixes=true'" "$T/diag")"
+printf 'FULLCMD=%s\\n' "$(grep -c -E 'dnf install -y --setopt=.*module_hotfixes=true.*git' "$T/diag")"
+`);
+  if (r.unavailable) return;
+  const seen = `${r.out}${r.err}`;
+  const mH = /HF_LINE=(\d+)/.exec(r.out);
+  const mR = /RESET_LINE=(\d+)/.exec(r.out);
+  assert(mH && mR && Number(mH[1]) > 0 && Number(mR[1]) > 0,
+    `诊断里两条命令都要出现（顺序断言不能靠"其中一条压根没有"来通过）：${seen.slice(0, 600)}`);
+  assert(Number(mH[1]) < Number(mR[1]),
+    `手工命令里「绕过过滤」必须排在「复位模块流」之前（第 ${mH && mH[1]} 行 vs 第 ${mR && mR[1]} 行）：${seen.slice(0, 600)}`);
+  assert(/QUOTED=[1-9]/.test(r.out),
+    `给出的命令必须带引号，否则用户原样复制执行时那个 * 会被自己的 shell 展开：${seen.slice(0, 600)}`);
+  assert(/FULLCMD=[1-9]/.test(r.out),
+    `必须是一条可以直接复制执行的完整命令（含包名）：${seen.slice(0, 600)}`);
 });

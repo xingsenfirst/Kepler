@@ -1378,10 +1378,14 @@ const CASES = [
       /*
        * 删掉「模块流被过滤」诊断分支 → 用户日志掉进通用兜底，只被告知"未能自动识别原因"，
        * 拿不到 dnf module reset/enable 这条真正的修复命令，也不知道"没有 git 也能部署"。
+       *
+       * （第 19 轮：判据从「本分支自己 grep 日志」收敛为 `pkg_failure_kind` 的**唯一实现点**，
+       *   anchor 随之换新形态 —— 原锚点是 `elif grep -qiE 'modular filtering'`，
+       *   改判据后它必然腐烂，这正是 invariants 里那条「anchor 必须命中」自检要抓的。）
        */
       name: 'D1-09 · 删掉「模块流被过滤」诊断（CentOS 8 装包失败的诊断退回通用兜底）',
       file: 'deploy.sh',
-      anchor: '  elif grep -qiE \'filtered out by modular filtering|modular filtering|requires module\\(|conflicts with module\\(\' <<<"$tail_log"; then',
+      anchor: '  elif [[ "$kind" == "modular" ]]; then',
       replacement: '  elif false; then',
       testFile: 'deploy-script.test.js',
       minFail: 1,
@@ -1825,6 +1829,160 @@ const CASES = [
       file: 'deploy.sh',
       anchor: 'CERT_REUSE_MIN_DAYS=30\n',
       replacement: 'CERT_REUSE_MIN_DAYS=365\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-06（第 19 轮）：`pkg_auto_repair` 的 modular 分支失效 —— 回到「只诊断、不修复」。
+       *
+       * 这一条钉的是用户的原话：「脚本自动安装 git 失败。这种最基础的操作不应该出问题。」
+       * 旧实现**已经能识别**这是模块流问题，却只把 `dnf module reset perl` 打印出来让人去敲；
+       * 而 git 走的是**可选**通道，装不上只降级不中断 —— 于是重装时 `prepare_source`
+       * 才发现没有 git，整个部署卡在拉源码那一步。
+       * 把 case 分支改成一个永不匹配的标签，就等于退回那个「识别了但不作为」的版本。
+       */
+      name: 'D3-06 · 包装不上时不再自动修模块流（退回「只诊断不修复」，git 仍然装不上）',
+      file: 'deploy.sh',
+      anchor: '  case "$(pkg_failure_kind "$(log_since_mark)")" in\n    modular)\n',
+      replacement: '  case "$(pkg_failure_kind "$(log_since_mark)")" in\n    never_matches)\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-07（第 19 轮）：把 `--nobest` 提到判据**之前**（无条件放宽候选版本）。
+       *
+       * `--nobest` 是 dnf 自己的建议，但它只在「已经确认是模块流不一致」之后才值得用；
+       * 无条件先试，就是在没搞清原因的情况下换一个版本装上、把问题推给下一个环节 ——
+       * 网络类失败也会去装一个「非最佳版本」的包，并骗过「自动修复没碰系统」这条边界。
+       */
+      name: 'D3-07 · 自动修复无条件放宽候选版本（--nobest 越过原因判据）',
+      file: 'deploy.sh',
+      anchor: '  case "$(pkg_failure_kind "$(log_since_mark)")" in\n',
+      replacement: '  if pkg_run_pm_nobest "${pkgs[@]}"; then return 0; fi\n'
+        + '  case "$(pkg_failure_kind "$(log_since_mark)")" in\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-08（第 19 轮）：删掉 failovermethod 的无害警告说明。
+       *
+       * 现场日志里那 5 行 `Invalid configuration value: failovermethod=…` 是最显眼的东西，
+       * 但它**不是**失败原因（旧版 yum 的选项，dnf 不支持）。脚本不主动说清，
+       * 用户就会顺着它把排查方向整个搞错 —— 真实故障现场里正是如此。
+       */
+      name: 'D3-08 · 删除 failovermethod 无害警告说明（用户被最显眼的那几行带偏）',
+      file: 'deploy.sh',
+      anchor: "  if grep -qiE 'Invalid configuration value.*failovermethod' <<<\"$tail_log\"; then\n",
+      replacement: '  if false; then\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-09（第 19 轮）：模块名不再验证 —— 直接把包名当模块名去 reset。
+       *
+       * 报错里给的是**包名**（perl-libs），`module reset` 要的是**模块名**（perl）。
+       * 跳过 `module list` 验证就等于把 perl-libs 拿去 reset —— 它根本不是模块，
+       * 只会多刷一行错，而真正要复位的 perl 一次都没被动过。
+       * 表现：`module reset -y perl-libs` 看着像做了事，git 依旧装不上。
+       */
+      name: 'D3-09 · 包名被直接当模块名 reset（跳过一次 module list 验证）',
+      file: 'deploy.sh',
+      anchor: '      if module_exists "$cand"; then mod="$cand"; break; fi\n',
+      replacement: '      mod="$cand"; break\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-10（第 19 轮）：`pkg_install_opt` 不接自动修复 —— **git 走的正是这条通道**。
+       *
+       * 只在必需通道里修等于没修：用户看到的「git 装不上」恰好发生在这条可选通道上。
+       * 后果与 D3-06 同类，但更隐蔽 —— 必需通道（nginx/nodejs）一切正常，
+       * 只有 git 这一条路径悄悄退回「只编号不干活」。
+       */
+      name: 'D3-10 · 可选通道不接自动修复（git 恰好走的就是这条通道）',
+      file: 'deploy.sh',
+      anchor: '    if pkg_auto_repair "${pkgs[@]}"; then return 0; fi\n'
+        + '    # on_pkg_failure 在「可选」分支里 return 1（表示未装上）。这里是**裸调用**，\n',
+      replacement: '    # on_pkg_failure 在「可选」分支里 return 1（表示未装上）。这里是**裸调用**，\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-11（第 19 轮）：自动修复里**去掉「绕过模块过滤」这一档**，退回「只 reset/enable」。
+       *
+       * 用户现场是**全新安装的纯净系统** —— 模块流状态本来就是对的，`module reset perl`
+       * 与 `module enable perl:5.26` 全是空转，那台机器上永远修不好。
+       * 真正的机制是 RHEL 8 的 module failsafe（按模块的包级过滤清单屏蔽 perl-libs），
+       * 只有 `module_hotfixes`（让仓库按包级视图求解）能过。
+       */
+      name: 'D3-11 · 撤掉「绕过模块过滤」档（纯净系统上 reset/enable 全是空转，git 依旧装不上）',
+      file: 'deploy.sh',
+      anchor: '          if pkg_run_pm_hotfixes "${pkgs[@]}"; then return 0; fi\n',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-12（第 19 轮）：给 `--setopt='*.module_hotfixes=true'` **去掉引号**。
+       *
+       * 那个 `*` 不引起来会被 shell 当通配符，在当前工作目录里做 glob 展开 ——
+       * dnf 收到的是被换成文件名的垃圾参数，而失败信息完全看不出是这个原因。
+       * 这是本条修复里最容易被"顺手简化"掉的一个字符。
+       *
+       * ⚠️ anchor 必须带上 `"${pkgs[@]}"` 这一截才**唯一**：命令原文在 deploy.sh 里出现两次
+       * （实现处 + 诊断提示处），只写命令本身会命中首处之外的第二处、或让护栏以为"还在"。
+       * 护栏侧对应地断言「**每一处** `--setopt=` 后面都紧跟引号」。
+       */
+      name: 'D3-12 · --setopt 的通配符丢掉引号（被 shell 展开成文件名，dnf 收到垃圾参数）',
+      file: 'deploy.sh',
+      anchor: "--setopt='*.module_hotfixes=true' \"${pkgs[@]}\"",
+      replacement: '--setopt=*.module_hotfixes=true "${pkgs[@]}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-13（第 19 轮）：把「绕过模块过滤」挪到「复位模块流」**之后**。
+       *
+       * 顺序反了的后果：纯净系统上先去 reset/enable 空转一遍（那是**全局**状态变更，
+       * 副作用大且对这个故障无效），再去绕过过滤 —— 结果虽然也可能装上，但用户机器
+       * 的模块流已被无谓改过。零副作用的那一档必须在前。
+       */
+      name: 'D3-13 · 修复档顺序颠倒（先动全局模块流，再试零副作用的绕过过滤）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: '          if pkg_run_pm_hotfixes "${pkgs[@]}"; then return 0; fi\n',
+          replacement: '',
+        },
+        {
+          anchor: '          if pkg_repair_modular_streams "${pkgs[@]}"; then return 0; fi ;;',
+          replacement: '          if pkg_repair_modular_streams "${pkgs[@]}"; then return 0; fi\n'
+            + '          if pkg_run_pm_hotfixes "${pkgs[@]}"; then return 0; fi ;;',
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * D3-14（第 19 轮）：失败判据不再认 `modulefailsafe` 这个机制名。
+       *
+       * 判据只认 `filtered out by modular filtering` 时，日志里出现的是
+       * `modulefailsafe` 措辞的那些变体就落进通用兜底 —— 用户拿不到「绕过模块过滤」这条
+       * 唯一有效的命令。判据漏一个机制名，整条修复路径就整段失效。
+       */
+      name: 'D3-14 · 失败判据不认 modulefailsafe（掉进通用兜底，拿不到对症命令）',
+      file: 'deploy.sh',
+      anchor: '|modulefailsafe|module_hotfixes|requires module\\(|',
+      replacement: '|requires module\\(|',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },

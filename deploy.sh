@@ -2293,6 +2293,41 @@ acme_bin() { printf '%s/acme.sh' "$ACME_HOME"; }
 # 会以退出码 2 收场（见 acme_issue_skipped），旧实现把它当失败就回退自签名，于是「重装」
 # 反而把好好的正式证书降级了（2026-09 现场故障）。
 #
+# ------------------------------------------------------------------------------
+# 「这份证书到底能不能用」——**唯一实现点**（签发安装、复用判断、自签名生成三处共用）。
+#
+# 只判 `-s`（文件非空）会漏掉两类**已经踩到**的坏证书：
+#   ① 文件里有字节、也能被 openssl 解析，但 subject / issuer **是空的**——
+#      `openssl req -x509 -subj "/"` 实测就产出这样一份「合法但字段全空白」的证书，
+#      `nginx -t` 照样通过。装上去浏览器里点开证书信息**所有字段都是空白**、
+#      一律判「不安全」。这正是「脚本说签发成功、浏览器却说证书空白」的机制。
+#   ② 证书与私钥不是一对（acme.sh 续期只换证书、不换 key 的中间态）。
+#
+# 所以判据必须是**内容级**的：能解析出 subject 与 issuer 且都**有实值**，且公钥与私钥配对。
+cert_file_ok() {
+  local crt="$1" key="$2"
+  [[ -s "$crt" && -s "$key" ]] || return 1
+  have openssl || return 1
+  local s i
+  s="$(openssl x509 -in "$crt" -noout -subject 2>/dev/null || true)"
+  i="$(openssl x509 -in "$crt" -noout -issuer  2>/dev/null || true)"
+  # openssl 输出形如 `subject=CN = example.com`（1.0.2 上是 `subject=/CN=...`）；
+  # 等号后面为空 = 证书字段全空白，必须判为不可用。
+  [[ "$s" == subject=* && -n "${s#subject=}" ]] || return 1
+  [[ "$i" == issuer=*  && -n "${i#issuer=}"  ]] || return 1
+  # 公钥配对：先 pkey（ECC/RSA 通吃），老 OpenSSL 上再退到 rsa。
+  # 要求两段文本都真的是 PUBLIC KEY 块 —— 否则「两边都解析失败」会变成空==空的假通过。
+  local pc pk
+  pc="$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null || true)"
+  pk="$(openssl pkey -in "$key" -pubout 2>/dev/null || openssl rsa -in "$key" -pubout 2>/dev/null || true)"
+  [[ "$pc" == *"-----BEGIN PUBLIC KEY-----"* && "$pk" == *"-----BEGIN PUBLIC KEY-----"* ]] || return 1
+  pc="${pc//$'\n'/}"; pk="${pk//$'\n'/}"
+  # 显式 return：函数**不得**以裸 `[[ ... ]]` 结尾 —— 条件为假时函数返回 1，
+  # 裸调用处会被 ERR trap 当成脚本失败（本仓有一条全局护栏专门扫这个写法）。
+  if [[ "$pc" != "$pk" ]]; then return 1; fi
+  return 0
+}
+
 # 判据只用 openssl 的 -checkend：它直接回答「未来 N 天内会不会过期」，
 # 不必解析 notAfter 文本（BSD 与 GNU 的 date 语法不同，解析一换机器就翻车）。
 # 拿不到结论时返回 1 —— 那就照旧去申请，退化成原有流程，不冒险跳过。
@@ -2300,6 +2335,11 @@ tls_cert_reusable() {
   local dir="$1"
   [[ -s "${dir}/fullchain.pem" && -s "${dir}/privkey.pem" ]] || return 1
   have openssl || return 1
+  # 先过内容关。一份「没过期、但浏览器根本用不了」的证书若不在这里拦下，就会被
+  # **每次重装永久复用**（每次都判「可复用 → 跳过申请」），表现为「怎么重装它都还是
+  # 那个不安全的证书」—— 与「可复用来源只认 ACME_CERT_DIR」是同一类教训：
+  # 复用判据必须能回答「它现在还好不好用」，而不只是「它在不在」。
+  cert_file_ok "${dir}/fullchain.pem" "${dir}/privkey.pem" || return 1
   openssl x509 -in "${dir}/fullchain.pem" -noout \
     -checkend $((CERT_REUSE_MIN_DAYS * 86400)) >/dev/null 2>&1
 }
@@ -2368,8 +2408,10 @@ acme_eab_hints() {
 gen_self_signed() {
   mkdir -p "$SELF_SIGNED_DIR"
   local key="${SELF_SIGNED_DIR}/privkey.pem" crt="${SELF_SIGNED_DIR}/fullchain.pem"
-  if [[ -s "$key" && -s "$crt" ]]; then
-    info "已存在自签名证书，复用：${crt}"
+  # 复用判据同样要过内容关：「存在且非空」的坏证书（字段全空白 / 与私钥不配对）
+  # 如果被复用，就会**每次重装都原地保留**那份浏览器用不了的证书。
+  if cert_file_ok "$crt" "$key"; then
+    info "已存在可用的自签名证书，复用：${crt}"
   else
     have openssl || pkg_install openssl
     info "生成自签名证书（有效期 825 天）…"
@@ -2387,6 +2429,15 @@ gen_self_signed() {
     fi
   fi
   chmod 0600 "$key"; chmod 0644 "$crt"
+  # 生成成功（rc=0）不等于内容可用：`-subj` 拼错、DOMAIN 为空等都会产出
+  # subject/issuer 全空白的证书 —— openssl 返回 0，浏览器里字段却是空的。
+  if ! cert_file_ok "$crt" "$key"; then
+    HINTS=()
+    add_hint "  生成出来的证书**内容不可用**（subject/issuer 为空 或 与私钥不配对）。"
+    add_hint "  字段自检：openssl x509 -in ${crt} -noout -subject -issuer -dates"
+    add_hint "  删掉重生成：rm -f ${key} ${crt} && $(rerun_cmd --tls selfsigned)"
+    die_with_hint "自签名证书内容校验未通过（浏览器会看到字段全空白的证书）" "${HINTS[@]}"
+  fi
   CERT_FULLCHAIN="$crt"; CERT_KEY="$key"
   ok "自签名证书就绪：${crt}"
   info "浏览器会提示「不安全」，在警告页选「高级 → 继续前往」即可（本配置对自签名不启用 HSTS，可以点进去）。"
@@ -2567,6 +2618,18 @@ acme_install_cert() {
     warn "证书文件未正确落盘：${dir}/privkey.pem 或 fullchain.pem 缺失/为空。"
     return 1
   fi
+  # 落盘 ≠ 可用。只判「非空」时，一份 subject/issuer 全空白（或与私钥不配对）的证书
+  # 会被一路当成「签发成功」送到浏览器 —— 用户看到的就是「提示成功、证书字段全空白、
+  # 显示不安全」。这里必须当场拒绝，并把它到底是什么打出来，别让下一个人再去猜。
+  if ! cert_file_ok "${dir}/fullchain.pem" "${dir}/privkey.pem"; then
+    warn "证书文件已落盘，但**内容不可用**（字段全空白 / 不是证书 / 与私钥不配对）：${dir}"
+    warn "  文件开头（前 3 行）：$(head -n 3 "${dir}/fullchain.pem" 2>/dev/null | tr '\n' ' ' || true)"
+    warn "  字段自检：openssl x509 -in ${dir}/fullchain.pem -noout -subject -issuer -dates"
+    warn "  私钥自检：openssl pkey -in ${dir}/privkey.pem -noout 2>&1 | head -n1"
+    warn "  已**不**把它记为「签发成功」。重签：$(rerun_cmd --force-cert)"
+    return 1
+  fi
+  ok "证书内容校验通过：$(openssl x509 -in "${dir}/fullchain.pem" -noout -subject 2>/dev/null || true)"
   return 0
 }
 
@@ -2683,6 +2746,68 @@ issue_acme_sh() {
   return 0
 }
 
+# ------------------------------------------------------------------------------
+# 「本机 443 上**实际**提供的是哪份证书」—— 这是本次修复的另一半。
+#
+# 为什么必须有这一步：`nginx -t` 只能证明**我们写的那份配置能被解析**，它证明不了
+# 「浏览器连上来时看到的就是这份证书」。下面任一情况都会让浏览器拿到**另一份**证书：
+#   · 访问的域名与 server_name 不一致（比如用 www. 访问、却只配了主域）→ Nginx 退回
+#     443 上的 default_server，而面板/旧站点常在那里放一份**字段全空白**的自签证书；
+#   · 面板或旧站点自己在 443 上占了 default_server；
+#   · 前面还有 CDN / 反向代理在终结 TLS（证书要在那边配）。
+# 现场表现就是「脚本说 ZeroSSL 签发成功，浏览器却说不安全、证书字段全空白」。
+# 这里把「实际提供的是谁」与本地文件按指纹比对并打印出来，把不可见的错配变成一行事实。
+tls_probe_served() {
+  have openssl || return 0
+  [[ -n "${CERT_FULLCHAIN:-}" && -s "$CERT_FULLCHAIN" ]] || return 0
+  local port="${HTTPS_PORT:-443}"
+  local pulled fp_file fp_served
+  pulled="$(openssl s_client -connect "127.0.0.1:${port}" -servername "$DOMAIN" </dev/null 2>/dev/null || true)"
+  fp_file="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -fingerprint -sha256 2>/dev/null || true)"
+  fp_served="$(printf '%s\n' "$pulled" | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+  if [[ -z "$fp_served" ]]; then
+    warn "读不到本机 ${port} 端口上的证书（Nginx 未监听该端口？），跳过「实际提供证书」比对。"
+    return 1
+  fi
+  local s i nd
+  s="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -subject 2>/dev/null || true)"
+  i="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -issuer  2>/dev/null || true)"
+  nd="$(cert_not_after "$CERT_FULLCHAIN")"
+  if [[ "$fp_file" == "$fp_served" ]]; then
+    ok "HTTPS 已就绪，浏览器里应能看到这份证书（字段不会是空的）："
+    info "  颁发给：${s#subject=}"
+    info "  颁发者：${i#issuer=}"
+    info "  到期  ：${nd}"
+    info "  指纹  ：${fp_served#*=}"
+    return 0
+  fi
+  # 不一致：这是「脚本说成功、浏览器说不安全」的真正落点，必须说清楚。
+  warn "⚠ 本机 ${port} 端口实际提供的证书，与我们刚安装的**不是同一份**！"
+  warn "  我们安装的：${CERT_FULLCHAIN}（${s#subject=}）"
+  warn "  实际提供的：$(printf '%s\n' "$pulled" | openssl x509 -noout -subject -issuer 2>/dev/null || true)"
+  warn "  → 浏览器看到的是**后面这一份**，所以判定不安全、证书信息可能是空白的。"
+  # 注意 `mine` 必须单独算在一行上：管道那条赋值里若出现嵌套的 `$(...)`，
+  # 逐行扫描「命令替换里的管道必须有 || true」的护栏会在同一行上把嵌套 `$(`
+  # 里面的 `)` 当成收尾，从而误判这条赋值缺兜底（本仓既有护栏的行为，实测踩到）。
+  local def_files="" mine
+  mine="$(basename "${NGINX_CONF}")"
+  if [[ -n "${NGINX_BIN:-}" ]]; then
+    def_files="$(nginx -T 2>/dev/null | awk -v mine="$mine" '
+        /^# configuration file / { f = $4; sub(/:$/, "", f); sub(/^.*\//, "", f) }
+        index($0, "listen") && index($0, "443") && index($0, "default_server") { if (f != "" && f != mine) print f }
+      ' | sort -u | tr '\n' ' ' || true)"
+  fi
+  if [[ -n "${def_files// /}" ]]; then
+    warn "  443 上的 default_server 还出现在这些配置文件里：${def_files}"
+  fi
+  warn "  按顺序排查："
+  warn "    1) 你用浏览器访问的域名要和 ${DOMAIN} **完全一致**（含 www. 前缀）："
+  warn "       curl -vkI https://${DOMAIN}/ 2>&1 | grep -E 'subject|issuer'"
+  warn "    2) 停用面板/旧站点在 443 上的默认站点，或把该域名的反代指向 http://127.0.0.1:${APP_PORT}"
+  warn "    3) 若前面挂了 CDN/反向代理，证书要在那边配置（回源证书不影响浏览器看到的）"
+  return 1
+}
+
 setup_tls() {
   case "$TLS_MODE" in
     none)
@@ -2723,6 +2848,9 @@ setup_tls() {
   esac
   write_nginx_conf 1 "$CERT_FULLCHAIN" "$CERT_KEY"
   nginx_apply
+  # 收尾自检：把「实际对外提供的那份证书」打出来并与本地文件比对指纹。
+  # 只在「不一致」时才跳出来 —— 此时才说明浏览器看到的不是我们装的这份。
+  tls_probe_served || true
 }
 
 # ------------------------------------------------------------------------------

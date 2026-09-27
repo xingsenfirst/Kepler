@@ -1159,7 +1159,8 @@ test('deploy.sh：acme 证书落盘后不得因 reload 失败而误判「安装�
   assert(/! -s "\$\{dir\}\/privkey\.pem"/.test(inst) || /! -s "\$\{dir\}\/fullchain\.pem"/.test(inst),
     '成功判据必须是「privkey.pem / fullchain.pem 是否非空落盘」');
 
-  // 3) 行为验证：模拟 acme.sh --install-cert 返回非零但证书已写盘 → 必须判成功
+  // 3) 行为验证：模拟 acme.sh --install-cert 写盘成功但返回非零 → 必须判成功；
+  //    而「写盘的**不是证书**」必须判失败（这正是「浏览器里字段全空白」的入口）
   const r = await spawnBashSnippet(`
 set -Eeuo pipefail
 source ./deploy.sh
@@ -1167,16 +1168,34 @@ trap - ERR
 set +e
 ACME_HOME="$(mktemp -d)"
 DOMAIN=cos.example.com
-dir="$(mktemp -d)"
-printf 'KEY' > "$dir/privkey.pem"; printf 'CHAIN' > "$dir/fullchain.pem"
-# 让 acme.sh 那步「失败」（返回非零），但证书文件已存在且非空
+T="$(mktemp -d)"; trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+# 让 acme.sh 那步「失败」（返回非零），但证书文件是已经写好了的
 acme_bin() { printf 'false'; }
-acme_install_cert "$dir"
-printf 'RC=%s\\n' "$?"
+
+# 情形 1：写盘的是**真的一对证书** → 即使 --install-cert（reloadcmd）失败也必须判成功
+if have openssl; then
+  mkdir -p "$T/real"
+  openssl req -x509 -nodes -newkey rsa:2048 -days 30 \\
+    -keyout "$T/real/privkey.pem" -out "$T/real/fullchain.pem" -subj "/CN=cos.example.com" >/dev/null 2>&1 || true
+  acme_install_cert "$T/real" >/dev/null 2>&1
+  printf 'RC_REAL=%s\\n' "$?"
+else
+  printf 'RC_REAL=SKIP\\n'
+fi
+
+# 情形 2：文件「非空，但不是证书」→ 必须判失败。
+# 旧实现的成功判据只到「非空」为止，于是这种证书被当成签发成功送到浏览器里，
+# 用户看到的就是「提示签发成功、证书字段全空白、显示不安全」。
+mkdir -p "$T/junk"
+printf 'KEY' > "$T/junk/privkey.pem"; printf 'CHAIN' > "$T/junk/fullchain.pem"
+acme_install_cert "$T/junk" >/dev/null 2>&1
+printf 'RC_JUNK=%s\\n' "$?"
 `);
   if (r.unavailable) return;
-  assert(/RC=0/.test(r.out),
-    `证书已落盘时，即使 acme.sh 的 --install-cert（reloadcmd）失败也不该判「安装失败」：${(r.out + r.err).slice(0, 400)}`);
+  assert(/RC_REAL=(0|SKIP)/.test(r.out),
+    `证书已落盘（且内容可用）时，即使 acme.sh 的 --install-cert（reloadcmd）失败也不该判「安装失败」：${(r.out + r.err).slice(0, 400)}`);
+  assert(/RC_JUNK=1/.test(r.out),
+    `「非空但不是证书」的文件必须判失败：否则浏览器里就是「提示成功、证书字段全空白」：${(r.out + r.err).slice(0, 400)}`);
 });
 
 /**
@@ -1299,6 +1318,12 @@ test('deploy.sh：tls_cert_reusable 的判据与阈值（「跳过申请」的�
     '必须用 openssl x509 -checkend 判「未来 N 天内会不会过期」：解析 notAfter 文本会撞上 BSD/GNU 的 date 语法差异');
   assert(/-s "\$\{dir\}\/fullchain\.pem"/.test(body) && /-s "\$\{dir\}\/privkey\.pem"/.test(body),
     'fullchain 与 privkey 两个文件都必须「存在且非空」才算可复用（缺一个就起不了 TLS）');
+  // 「非空」还不够 —— 必须过内容关。这一句是本用例与第 39 条分工的地方：
+  // 第 39 条守「签发安装时坏证书不得被当成成功」，这里守「复用时不把坏证书当好的」。
+  assert(/cert_file_ok/.test(body),
+    '复用判据必须包含「内容可用」校验（cert_file_ok）：只判存在/非空的复用，会让一份浏览器'
+    + '根本用不了的证书（字段全空白 / 与私钥不配对）被**每次重装永久复用**（每次都判'
+    + '「可复用 → 跳过申请」），表现成「怎么重装它都还是那个不安全的证书」');
 
   // 行为验证：阈值两侧各留余量（90 天 ≫ 30、10 天 ≪ 30），外加三类「看似有文件其实不可用」
   const r = await spawnBashSnippet(`
@@ -1896,4 +1921,80 @@ printf 'FULLCMD=%s\\n' "$(grep -c -E 'dnf install -y --setopt=.*module_hotfixes=
     `给出的命令必须带引号，否则用户原样复制执行时那个 * 会被自己的 shell 展开：${seen.slice(0, 600)}`);
   assert(/FULLCMD=[1-9]/.test(r.out),
     `必须是一条可以直接复制执行的完整命令（含包名）：${seen.slice(0, 600)}`);
+});
+
+test('deploy.sh：证书必须「内容可用」才算成功（字段非空 + 与私钥配对），且要核对实际对外提供的是哪一份', async () => {
+  const src = readDeploy();
+
+  // —— 静态：判据必须存在、且是唯一实现点 ——
+  assert(hasFn(src, 'cert_file_ok'),
+    '必须有证书「内容可用」的判据：只判文件非空会放过 subject/issuer 全空白的证书'
+    + '（openssl 能解析、nginx -t 也通过，浏览器里证书字段全空白 —— 现场症状）');
+  const okFn = fnBody(src, 'cert_file_ok');
+  assert(/subject=/.test(okFn) && /issuer=/.test(okFn),
+    '判据必须要求 subject 与 issuer **有实值**（等号后为空即判不可用），不能只看文件字节数');
+  assert(/-pubkey/.test(okFn) && /-pubout/.test(okFn),
+    '判据必须校验证书公钥与私钥配对：acme.sh 续期只换证书不换 key 时会产出不配对的一份');
+
+  // 三个调用点都必须走这个判据 —— 少一处，坏证书就从那条路径漏过去
+  for (const fn of ['acme_install_cert', 'tls_cert_reusable', 'gen_self_signed']) {
+    assert(/cert_file_ok/.test(fnBody(src, fn)),
+      `${fn} 必须用 cert_file_ok 判「能不能用」，不能只判文件存在/非空`
+      + '（否则一份坏证书会被当成「签发成功」，或被每次重装永久复用）');
+  }
+
+  // —— 静态：另一半「实际对外提供的是不是这一份」 ——
+  assert(hasFn(src, 'tls_probe_served'),
+    '必须探测「本机 HTTPS 端口实际提供的是哪份证书」：nginx -t 只能证明配置能被解析，'
+    + '证明不了浏览器看到的是这份（SNI 不匹配会退到 443 上的 default_server）');
+  assert(/tls_probe_served \|\| true/.test(src),
+    'setup_tls 收尾必须调用探测（且不能因它失败而中断部署）');
+  const probe = fnBody(src, 'tls_probe_served');
+  assert(/-fingerprint/.test(probe) && /-servername/.test(probe),
+    '探测必须带 SNI（-servername）取实际证书，并按指纹与本地文件比对');
+  assert(/default_server/.test(probe),
+    '不一致时要指出 443 上还有别人的 default_server（SNI 不匹配时浏览器拿到的就是它的证书）');
+
+  // —— 行为：用**真实 openssl** 造几种证书，逐一验证判据 ——
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+have openssl || { printf 'NO_OPENSSL\\n'; exit 0; }
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# 不带 -addext：老 OpenSSL 也认，且 cert_file_ok 不依赖 SAN
+mk() { mkdir -p "$1"; openssl req -x509 -nodes -newkey rsa:2048 -days 30 \\
+        -keyout "$1/privkey.pem" -out "$1/fullchain.pem" -subj "$2" >/dev/null 2>&1 || return 1; return 0; }
+mk "$T/ok" "/CN=x.test" || printf 'MK_FAIL=1\\n'
+mk "$T/blank" "/" || printf 'MK_BLANK_FAIL=1\\n'
+mk "$T/other" "/CN=other.test" || printf 'MK_OTHER_FAIL=1\\n'
+: > "$T/empty.pem"; printf 'not a cert\\n' > "$T/junk.pem"
+f() { cert_file_ok "$1" "$2" && printf '0' || printf '1'; }
+printf 'OK_PAIR=%s\\n'       "$(f "$T/ok/fullchain.pem" "$T/ok/privkey.pem")"
+printf 'BLANK_SUBJ=%s\\n'    "$(f "$T/blank/fullchain.pem" "$T/blank/privkey.pem")"
+printf 'MISMATCH_KEY=%s\\n'  "$(f "$T/ok/fullchain.pem" "$T/other/privkey.pem")"
+printf 'EMPTY_FILE=%s\\n'    "$(f "$T/empty.pem" "$T/ok/privkey.pem")"
+printf 'JUNK_FILE=%s\\n'     "$(f "$T/junk.pem" "$T/ok/privkey.pem")"
+printf 'BLANK_SUBJECT_LINE=%s\\n' "$(openssl x509 -in "$T/blank/fullchain.pem" -noout -subject 2>/dev/null || true)"
+`);
+  if (r.unavailable) return;
+  if (/NO_OPENSSL/.test(r.out)) return;   // 环境没有 openssl 就只保留静态断言
+  const seen = `${r.out}${r.err}`;
+
+  assert(/OK_PAIR=0/.test(r.out), `正常的一对证书必须判可用：${seen.slice(0, 800)}`);
+  assert(/MISMATCH_KEY=1/.test(r.out),
+    `证书与私钥不配对必须判不可用（acme.sh 续期只换证书不换 key 时会走到这条路径）：${seen.slice(0, 800)}`);
+  assert(/EMPTY_FILE=1/.test(r.out) && /JUNK_FILE=1/.test(r.out),
+    `空文件与「有字节但不是证书」的文件都必须判不可用：${seen.slice(0, 800)}`);
+
+  // 核心判据：字段全空白的证书必须判不可用。先钉住前提（openssl 确实能造出这种证书，
+  // 且它的 -noout -subject 输出就是 `subject=`），再钉判据 —— 否则这条断言的前提本身会漂移。
+  if (!/MK_BLANK_FAIL/.test(r.out)) {
+    const blankLine = ((/BLANK_SUBJECT_LINE=(.*)/.exec(r.out) || [])[1] || '').trim();
+    assert(blankLine === 'subject=',
+      `前提：openssl 生成的空 subject 证书，-noout -subject 就输出 \`subject=\`（等号后为空值）；`
+      + `实际为「${blankLine}」—— 判据必须按「等号后为空」判不可用`);
+    assert(/BLANK_SUBJ=1/.test(r.out),
+      `subject/issuer 全空白的证书必须判**不可用** —— 这正是「脚本说签发成功、浏览器里证书字段全空白」的来源：${seen.slice(0, 800)}`);
+  }
 });

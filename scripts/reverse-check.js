@@ -1986,6 +1986,58 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * D3-15（第 20 轮）：把证书「内容可用」的判据退回「只看文件字节数」。
+       *
+       * 两处**一起**退，缺一不可：
+       *   ① `cert_file_ok` 里对 subject/issuer「必须有实值」的检查 ——
+       *      这才是拦住「字段全空白证书」的那一句；只删其中一行不行，
+       *      另一行（issuer）照样把它拦下，变异就等于没做；
+       *   ② `tls_cert_reusable` 里对 `cert_file_ok` 的调用 —— 复用判据若只看 `-s`，
+       *      一份坏证书会被**每次重装永久复用**，永远修不回来。
+       *
+       * 两处一起退，红项落在**两个不同用例**上（分工，不是冗余）：
+       *   ① 打红第 39 条 —— 守「签发安装时坏证书不得被当成成功」（`cert_file_ok` 里
+       *      subject/issuer 的实值检查 + 行为桩 `BLANK_SUBJ=1`）；
+       *   ② 打红第 39 条与第 31 条（`tls_cert_reusable 的判据与阈值`）—— 第 39 条管
+       *      「三处调用点都在」，第 31 条管「**复用这一处**的内容校验不能被摘掉」。
+       * 合计 2 个不同用例，故 `minFail: 2`（本脚手架一次施加全部变异、只取合计 `# fail`，
+       * 无法按变异归因）：只退 ① 时只有第 39 条红（=1），到不了 2。
+       * 早期第 31 条还没单独断言 `cert_file_ok` 时，退回旧实现只打中第 39 条一个用例、
+       * `fail=1` —— 正是这么暴露「复用路径那一半没被独立守着」的。
+       */
+      name: 'D3-15 · 证书判据退回「只看文件非空」（字段全空白的证书被当成签发成功 / 被永久复用）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: '  [[ "$s" == subject=* && -n "${s#subject=}" ]] || return 1\n'
+            + '  [[ "$i" == issuer=*  && -n "${i#issuer=}"  ]] || return 1\n',
+          replacement: '',
+        },
+        {
+          anchor: '  cert_file_ok "${dir}/fullchain.pem" "${dir}/privkey.pem" || return 1\n',
+          replacement: '',
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * D3-16（第 20 轮）：撤掉 `setup_tls` 收尾的「实际对外提供的是哪份证书」比对。
+       *
+       * `nginx -t` 只能证明我们写的配置能被解析，证明不了浏览器看到的就是这份证书。
+       * 撤掉这一步，「脚本说 ZeroSSL 签发成功、浏览器却说不安全」这种错配就再也
+       * 没有任何地方能发现 —— 现场只能靠人去猜，而这一猜就是几十分钟。
+       */
+      name: 'D3-16 · 撤掉「实际对外提供的证书」收尾比对（浏览器看到的不是这份，脚本仍报成功）',
+      file: 'deploy.sh',
+      anchor: '  tls_probe_served || true\n',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

@@ -182,6 +182,15 @@ HTTPS 证书默认向 **ZeroSSL** 申请（acme.sh 可用 `--email` 自动换取
 > 例（LiteSSL，国内直连）：`sudo bash deploy.sh --domain cos.example.com --ca litessl --eab-kid <KID> --eab-hmac-key <密钥>`
 >
 > 拿不到 EAB、又连不上其它 CA 时，先用 `--tls selfsigned` 把站点跑起来，之后再换正式证书 —— 证书步骤失败只会回退自签名，**不会**中断部署。
+>
+> **证书自检**：脚本不再只看「文件在不在」，而是要求证书**内容真的可用** —— 能解析出 subject / issuer 且都有实值、且与私钥配对。只判文件非空的实现会把「所有字段都是空白」的证书当成签发成功（`openssl req -x509 -subj "/"` 就会产出这种证书，`nginx -t` 也照样通过），用户拿到的是一个浏览器判定不安全、点开证书信息一片空白的站点。装完证书后脚本还会**核对「浏览器实际看到的是哪一份」**：带 SNI 连本机 HTTPS 端口取回实际证书、按 SHA-256 指纹与刚安装的文件比对。若两者不一致会直接点名原因（最常见的是用 `www.` 访问却只配了主域，于是退回到面板/旧站点在 443 上的 `default_server`）。自查命令：
+>
+> ```bash
+> openssl x509 -in /etc/kepler/ssl/acme/fullchain.pem -noout -subject -issuer -dates   # 本地装的这份
+> curl -vkI https://你的域名/ 2>&1 | grep -E 'subject|issuer'                          # 浏览器看到的那份
+> ```
+>
+> 两者不一致时，按提示排查：① 访问的域名与配置的 `--domain` **完全一致**（含 `www.` 前缀）；② 停用面板/旧站点在 443 上的默认站点；③ 前面挂了 CDN 的话，证书要在 CDN 侧配置。
 
 > 部署状态保存在 `/etc/kepler/deploy.conf`（0600）：修改端口、重新安装都以它为准，避免重跑时参数丢失；卸载会一并清除该文件。
 

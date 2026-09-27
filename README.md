@@ -132,7 +132,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（31 个文件 / 500+ 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（32 个文件 / 500+ 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
@@ -164,7 +164,23 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/K
 | 5 | 卸载 | 清理服务、应用、数据、证书配置与全局命令 |
 | 0 | 退出 | — |
 
-常用参数：`--domain`（必填）、`--port`、`--https-port`、`--http-port`、`--dir`、`--data-dir`、`--mode systemd|docker`、`--tls auto|letsencrypt|selfsigned|none`、`--mirror cn`（国内加速）、`--skip-node` / `--skip-deps` / `--skip-nginx` / `--skip-service`（自行接管某一步）。
+常用参数：`--domain`（必填）、`--port`、`--https-port`、`--http-port`、`--dir`、`--data-dir`、`--mode systemd|docker`、`--tls auto|acme|selfsigned|none`、`--mirror cn`（国内加速）、`--skip-node` / `--skip-deps` / `--skip-nginx` / `--skip-service`（自行接管某一步）。
+
+HTTPS 证书默认向 **ZeroSSL** 申请（acme.sh 可用 `--email` 自动换取 EAB，零手工；走 HTTP-01 校验）。**不建议默认用 Let's Encrypt**：国内服务器经常连不上它的境外 API，而且它按「注册域名/公共后缀」7 天限发证书，公共后缀（如 `*.l.cd`、`*.github.io`）下所有人共享配额，极易被 `rateLimited`（429）限流，反复签不下来。
+
+| 参数 | 作用 | 说明 |
+| --- | --- | --- |
+| `--ca zerossl\|letsencrypt\|litessl` | 选择 CA | 默认 `zerossl`；`litessl` 是亚数 TrustAsia 的免费 DV 证书，国内可直连 |
+| `--eab-kid <KID>` | EAB 凭据 | LiteSSL 必需；到 [litessl.com](https://www.litessl.com) 注册后生成 |
+| `--eab-hmac-key <密钥>` | EAB 凭据 | LiteSSL 必需；只经命令行交给 acme.sh，**不写入部署状态文件** |
+
+> 换 CA **不等于**换个接口地址：LiteSSL 与 ZeroSSL 的 ACME 接口都声明 `externalAccountRequired: true`，必须带 EAB（外部账户绑定）凭据。ZeroSSL 可由 acme.sh 用 `--email` 自动换取 EAB；LiteSSL 必须手工取。`--tls` 也可以直接写 CA 名，如 `--tls litessl`。
+>
+> 例（ZeroSSL，推荐，零手工）：`sudo bash deploy.sh --domain cos.example.com --ca zerossl --email you@example.com`
+>
+> 例（LiteSSL，国内直连）：`sudo bash deploy.sh --domain cos.example.com --ca litessl --eab-kid <KID> --eab-hmac-key <密钥>`
+>
+> 拿不到 EAB、又连不上其它 CA 时，先用 `--tls selfsigned` 把站点跑起来，之后再换正式证书 —— 证书步骤失败只会回退自签名，**不会**中断部署。
 
 > 部署状态保存在 `/etc/kepler/deploy.conf`（0600）：修改端口、重新安装都以它为准，避免重跑时参数丢失；卸载会一并清除该文件。
 

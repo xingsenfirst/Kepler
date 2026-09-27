@@ -165,10 +165,11 @@ function spawnBash(args) {
   });
 }
 
-/** 取某个 shell 函数的函数体（函数体以行首 `}` 结束） */
+/** 取某个 shell 函数的函数体（函数体以行首 `}` 结束）。两种写法（f() / function f()）都要认。 */
 function fnBody(src, name) {
-  const start = src.indexOf(`\n${name}() {`);
-  assert.notEqual(start, -1, `deploy.sh 里应存在函数 ${name}`);
+  const m = new RegExp(`\\n(?:function[ \\t]+)?${name}\\(\\) \\{`).exec(src);
+  assert(m, `deploy.sh 里应存在函数 ${name}`);
+  const start = m.index;
   const end = src.indexOf('\n}', start);
   assert.notEqual(end, -1, `${name}() 应有正常的函数体结束`);
   return src.slice(start, end);
@@ -332,8 +333,22 @@ test('deploy.sh：取值型参数缺值必须给人话错误（不得退化成�
   );
   assert(/\[\[ \$# -lt 2 \|\| -z "\$\{2-\}" \]\]/.test(src),
     '取值型参数必须校验「确实给了取值」（`$#` 够且非空）');
-  assert(/--domain\|--port\|[^\n]*--mirror\)/.test(src),
-    '所有取值型选项应走同一个校验分支，避免漏掉某一个');
+  /**
+   * 判据从「正则凑巧匹配到 --mirror」升级为「该分支的选项清单必须逐个覆盖下面这份名单」。
+   * 旧写法把 `--mirror` 锚在末尾，一旦在它后面追加选项（本次加了 --ca/--eab-kid/--eab-hmac-key），
+   * 断言会失败在"格式变了"上而不是"真的漏了校验"上 —— 这种假红会诱使人去改断言而不是看代码。
+   * 新写法只关心集合是否被覆盖：新增取值型选项却没并进这个分支，立刻变红。
+   */
+  const VALUE_OPTS = ['--domain', '--port', '--https-port', '--http-port', '--dir', '--data-dir',
+    '--mode', '--tls', '--email', '--path', '--repo', '--node-version', '--mirror',
+    '--ca', '--eab-kid', '--eab-hmac-key'];
+  const branch = /^\s*(--[a-z0-9-]+(?:\|--[a-z0-9-]+)+)\)\s*$/m.exec(codeOnly(src));
+  assert(branch, 'parse_args 里应有一个「多个取值型选项合并」的 case 分支（形如 `--a|--b) ）');
+  const covered = new Set(branch[1].split('|'));
+  const notCovered = VALUE_OPTS.filter((o) => !covered.has(o));
+  assert.strictEqual(notCovered.length, 0,
+    `这些取值型选项没有并进统一校验分支：${notCovered.join(', ')}\n`
+    + '  它们只给选项不给值时不会命中「缺少取值」校验，而是 shift 越界 → 「脚本在第 N 行意外失败」');
 
   const r = await spawnBash(['--domain']);
   if (r.unavailable) return;
@@ -758,4 +773,408 @@ printf '%s\\n' "\${HINTS[@]}"
   if (okLog.unavailable) return;
   assert(!/cannot install both/.test(okLog.out + okLog.err),
     '「is already installed」是安装成功的正常输出，不得据此误报冲突（会把人引去卸掉刚装好的包）');
+});
+
+/**
+ * ---- ACME 多 CA（Let's Encrypt / ZeroSSL / LiteSSL）----
+ *
+ * 背景：用户实测在**国内服务器**上 certbot 签 Let's Encrypt 报错，宝塔面板签 LE 也失败，
+ * 但宝塔签 LiteSSL（亚数 TrustAsia）成功 —— 根因是 LE 的 API 在境外，服务器连不上。
+ * 于是脚本支持多 CA。三条最容易「改坏却没人发现」的契约：
+ *
+ *  1. **换 CA 不等于换 --server**：实测 LiteSSL 与 ZeroSSL 的 directory 元数据里都是
+ *     `externalAccountRequired: true`，必须带 EAB（KID + HMAC KEY）。少了这个判断，
+ *     用户会看到「注册失败」，然后去怀疑网络、DNS、80 端口 —— 全错。
+ *  2. **EAB 是密钥**：不得回显到提示里、不得写进部署状态文件。
+ *  3. **账户目录推导**：acme.sh 的账户目录是 ca/&lt;host&gt;/&lt;path&gt;/，账户密钥在**最里层**。
+ *     只用通配符匹配 ca/ 下面一层目录，只会命中外层父目录，永远判成「没注册过」，
+ *     于是每次重跑都强索 EAB —— 而 acme.sh 早把 EAB 存在 ca.conf 里了。
+ * ------------------------------------------------------------------ */
+
+test('deploy.sh：CA 注册表、EAB 必要性与 acme.sh 账户目录推导（真实 source 跑一遍）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+ACME_HOME="$T"
+printf 'ROOT=%s\\n' "$T"
+printf 'SRV_LE=%s\\n' "$(ca_server letsencrypt)"
+printf 'SRV_ZS=%s\\n' "$(ca_server zerossl)"
+printf 'SRV_LS=%s\\n' "$(ca_server litessl)"
+printf 'SRV_BAD=[%s]\\n' "$(ca_server netease)"
+ca_needs_eab litessl && printf 'NEED_LS=1\\n' || printf 'NEED_LS=0\\n'
+ca_needs_eab zerossl && printf 'NEED_ZS=1\\n' || printf 'NEED_ZS=0\\n'
+ca_needs_eab letsencrypt && printf 'NEED_LE=1\\n' || printf 'NEED_LE=0\\n'
+printf 'DIR_LE=%s\\n' "$(acme_ca_dir letsencrypt)"
+printf 'DIR_ZS=%s\\n' "$(acme_ca_dir zerossl)"
+printf 'DIR_LS=%s\\n' "$(acme_ca_dir litessl)"
+printf 'BIN=%s\\n' "$(acme_bin)"
+acme_account_exists litessl && printf 'ACC_EMPTY=1\\n' || printf 'ACC_EMPTY=0\\n'
+mkdir -p "$T/ca/acme.litessl.com/acme/v2/directory"
+printf 'dummy-account-key' > "$T/ca/acme.litessl.com/acme/v2/directory/account.key"
+acme_account_exists litessl && printf 'ACC_LS=1\\n' || printf 'ACC_LS=0\\n'
+acme_account_exists zerossl && printf 'ACC_ZS=1\\n' || printf 'ACC_ZS=0\\n'
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  const val = (k) => (new RegExp('^' + k + '=(.*)$', 'm').exec(all) || [])[1];
+
+  assert.strictEqual(val('SRV_LE'), 'https://acme-v02.api.letsencrypt.org/directory');
+  assert.strictEqual(val('SRV_ZS'), 'https://acme.zerossl.com/v2/DV90');
+  assert.strictEqual(val('SRV_LS'), 'https://acme.litessl.com/acme/v2/directory',
+    'LiteSSL 的 ACME 接口是 acme.litessl.com/acme/v2/directory（不是 /v2/DV90 那种路径）');
+  assert.strictEqual(val('SRV_BAD'), '[]',
+    '未知 CA 必须返回空串（调用方据此报错），不得静默回落成某个默认 CA');
+
+  assert.strictEqual(val('NEED_LS'), '1',
+    'LiteSSL 必须提供 EAB：它的 directory 元数据里 externalAccountRequired=true');
+  assert.strictEqual(val('NEED_ZS'), '0', 'ZeroSSL 不该强制要 EAB：acme.sh 能用注册邮箱自动换取');
+  assert.strictEqual(val('NEED_LE'), '0', "Let's Encrypt 免 EAB，不该被卡住");
+
+  const root = val('ROOT');
+  assert.strictEqual(val('DIR_LE'), `${root}/ca/acme-v02.api.letsencrypt.org/directory`,
+    '账户目录必须与 acme.sh 的 CA_DIR（ca/<host>/<path>）逐段一致，否则判不出「已注册」');
+  assert.strictEqual(val('DIR_ZS'), `${root}/ca/acme.zerossl.com/v2/DV90`,
+    'ZeroSSL 的两个路径段（v2、DV90）都要保留，少一段就落到别的目录去');
+  assert.strictEqual(val('DIR_LS'), `${root}/ca/acme.litessl.com/acme/v2/directory`,
+    'LiteSSL 的三个路径段（acme、v2、directory）都要保留');
+
+  assert.strictEqual(val('BIN'), `${root}/acme.sh`,
+    'acme.sh 可执行文件路径必须跟着 ACME_HOME 现算：加载期缓存成常量会读到覆盖前的旧值');
+  assert.strictEqual(val('ACC_EMPTY'), '0', '没建过账户时必须如实报「没有」');
+  assert.strictEqual(val('ACC_LS'), '1',
+    '账户密钥在 ca/<host>/<path>/ 最里层；glob 到外层目录会永远判成「没注册过」，导致重跑反复索要 EAB');
+  assert.strictEqual(val('ACC_ZS'), '0',
+    '不能把别的 CA 的账户算到这家头上（否则会跳过注册、到签发时才发现没有 EAB）');
+});
+
+test('deploy.sh：EAB HMAC 密钥不得回显、不得落盘（它相当于签发密码）', async () => {
+  const src = readDeploy();
+
+  // 1) 落盘闸门：状态文件里只能有 CA 与 EAB KID；HMAC 由 acme.sh 自己存进 ca.conf
+  assert(!/EAB_HMAC_KEY/.test(codeOnly(fnBody(src, 'save_state'))),
+    'save_state 不得把 EAB_HMAC_KEY 写进部署状态文件（明文密钥落盘，而且没必要）');
+  assert(!/EAB_HMAC_KEY/.test(codeOnly(fnBody(src, 'load_state'))),
+    'load_state 也不得回读 HMAC 密钥，否则等于给它开了条落盘通道');
+  assert(/EAB_KID/.test(codeOnly(fnBody(src, 'save_state')))
+    && /EAB_KID/.test(codeOnly(fnBody(src, 'load_state'))),
+    'EAB KID 是公开标识，应当持久化（重跑时少敲一个参数）');
+
+  // 2) 回显闸门：run 打印失败命令、rerun_cmd 打印「原样重跑」都可能带上 HMAC
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+ORIG_ARGS='--domain a.example.com --ca litessl --eab-kid KID1 --eab-hmac-key SUPER-SECRET-HMAC'
+printf 'RERUN=%s\\n' "$(rerun_cmd)"
+printf 'RED1=[%s]\\n' "$(redact_args '--eab-kid K --eab-hmac-key SEC --domain a')"
+printf 'RED2=[%s]\\n' "$(redact_args '--eab-hmac-key=SEC2 --domain b')"
+printf 'RED3=[%s]\\n' "$(redact_args '--eab-hmac-key')"
+printf 'RED4=[%s]\\n' "$(redact_args '')"
+`);
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert(!all.includes('SUPER-SECRET-HMAC'),
+    'rerun_cmd 会把原始命令行原样回显，必须先把 --eab-hmac-key 的值抹掉（HMAC 相当于签发密码）');
+  assert(/KID1/.test(all), 'KID 是公开标识，回显时保留反而有用（能确认脚本确实收到了）');
+  assert(/RED1=\[--eab-kid K --eab-hmac-key \*\*\* --domain a\]/.test(all),
+    `--eab-hmac-key 的值应被替换成 ***（空格分隔写法）：${all.slice(0, 300)}`);
+  assert(/RED2=\[--eab-hmac-key=\*\*\* --domain b\]/.test(all),
+    `--eab-hmac-key=VALUE 这种等号写法也要抹掉，否则漏一条通道：${all.slice(0, 300)}`);
+  assert(/RED3=\[--eab-hmac-key\]/.test(all), '只给参数名（无值）不得崩，也不该凭空补 ***');
+  assert(/RED4=\[\]/.test(all), '空命令行不得崩（未带参数重跑就是这条路径）');
+});
+
+test('deploy.sh：非 LE 的 CA 必须走 acme.sh，且真的带上 --server / EAB / --install-cert', () => {
+  const src = readDeploy();
+  const issue = codeOnly(fnBody(src, 'issue_cert'));
+  assert(/CA_PROVIDER"?\s*!=\s*"?letsencrypt/.test(issue),
+    '非 LE 必须与 LE 分支区分开：CentOS 8 的 certbot 是 1.22（Python 3.6），不支持 --eab-kid/--eab-hmac-key，用 certbot 接 EAB 类 CA 必然失败');
+  assert(/issue_acme_sh/.test(issue), '必须真有一条 acme.sh 通道');
+  assert(/issue_via_certbot/.test(issue), "LE 侧应优先用 certbot（续期交给包自带的 timer/cron）");
+
+  const acme = codeOnly(fnBody(src, 'issue_acme_sh'));
+  const flat = acme.replace(/\n/g, ' ');
+  assert(/--register-account[^\n]*--server/.test(acme.replace(/\n/g, ' ')),
+    '注册账户时必须显式 --server：acme.sh v3 的默认 CA 是 ZeroSSL，不指定就把用户送错 CA');
+  assert(/--home "\$ACME_HOME"/.test(acme),
+    'acme.sh 调用必须显式 --home（默认是当前用户 ~/.acme.sh；ACME_HOME 可被环境变量覆盖，不显式传会不一致）');
+  assert(/--eab-kid/.test(acme) && /--eab-hmac-key/.test(acme),
+    'EAB 只能由命令行传给 acme.sh（它没有对应的环境变量），少了这两个参数 LiteSSL 必然注册失败');
+  assert(/--eab-hmac-key "\$EAB_HMAC_KEY"/.test(acme),
+    'EAB 的值要以变量形式原样传，不得内联/转义（转义过的密钥会被 acme.sh 当成错误凭据）');
+  assert(/acme_account_exists/.test(acme),
+    '已注册过的账户应跳过注册：acme.sh 会把 EAB 存进 ca.conf，重跑不该再索要 EAB');
+  assert(/--issue[^\n]*--server "\$server"/.test(flat),
+    '签发时同样必须 --server：否则 acme.sh 会回到默认 CA（ZeroSSL）');
+  assert(/acme_install_cert/.test(acme),
+    '必须 --install-cert 把证书落到固定路径：否则续期只更新 acme.sh 私有目录，Nginx 一直用旧证书');
+
+  const inst = codeOnly(fnBody(src, 'acme_install_cert'));
+  assert(/--install-cert/.test(inst) && /--key-file/.test(inst)
+    && /--fullchain-file/.test(inst) && /--reloadcmd/.test(inst),
+    '--install-cert 要指定 key-file / fullchain-file / reloadcmd（续期后自动生效）');
+  assert(/chmod 0600/.test(inst), '私钥落盘后必须收紧到 0600');
+
+  // 反面：certbot 通道不得承载非 LE 的 CA
+  const cb = codeOnly(fnBody(src, 'issue_via_certbot'));
+  assert(!/--eab-kid|--eab-hmac-key|--server/.test(cb),
+    'certbot 通道不得出现 EAB / --server：那正是 1.22 不支持的用法，写在这里等于给了个跑不通的假通道');
+});
+
+test('deploy.sh：LiteSSL 缺 EAB 必须当场失败并给出人话+可敲命令（不得拖到签发才失败）', async () => {
+  const snippet = (ca, kid, hmac) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+DOMAIN="cos.example.com"
+ACME_HOME="$(mktemp -d)"
+TLS_MODE="auto"
+CA_PROVIDER="${ca}"
+EAB_KID="${kid}"
+EAB_HMAC_KEY="${hmac}"
+collect_config
+printf 'REACHED_END\\n'
+`;
+
+  // ① litessl 不给 EAB：必须当场死，且死得有用
+  const bad = await spawnBashSnippet(snippet('litessl', '', ''));
+  if (bad.unavailable) return;
+  const badAll = bad.out + bad.err;
+  assert.strictEqual(bad.code, 1,
+    '证书这一步失败是「回退自签名、不中断」的，用户很容易把它当成网络抖动；缺 EAB 是参数错，必须当场退出');
+  assert(/EAB/.test(badAll), `必须点出 EAB 这个词，否则用户搜不到方向：${badAll.slice(0, 400)}`);
+  assert(/litessl\.com/i.test(badAll), `必须给出取 EAB 的地址：${badAll.slice(0, 600)}`);
+  assert(/--eab-kid/.test(badAll) && /--eab-hmac-key/.test(badAll),
+    `必须给出可直接复制重跑的命令（凭据只能由用户去 CA 控制台取，脚本变不出来）：${badAll.slice(0, 800)}`);
+  assert(!/REACHED_END/.test(badAll), '必须在「部署参数确认」阶段就退出，不能继续往下装东西');
+
+  // ② 对照：给了 EAB 就必须放行（否则等于把所有 LiteSSL 用户挡在门外）
+  const withEab = await spawnBashSnippet(snippet('litessl', 'kid-123', 'hmac-abc'));
+  if (withEab.unavailable) return;
+  assert(/REACHED_END/.test(withEab.out),
+    `带上 --eab-kid/--eab-hmac-key 后必须通过参数校验：${(withEab.out + withEab.err).slice(0, 400)}`);
+
+  // ③ 对照：LE / ZeroSSL 本来就免 EAB，一个都不能被卡住
+  for (const ca of ['letsencrypt', 'zerossl']) {
+    const ok = await spawnBashSnippet(snippet(ca, '', ''));
+    if (ok.unavailable) return;
+    assert(/REACHED_END/.test(ok.out),
+      `${ca} 免 EAB/可自动换取 EAB，不该被 EAB 门禁拦下：${(ok.out + ok.err).slice(0, 400)}`);
+  }
+
+  // ④ 未知 CA 名必须报错，不得当成「不认识就按默认来」
+  const bogus = await spawnBashSnippet(snippet('netease', '', ''));
+  if (bogus.unavailable) return;
+  assert.strictEqual(bogus.code, 1, '未知 CA 必须报错退出');
+  assert(/证书颁发机构不合法/.test(bogus.out + bogus.err),
+    `未知 CA 的错误要说人话并列出可选值：${(bogus.out + bogus.err).slice(0, 300)}`);
+});
+
+test('deploy.sh：HSTS 必须按证书来源区分（自签名发 max-age=0，正式证书才发长期 HSTS）', async () => {
+  // 背景：正式证书签发失败回退自签名时，TLS 配置仍声明 max-age=31536000 的 HSTS。
+  // 浏览器一旦记录该域名的 HSTS，再遇到自签名证书的错误就**没有「继续访问」入口**
+  // （Chrome：「您目前无法访问 … 因为此网站使用了 HSTS」）—— 回退方案变成了整站不可达，
+  // 比不回退还糟。正确行为：自签名下发 max-age=0（主动清除旧记录），正式证书才发长期 HSTS。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+DOMAIN=cos.example.com
+APP_PORT=3000
+SUB_PATH=/
+NGINX_LINK=""
+SELF_SIGNED_DIR="$T/ssl"
+ACME_CERT_DIR="$T/ssl/acme"
+mkdir -p "$T/ssl" "$T/ssl/acme"
+: > "$T/ssl/privkey.pem"; : > "$T/ssl/fullchain.pem"
+: > "$T/ssl/acme/privkey.pem"; : > "$T/ssl/acme/fullchain.pem"
+NGINX_CONF="$T/self.conf"
+write_nginx_conf 1 "$T/ssl/fullchain.pem" "$T/ssl/privkey.pem"
+NGINX_CONF="$T/acme.conf"
+write_nginx_conf 1 "$T/ssl/acme/fullchain.pem" "$T/ssl/acme/privkey.pem"
+printf 'SELF_LONG=%s\\n' "$(grep -c 'max-age=31536000' "$T/self.conf" || true)"
+printf 'SELF_ZERO=%s\\n' "$(grep -c 'max-age=0' "$T/self.conf" || true)"
+printf 'ACME_LONG=%s\\n' "$(grep -c 'max-age=31536000' "$T/acme.conf" || true)"
+printf 'ACME_ZERO=%s\\n' "$(grep -c 'max-age=0' "$T/acme.conf" || true)"
+`);
+  if (r.unavailable) return;
+  const val = (k) => (new RegExp('^' + k + '=(\\d+)$', 'm').exec(r.out) || [])[1];
+  assert.strictEqual(val('SELF_LONG'), '0',
+    '自签名证书绝不能声明长期 HSTS：浏览器记录后，自签名的证书错误没有「继续访问」入口，整站无法访问');
+  assert.notStrictEqual(val('SELF_ZERO'), '0',
+    '自签名要主动下发 max-age=0，清除浏览器里可能已记录的旧 HSTS（否则老访客仍被锁死）');
+  assert.notStrictEqual(val('ACME_LONG'), '0', '正式证书要保留长期 HSTS（防协议降级的本来目的）');
+  assert.strictEqual(val('ACME_ZERO'), '0', '正式证书不得下发 max-age=0（会把有效防护清掉）');
+});
+
+test('deploy.sh：CA 速率限制（rateLimited/429）必须命中专属分支，且排在「连不上」之前', async () => {
+  // 背景：用户实测 LE 返回 rateLimited，日志是：
+  //   Error creating new order. Le_OrderFinalize not found.
+  //   "type": "urn:ietf:params:acme:error:rateLimited", "status": 429
+  //   detail: "too many certificates (50) already issued for \"l.cd\" ..."
+  // 同时脚本打出「已存在 LE 的 ACME 账户，跳过注册」——用户误以为「账户坏了」，其实账户有效，
+  // 是 CA 按「注册域名」限流。两个必须钉住的契约：
+  //   1. rateLimited（驼峰、无空格）与 429/Le_OrderFinalize/too many 必须命中限流分支，不能漏判；
+  //   2. 限流分支必须排在「连接失败」分支之前 —— 429 是 CA 明确返回的 HTTP 状态，说明网络是通的。
+  const src = codeOnly(readDeploy());
+
+  // 静态：判据（grep -qiE 那行）要覆盖 acme.sh 实际的报错措辞（驼峰 rateLimited → ratelimited、
+  // Le_OrderFinalize、429）。必须锚定**判据行本身**（而非整个函数体）：提示文案里也会写
+  // 「rateLimited / 429」这几个字，锚定函数体会让退回旧判据的变异仍被文案「救命」→ 抓不住。
+  const hintsBody = codeOnly(fnBody(src, 'acme_failure_hints'));
+  const rateGrepLine = hintsBody.split('\n').find((l) => /grep -qiE/.test(l) && /ratelimited|429/i.test(l));
+  assert(rateGrepLine, '限流判据（grep 那行）必须含 ratelimited / Le_OrderFinalize / 429 —— acme.sh 被限流时输出的是这些驼峰词，旧判据「rate limit|too many」抓不到');
+  assert(/ratelimited|Le_OrderFinalize|429/i.test(rateGrepLine),
+    '判据行必须覆盖 429 与 ratelimited：429 恰恰证明网络可达，漏掉会误报成「连不上」');
+  assert(/retry after|retry-after/i.test(hintsBody),
+    '提示里要出现 retry-after，让人知道参数与等待时间在哪看');
+
+  // 静态：限流分支必须排在「连接失败」分支之前（429 是明确响应，网络是通的）
+  const rateIdx = hintsBody.indexOf(rateGrepLine);
+  const connIdx = hintsBody.search(/cannot connect|failed to connect|timed out/i);
+  assert(rateIdx >= 0 && connIdx >= 0 && rateIdx < connIdx,
+    '限流分支必须排在「连接失败」之前：否则 429 的日志会被更宽泛的连接判据先吞掉，报成「连不上 CA」误导用户');
+
+  // 行为验证：真实 source，用 stub 的日志喂给 acme_failure_hints
+  const snippet = (fakeLog) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+CA_PROVIDER=letsencrypt
+DOMAIN=bucketmg.l.cd
+FAKE_LOG='${fakeLog}'
+log_since_mark() { printf '%s' "$FAKE_LOG"; }
+log_key_lines()  { sed -n '1,4p' <<<"$FAKE_LOG"; }
+acme_failure_hints
+printf '--HINTS--\\n'
+printf '%s\\n' "\${HINTS[@]}"
+`;
+  const rateLog = `Using CA: https://acme-v02.api.letsencrypt.org/directory
+Error creating new order. Le_OrderFinalize not found.
+"type": "urn:ietf:params:acme:error:rateLimited",
+"status": 429`;
+  const r = await spawnBashSnippet(snippet(rateLog));
+  if (r.unavailable) return;
+  const all = r.out + r.err;
+  assert(/速率限制|rateLimited|429/.test(all),
+    `限流日志必须命中限流分支并点出「速率限制」，而不是笼统回退：${all.slice(0, 500)}`);
+  assert(!/连不上 ACME/.test(all),
+    `429 是 CA 明确返回的响应，绝不能报成「连不上 ACME 服务器」：${all.slice(0, 500)}`);
+  assert(/l\.cd|注册域名|公共后缀/.test(all),
+    `要说明限流按「注册域名/公共后缀」计，避免用户误以为「已存在的账户坏了」：${all.slice(0, 700)}`);
+});
+
+test('deploy.sh：acme.sh 的安装必须「先落盘校验再安装」，且带国内镜像兜底', () => {
+  // 背景：官方安装器（get.acme.sh）实际从 raw.githubusercontent.com 取文件（读其源码确认），
+  // 国内服务器连不上 GitHub → acme.sh 装不上 → 所有需要 EAB 的 CA 全军覆没
+  // （certbot 又不支持 EAB 参数）→ 必然回退自签名。另外原来的 `curl … | sh`
+  // 违反 D1-06 钉下的纪律（管道吞掉下载失败，$? 取右侧 sh 的 0）。
+  const body = codeOnly(fnBody(readDeploy(), 'install_acme_sh'));
+  assert(!/\|\s*(ba)?sh\b/.test(body),
+    '不得用 curl … | sh 安装：管道会把左侧下载失败吞掉（$? 取的是右侧 sh 的 0），404/错误页也可能被当成脚本执行（D1-06 同型）');
+  assert(/gitee\.com\/neilpang\/acme\.sh\/raw\/master\/acme\.sh/.test(body),
+    '官方源（raw.githubusercontent.com）失败时必须兜底 gitee 镜像（acme.sh 官方 wiki《Install in China》给的地址）—— 否则国内服务器永远装不上 acme.sh');
+  assert(/head -c 2/.test(body),
+    '落盘后必须查首行 shebang（拦「镜像返回了错误页」）：curl -f 拦不住所有非脚本内容');
+  assert(/bash -n/.test(body), '必须 bash -n 拦「是脚本但被截断」—— 与 reinstall_now 的双检同一条纪律');
+  assert(/--cron --home/.test(body),
+    '不跑官方 --install（它会写 root 的 crontab），续期任务自己落 /etc/cron.d，必须带 --cron --home');
+});
+
+test('deploy.sh：默认 CA 必须是 zerossl，且旧状态残留 letsencrypt 时要主动提醒换 CA', async () => {
+  // 背景：用户在公共后缀域名（*.l.cd）上反复用 LE 被 rateLimited 拒签，明确要求「不要再使用 LE」。
+  // 但之前跑 LE 时状态文件已持久化 CA_PROVIDER=letsencrypt，即使把默认值改成 zerossl，
+  // 重跑仍会因 load_state 回读而继续走 LE。所以既要改默认值，也要在「没显式选 CA 却仍用 LE」时提醒。
+  const src = readDeploy();
+
+  // 静态：默认值必须是 zerossl（不再是 letsencrypt）
+  assert(/CA_PROVIDER="zerossl"/.test(src),
+    '默认 CA 必须是 zerossl：LE 按公共后缀共享 7 天配额、极易 rateLimited，不适合当默认');
+
+  // 静态：要有「显式指定」标记，用于区分「用户就要 LE」与「状态残留 LE」
+  const parseBody = codeOnly(fnBody(src, 'parse_args'));
+  assert(/CA_EXPLICIT=1/.test(parseBody),
+    '--ca / --tls 显式指定 CA 时必须置 CA_EXPLICIT=1，否则无法区分「用户就要 LE」与「状态文件残留 LE」');
+
+  // 行为验证：真实 source，模拟「没显式传 --ca + 状态残留 letsencrypt」→ 必须打印换 CA 提醒
+  const snippet = (caProvider, caExplicit) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+DOMAIN=bucketmg.l.cd
+TLS_MODE=auto
+CA_PROVIDER=${caProvider}
+CA_EXPLICIT=${caExplicit}
+out="$(collect_config 2>&1)"
+printf '%s\\n' "$out"
+`;
+  // ① 残留 LE + 未显式指定 → 必须提醒换 CA
+  const r1 = await spawnBashSnippet(snippet('letsencrypt', 0));
+  if (r1.unavailable) return;
+  const a1 = r1.out + r1.err;
+  assert(/rateLimited|速率限制|配额|限流/.test(a1),
+    `旧状态残留 LE 且未显式指定时，必须提醒 LE 容易 rateLimited：${a1.slice(0, 500)}`);
+  assert(/--ca zerossl/.test(a1),
+    `提醒里必须给出可直接换 CA 的命令（--ca zerossl 零手工）：${a1.slice(0, 600)}`);
+  assert(/--ca letsencrypt/.test(a1),
+    `必须给出「确要 LE 就显式 --ca letsencrypt」的出口，避免用户以为只能用 LE：${a1.slice(0, 600)}`);
+
+  // ② 显式指定 LE（CA_EXPLICIT=1）→ 不打扰
+  const r2 = await spawnBashSnippet(snippet('letsencrypt', 1));
+  if (r2.unavailable) return;
+  assert(!/rateLimited|建议改用/.test(r2.out + r2.err),
+    '用户显式拍板 --ca letsencrypt 时不得再打印换 CA 提醒（那是他自己的选择）');
+
+  // ③ zerossl（新默认）→ 不提醒
+  const r3 = await spawnBashSnippet(snippet('zerossl', 0));
+  if (r3.unavailable) return;
+  assert(!/rateLimited|建议改用/.test(r3.out + r3.err),
+    'zerossl 本身就是默认推荐，不该触发换 CA 提醒');
+});
+
+test('deploy.sh：acme 证书落盘后不得因 reload 失败而误判「安装失败」回退自签名', async () => {
+  // 背景：宝塔/自编译的 nginx 不是 systemd native service，`systemctl reload nginx` 报
+  // "is not active, cannot reload"。acme.sh 的 --install-cert 会先把 key/fullchain 写进指定
+  // 路径、之后才跑 --reloadcmd；reload 失败时 acme.sh 返回非零并打 "Reload error"，但证书
+  // 其实已经装好了。之前 acme_install_cert 拿 run 的返回码直接判「安装失败」→ 回退自签名。
+  const src = readDeploy();
+
+  // 1) nginx_reload_cmd 必须优先 `nginx -s reload` 并依次兜底，不能按 INIT_SYSTEM 二分走 systemctl
+  const rcBody = codeOnly(fnBody(src, 'nginx_reload_cmd'));
+  assert(/nginx -s reload/.test(rcBody),
+    'reload 命令必须优先 nginx -s reload：脚本已把宝塔/自编译的 nginx 二进制加进 PATH，systemctl reload 对非 native service 会报 is not active');
+  assert(/systemctl reload nginx/.test(rcBody),
+    '要保留 systemctl reload nginx 作为兜底（systemd native 场景）');
+
+  // 2) acme_install_cert 成功判据是「证书是否落盘」，而非 run 的返回码
+  const inst = codeOnly(fnBody(src, 'acme_install_cert'));
+  assert(!/if ! run .*; then return 1; fi\s*\n\s*chmod/.test(inst) &&
+         !/if ! run "\$\(acme_bin\)" "\$\{args\[@\]\}" <\/dev\/null; then return 1; fi/.test(inst),
+    '不得再把 --install-cert 的 run 返回码直接当「安装失败」：reload 失败时 acme.sh 返回非零，但证书已落盘，会误回退自签名');
+  assert(/! -s "\$\{dir\}\/privkey\.pem"/.test(inst) || /! -s "\$\{dir\}\/fullchain\.pem"/.test(inst),
+    '成功判据必须是「privkey.pem / fullchain.pem 是否非空落盘」');
+
+  // 3) 行为验证：模拟 acme.sh --install-cert 返回非零但证书已写盘 → 必须判成功
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+ACME_HOME="$(mktemp -d)"
+DOMAIN=cos.example.com
+dir="$(mktemp -d)"
+printf 'KEY' > "$dir/privkey.pem"; printf 'CHAIN' > "$dir/fullchain.pem"
+# 让 acme.sh 那步「失败」（返回非零），但证书文件已存在且非空
+acme_bin() { printf 'false'; }
+acme_install_cert "$dir"
+printf 'RC=%s\\n' "$?"
+`);
+  if (r.unavailable) return;
+  assert(/RC=0/.test(r.out),
+    `证书已落盘时，即使 acme.sh 的 --install-cert（reloadcmd）失败也不该判「安装失败」：${(r.out + r.err).slice(0, 400)}`);
 });

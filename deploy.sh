@@ -17,7 +17,8 @@
 #   3) 安装运行时（Node.js ≥ 18）与依赖（npm 生产依赖）
 #   4) 安装并配置 Nginx 反向代理
 #   5) 生成 .env 环境变量文件并注册进程守护
-#   6) HTTPS：Let's Encrypt 自动签发（失败自动回退自签名证书）
+#   6) HTTPS：自动向 ACME 证书颁发机构（CA）签发（默认 Let's Encrypt，可换 ZeroSSL / LiteSSL；
+#      失败自动回退自签名证书）
 #   7) 注册全局 kepler 管理命令、保存部署状态并执行健康检查
 #
 # 设计约束：
@@ -41,13 +42,16 @@
 #   --dir <路径>            安装目录（默认 /opt/kepler）
 #   --data-dir <路径>       数据目录（默认 <安装目录>/data；含密钥，务必备份）
 #   --mode <systemd|docker> 进程守护方式（默认 systemd）
-#   --tls <auto|letsencrypt|selfsigned|none>  证书方式（默认 auto）
-#   --email <邮箱>          Let's Encrypt 通知邮箱（默认 admin@<域名>）
+#   --tls <auto|acme|selfsigned|none>  证书方式（默认 auto；acme 处也可直接写 CA 名，如 --tls litessl）
+#   --ca <zerossl|letsencrypt|litessl> ACME 证书颁发机构（默认 zerossl，可自动换取 EAB）
+#   --eab-kid <KID>         该 CA 的 EAB Key ID（litessl 必需；zerossl 可省略）
+#   --eab-hmac-key <密钥>   该 CA 的 EAB HMAC 密钥（litessl 必需；不写入部署状态文件）
+#   --email <邮箱>          ACME 账户注册 / 通知邮箱（默认 admin@<域名>）
 #   --path <路径>           服务路径前缀（默认 /，推荐根路径；子路径为尽力而为模式）
 #   --repo <git-url>        脚本独立运行时用于拉取源码的仓库地址
 #   --node-version <版本>   指定 Node.js 版本（默认解析最新的 20.x LTS）
 #   --mirror <auto|cn|official> 下载镜像：cn 走 npmmirror 加速；auto 先走官方源，失败自动改走国内
-#   --staging               使用 Let's Encrypt 测试环境（避免正式证书频次限制）
+#   --staging               使用 Let's Encrypt 测试环境（仅在 CA 为 letsencrypt 时生效）
 #   --skip-node             跳过 Node.js 安装（只校验版本；适合用 nvm/自建运行时的人）
 #   --skip-deps             跳过 npm 依赖安装
 #   --skip-nginx            跳过 Nginx 安装与反代配置（自行用 Caddy/Nginx 反代）
@@ -66,6 +70,7 @@
 # 环境变量（与命令行参数等价，参数优先级更高）：
 #   DOMAIN APP_PORT HTTPS_PORT HTTP_PORT INSTALL_DIR DATA_DIR MODE TLS_MODE
 #   EMAIL SUB_PATH REPO_URL NODE_VERSION MIRROR STAGING ASSUME_YES VERBOSE
+#   CA_PROVIDER EAB_KID EAB_HMAC_KEY
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -83,6 +88,9 @@ readonly STATE_DIR="/etc/${SERVICE_NAME}"
 readonly STATE_FILE="${STATE_DIR}/deploy.conf"
 readonly GLOBAL_COMMAND="/usr/local/bin/${SERVICE_NAME}"
 readonly DEFAULT_REPO_URL="https://github.com/xingsenfirst/Kepler.git"
+# WebDAV 独立 HTTPS 端口：应用侧同名环境变量，这里作为唯一事实来源，
+# .env 与 Nginx 上游都用它 —— 两边写死两份 8443 迟早会漂移成「界面有地址、反代不通」。
+WEBDAV_PORT="${WEBDAV_PORT:-8443}"
 
 STEP_NO=0
 VERBOSE="${VERBOSE:-0}"
@@ -120,6 +128,23 @@ err()  { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()  { err "$*"; err "部署中断。详细日志：${LOG_FILE}"; exit 1; }
 step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%s/%s]%s %s%s%s\n' "$C_BLUE" "$STEP_NO" "$TOTAL_STEPS" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
 
+# 抹掉命令行里的敏感值，避免在回显/提示/日志里泄出。
+# 目前只有 EAB 的 HMAC 密钥（--eab-hmac-key）属于机密：KID 是公开标识，不用抹。
+redact_args() {
+  local -a parts=()
+  local tok skip=0 out=""
+  read -r -a parts <<<"${1:-}" || true
+  for tok in "${parts[@]}"; do
+    if ((skip == 1)); then skip=0; out+=" ***"; continue; fi
+    case "$tok" in
+      --eab-hmac-key) out+=" --eab-hmac-key"; skip=1 ;;
+      --eab-hmac-key=*) out+=" --eab-hmac-key=***" ;;
+      *) out+=" $tok" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
 # 执行子命令：正常输出写日志，失败时回显尾部日志并返回真实退出码
 run() {
   local rc=0
@@ -130,7 +155,8 @@ run() {
     "$@" >>"$LOG_FILE" 2>&1 || rc=$?
   fi
   if ((rc != 0)); then
-    err "命令执行失败（退出码 ${rc}）：$*"
+    # 回显命令行时必须过一遍脱敏：acme.sh 的 EAB HMAC 密钥是从命令行传进去的
+    err "命令执行失败（退出码 ${rc}）：$(redact_args "$*")"
     err "—— 本次操作的日志（完整日志：${LOG_FILE}）——"
     log_since_mark | tail -n 30 >&2 || true
   fi
@@ -248,10 +274,11 @@ confirm_continue() {
 
 # 重跑命令（保留用户原本传的全部参数，再追加跳过的开关）
 rerun_cmd() {
-  local extra="$*" self="$SCRIPT_NAME"
+  local extra="$*" self="$SCRIPT_NAME" orig
   [[ -f "${0:-}" ]] && self="$0"      # 脚本在本地就给出可复制的真实路径
-  if [[ -n "$ORIG_ARGS" ]]; then
-    printf 'bash %s %s%s' "$self" "$ORIG_ARGS" "${extra:+ $extra}"
+  orig="$(redact_args "$ORIG_ARGS")"  # 原样重跑，但不把 EAB 密钥回显出来
+  if [[ -n "$orig" ]]; then
+    printf 'bash %s %s%s' "$self" "$orig" "${extra:+ $extra}"
   else
     printf 'bash %s --domain %s%s' "$self" "${DOMAIN:-<域名>}" "${extra:+ $extra}"
   fi
@@ -314,6 +341,10 @@ ENV_REPO_URL="${REPO_URL-}"
 ENV_NODE_VERSION="${NODE_VERSION-}"
 ENV_MIRROR="${MIRROR-}"
 ENV_STAGING="${STAGING-}"
+ENV_CA_PROVIDER="${CA_PROVIDER-}"
+ENV_EAB_KID="${EAB_KID-}"
+ENV_EAB_HMAC_KEY="${EAB_HMAC_KEY-}"
+ENV_ACME_HOME="${ACME_HOME-}"
 
 DOMAIN=""
 APP_PORT="3000"
@@ -329,6 +360,19 @@ REPO_URL="$DEFAULT_REPO_URL"
 NODE_VERSION=""
 MIRROR="auto"
 STAGING="0"
+# ACME 证书颁发机构（见 §8.0 CA 注册表）。默认 ZeroSSL —— 它走 HTTP-01、支持面广，
+# 且 acme.sh 能用 --email **自动换取 EAB**（零手工）；Let's Encrypt 虽免 EAB，但其
+# 「注册域名/公共后缀」7 天配额是所有人共享的，公共后缀（如 l.cd / github.io 等）下
+# 极易被限流（rateLimited/429），反复签不下来。国内服务器或公共后缀域名请自觉用
+# zerossl / litessl。
+CA_PROVIDER="zerossl"
+# EAB（外部账户绑定）凭据：zerossl 通常由 acme.sh 用邮箱自动换取，litessl 必须手工提供。
+# EAB_HMAC_KEY 是密钥，**只进内存与 acme.sh 自己的账户目录，绝不写进状态文件**。
+EAB_KID=""
+EAB_HMAC_KEY=""
+# acme.sh 的家目录。可用 ACME_HOME 覆盖（测试里把脚本指到临时目录，避免读到真实账户）——
+# 因此 acme.sh 可执行文件路径一律现算 "${ACME_HOME}/acme.sh"，不要在加载期缓存成常量。
+ACME_HOME="/root/.acme.sh"
 UNINSTALL=0
 SRC_DIR=""          # 源码来源目录（自动探测）
 SRC_TMP_DIR=""      # 若源码来自临时克隆，复制完成后清理
@@ -336,6 +380,10 @@ APP_VERSION="1.0.0"
 NODE_BIN=""
 CERT_FULLCHAIN=""
 CERT_KEY=""
+# 是否在本轮由用户显式指定了 CA（命令行 --ca/--tls 或环境变量 ENV_CA_PROVIDER）。
+# 用于区分「用户就是要用 LE」与「状态文件里残留了上一轮的 letsencrypt」两种情况，
+# 后者要主动提醒换 CA（LE 在公共后缀域名上容易被 rateLimited 限流）。
+CA_EXPLICIT=0
 
 usage() {
   local source="${BASH_SOURCE[0]:-$0}"
@@ -378,6 +426,11 @@ function load_state() {
       NGINX_LINK) NGINX_LINK="$value" ;;
       CERT_FULLCHAIN) CERT_FULLCHAIN="$value" ;;
       CERT_KEY) CERT_KEY="$value" ;;
+      # 注意：只回读 CA 与 EAB KID。**EAB_HMAC_KEY 刻意不落盘** —— 它是密钥，
+      # acme.sh 自己会在 ~/.acme.sh/ca/<CA 主机>/ 里保存账户，重装时直接复用，
+      # 不需要（也不应该）让部署状态再做一份密钥副本。
+      CA_PROVIDER) CA_PROVIDER="$value" ;;
+      EAB_KID) EAB_KID="$value" ;;
     esac
   done < "$STATE_FILE"
   STATE_LOADED=1
@@ -402,12 +455,16 @@ function apply_env_overrides() {
   if [[ -n "$ENV_NODE_VERSION" ]]; then NODE_VERSION="$ENV_NODE_VERSION"; fi
   if [[ -n "$ENV_MIRROR" ]]; then MIRROR="$ENV_MIRROR"; fi
   if [[ -n "$ENV_STAGING" ]]; then STAGING="$ENV_STAGING"; fi
+  if [[ -n "$ENV_CA_PROVIDER" ]]; then CA_PROVIDER="$ENV_CA_PROVIDER"; CA_EXPLICIT=1; fi
+  if [[ -n "$ENV_EAB_KID" ]]; then EAB_KID="$ENV_EAB_KID"; fi
+  if [[ -n "$ENV_EAB_HMAC_KEY" ]]; then EAB_HMAC_KEY="$ENV_EAB_HMAC_KEY"; fi
+  if [[ -n "$ENV_ACME_HOME" ]]; then ACME_HOME="$ENV_ACME_HOME"; fi
   return 0
 }
 
 function save_state() {
   local value
-  for value in "$DOMAIN" "$APP_PORT" "$HTTPS_PORT" "$HTTP_PORT" "$INSTALL_DIR" "$DATA_DIR" "$MODE" "$TLS_MODE" "$EMAIL" "$SUB_PATH" "$REPO_URL" "$NODE_VERSION" "$MIRROR" "$NODE_BIN" "$NGINX_CONF" "$NGINX_LINK" "$CERT_FULLCHAIN" "$CERT_KEY"; do
+  for value in "$DOMAIN" "$APP_PORT" "$HTTPS_PORT" "$HTTP_PORT" "$INSTALL_DIR" "$DATA_DIR" "$MODE" "$TLS_MODE" "$EMAIL" "$SUB_PATH" "$REPO_URL" "$NODE_VERSION" "$MIRROR" "$NODE_BIN" "$NGINX_CONF" "$NGINX_LINK" "$CERT_FULLCHAIN" "$CERT_KEY" "$CA_PROVIDER" "$EAB_KID"; do
     [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "部署配置包含非法换行，拒绝保存状态。"
   done
   local content="# Kepler 部署状态（由 ${SCRIPT_NAME} 管理，请勿手工写入密钥）
@@ -434,7 +491,9 @@ NODE_BIN=${NODE_BIN}
 NGINX_CONF=${NGINX_CONF}
 NGINX_LINK=${NGINX_LINK}
 CERT_FULLCHAIN=${CERT_FULLCHAIN}
-CERT_KEY=${CERT_KEY}"
+CERT_KEY=${CERT_KEY}
+CA_PROVIDER=${CA_PROVIDER}
+EAB_KID=${EAB_KID}"
   mkdir -p "$STATE_DIR"
   write_file "$STATE_FILE" "$content" 0600
   return 0
@@ -447,7 +506,7 @@ parse_args() {
       # 不能写成 `X="${2:-}"; shift 2`：只给选项不给值时 shift 越界返回 1，
       # 会被 set -e 的 ERR trap 当成「脚本在第 N 行意外失败」，用户看到的是崩溃
       # 而不是「你少给了一个值」。十几个选项同一个坑，所以合并成一个分支处理。
-      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror)
+      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror|--ca|--eab-kid|--eab-hmac-key)
         if [[ $# -lt 2 || -z "${2-}" ]]; then
           die "参数 $1 缺少取值（示例：bash ${SCRIPT_NAME} $1 <值>；完整用法见 --help）"
         fi
@@ -459,12 +518,17 @@ parse_args() {
           --dir)          INSTALL_DIR="$2" ;;
           --data-dir)     DATA_DIR="$2" ;;
           --mode)         MODE="$2" ;;
-          --tls)          TLS_MODE="$2" ;;
+          --tls)
+            # 便利写法：--tls 直接给 CA 名等价于 --tls acme --ca <CA 名>
+            if ca_is_valid "$2"; then CA_PROVIDER="$2"; TLS_MODE="acme"; CA_EXPLICIT=1; else TLS_MODE="$2"; fi ;;
           --email)        EMAIL="$2" ;;
           --path)         SUB_PATH="$2" ;;
           --repo)         REPO_URL="$2" ;;
           --node-version) NODE_VERSION="$2" ;;
           --mirror)       MIRROR="$2" ;;
+          --ca)           CA_PROVIDER="$2"; CA_EXPLICIT=1 ;;
+          --eab-kid)      EAB_KID="$2" ;;
+          --eab-hmac-key) EAB_HMAC_KEY="$2" ;;
         esac
         shift 2 ;;
       --staging)      STAGING=1; shift ;;
@@ -844,11 +908,13 @@ collect_config() {
   DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"
   DOMAIN="${DOMAIN%%/*}"
   # 把「域名:端口」整段粘进来是很常见的输入。带端口的取值会被 is_ip_addr 当成 IP
-  # 放行（它只看到冒号），后果是：静默降级成自签名证书 + server_name 里带着端口让
-  # nginx -t 失败（用户在 nginx 那步看到一堆看不懂的报错）。这里一次说清楚。
-  if [[ "$DOMAIN" =~ ^[^:]+:[0-9]+$ ]]; then
+  # 放行（它见到冒号就以为是 IPv6），后果是：静默降级成自签名证书 + server_name 里带着
+  # 端口让 nginx -t 失败（用户在 nginx 那步看到一堆看不懂的报错）。这里一次说清楚。
+  # 判据取「末尾 :数字」且排除真 IPv6（IPv6 字面量必含 ::），不会误伤 2001:db8::1。
+  if [[ "$DOMAIN" =~ :[0-9]+$ ]] && [[ "$DOMAIN" != *::* ]]; then
     die "域名里不要带端口：${DOMAIN}（端口请用 --https-port / --http-port 指定，例如：--domain ${DOMAIN%%:*} --https-port ${DOMAIN##*:}）"
   fi
+
   if ! is_valid_domain "$DOMAIN" && ! is_ip_addr "$DOMAIN"; then
     die "域名格式不合法：$DOMAIN"
   fi
@@ -869,12 +935,18 @@ collect_config() {
   if [[ "$APP_PORT" == "$HTTP_PORT" || "$APP_PORT" == "$HTTPS_PORT" ]]; then
     die "应用内部端口（${APP_PORT}）不能与 Nginx 对外端口（${HTTP_PORT}/${HTTPS_PORT}）相同。"
   fi
-  # 应用自身还会占用 3443（内置 HTTPS）与 8443（WebDAV），内部端口不要撞上
+  # 应用自身还会占用 3443（内置 HTTPS）与 ${WEBDAV_PORT}（WebDAV），端口不要撞上。
+  # 注意：WebDAV 端口只有一个事实来源（本脚本顶部的 WEBDAV_PORT），.env 与 Nginx 上游都用它，
+  # 所以这里的比较必须对着变量来，写死 8443 会在用户覆盖端口后失效。
   if [[ "$APP_PORT" == "3443" ]]; then
     die "应用内部端口不能是 3443（应用内置 HTTPS 端口）。"
   fi
-  if [[ "$HTTPS_PORT" == "8443" ]]; then
-    warn "对外 HTTPS 端口 8443 与应用内置 WebDAV 默认端口相同，开启 WebDAV 后会冲突（可用 WEBDAV_PORT 环境变量改端口）。"
+  if [[ "$APP_PORT" == "$WEBDAV_PORT" ]]; then
+    die "应用内部端口（${APP_PORT}）不能与 WebDAV 端口（${WEBDAV_PORT}）相同（可用 WEBDAV_PORT=<其它端口> 改）。"
+  fi
+  # 对外端口撞 WebDAV 端口：不开 WebDAV 时无碍，一旦开启则应用必然起不来，故只提醒不拦。
+  if [[ "$HTTP_PORT" == "$WEBDAV_PORT" || "$HTTPS_PORT" == "$WEBDAV_PORT" ]]; then
+    warn "对外端口 ${WEBDAV_PORT} 与应用内置 WebDAV 端口相同，开启 WebDAV 后会冲突（可用 WEBDAV_PORT=<其它端口> 环境变量改端口）。"
   fi
   [[ "$DATA_DIR" ]] || DATA_DIR="${INSTALL_DIR}/data"
   [[ "$EMAIL" ]] || EMAIL="admin@${DOMAIN}"
@@ -886,15 +958,44 @@ collect_config() {
     [[ -n "$SUB_PATH" ]] || SUB_PATH="/"
   fi
 
+  # 证书模式统一叫 acme（原来叫 letsencrypt）：CA 现在有多家，模式名不该等同于其中一家的名字。
+  # letsencrypt / le 作为历史写法继续接受，归一化到 acme。
   TLS_MODE="${TLS_MODE,,}"
   case "$TLS_MODE" in
-    auto|letsencrypt|le|selfsigned|self|none) : ;;
-    *) die "TLS 方式不合法：$TLS_MODE（可选 auto/letsencrypt/selfsigned/none）" ;;
+    auto|acme|letsencrypt|le|selfsigned|self|none) : ;;
+    *) die "TLS 方式不合法：$TLS_MODE（可选 auto/acme/selfsigned/none，或直接给 CA 名 $(ca_names)）" ;;
   esac
-  [[ "$TLS_MODE" == "le" ]] && TLS_MODE="letsencrypt"
+  if [[ "$TLS_MODE" == "le" || "$TLS_MODE" == "letsencrypt" ]]; then TLS_MODE="acme"; fi
   [[ "$TLS_MODE" == "self" ]] && TLS_MODE="selfsigned"
-  if is_ip_addr "$DOMAIN" && [[ "$TLS_MODE" == "letsencrypt" ]]; then
-    warn "IP 地址无法签发 Let's Encrypt 证书，已切换为自签名证书。"
+
+  # CA 取值与 EAB 约束：**越早失败越好**。证书这一步失败是「回退自签名、不中断」的，
+  # 用户很容易把它当成"网络抖动"，其实是参数少给了一对必填凭据 —— 那样他会白折腾好几轮。
+  if ! ca_is_valid "$CA_PROVIDER"; then
+    die "证书颁发机构不合法：${CA_PROVIDER}（可选 $(ca_names)）"
+  fi
+  # 默认已改为 zerossl；这里兜住「旧状态文件残留 letsencrypt / 用户没显式选 CA」的情况：
+  # LE 在公共后缀域名（l.cd、github.io 等）上极易被 rateLimited 限流，反复签不下来。
+  # 若用户本次没显式拍板用 LE，就提醒他换 CA —— 而不是无声地继续撞 LE 的配额墙。
+  if [[ "$CA_PROVIDER" == "letsencrypt" && "$CA_EXPLICIT" != "1" ]] \
+     && [[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]]; then
+    warn "当前仍使用 Let's Encrypt（沿用之前保存的部署状态）。LE 按「注册域名/公共后缀」7 天限发证书，"
+    warn "公共后缀下所有人共享配额，极易被 rateLimited 拒签导致反复回退自签名。"
+    warn "建议改用一个不易被限流、且 acme.sh 能自动换取 EAB 的 CA（零手工）："
+    warn "    $(rerun_cmd --ca zerossl)"
+    warn "  或 LiteSSL（亚数 TrustAsia，需手工取 EAB）："
+    warn "    $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)"
+    warn "  若确认就要用 Let's Encrypt，请显式带上 --ca letsencrypt 以跳过本提示。"
+  fi
+  # 只有「真的要签发」时才卡 EAB；已经注册过账户（acme.sh 会把 EAB 存进 ca.conf）就不用再给。
+  if [[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]] \
+     && ca_needs_eab "$CA_PROVIDER" && [[ -z "$EAB_KID" || -z "$EAB_HMAC_KEY" ]] \
+     && ! acme_account_exists "$CA_PROVIDER"; then
+    acme_eab_hints
+    die_with_hint "使用 $(ca_label "$CA_PROVIDER") 需要 EAB 凭据（--eab-kid / --eab-hmac-key 未提供）" "${HINTS[@]}"
+  fi
+
+  if is_ip_addr "$DOMAIN" && [[ "$TLS_MODE" == "acme" ]]; then
+    warn "IP 地址无法签发 ACME 域名证书（LiteSSL 明确不支持 IP 证书），已切换为自签名证书。"
     TLS_MODE="selfsigned"
   fi
 
@@ -906,7 +1007,7 @@ collect_config() {
   log "  安装目录      : ${INSTALL_DIR}"
   log "  数据目录      : ${DATA_DIR}"
   log "  内部端口      : ${APP_PORT}"
-  log "  证书方式      : ${TLS_MODE}$([[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "letsencrypt" ]] && echo "（Let's Encrypt，失败自动回退自签名）")"
+  log "  证书方式      : ${TLS_MODE}$([[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]] && echo "（$(ca_label "$CA_PROVIDER")，失败自动回退自签名）")"
   log ""
 }
 
@@ -1262,6 +1363,19 @@ gen_env_file() {
     port=3000          # 容器内固定监听 3000，宿主机端口由 compose 映射
     data_dir="/app/data"
   fi
+  # WebDAV 对外基地址（不含 /dav/）。
+  # 只有脚本确实配了 Nginx 反代时才写死：那样 /dav/ 一定被转发到应用，
+  # 界面显示的地址就是客户端该填的地址，也不会因为管理员从内网 IP 打开面板而变样。
+  # --skip-nginx（用户自建反代）时留空，让应用按「用户此刻访问的域名」自行推断 ——
+  # 写死一个本站点没配反代的地址反而会指向 404。
+  local webdav_public=""
+  if [[ "$SKIP_NGINX" != "1" ]]; then
+    local wd_scheme="https" wd_port=""
+    [[ "$TLS_MODE" == "none" ]] && wd_scheme="http"
+    if [[ "$wd_scheme" == "https" && "$HTTPS_PORT" != "443" ]]; then wd_port=":${HTTPS_PORT}"; fi
+    if [[ "$wd_scheme" == "http" && "$HTTP_PORT" != "80" ]]; then wd_port=":${HTTP_PORT}"; fi
+    webdav_public="${wd_scheme}://${DOMAIN}${wd_port}"
+  fi
   local content
   # 注：本文件内容不含时间戳 —— 保证重复执行时判定为「未变化」，不产生无意义备份
   content="# Kepler 运行环境（由 ${SCRIPT_NAME} 生成）
@@ -1270,11 +1384,14 @@ NODE_ENV=production
 HOST=0.0.0.0
 PORT=${port}
 HTTPS_PORT=3443
-WEBDAV_PORT=8443
+WEBDAV_PORT=${WEBDAV_PORT}
 # 数据目录：保存加密主密钥、账户、配置与统计，务必定期备份
 COS_DATA_DIR=${data_dir}
 # 位于 Nginx 之后：信任 X-Forwarded-*，使「部署模式」下的 HTTPS 判定正确
 TRUST_PROXY=1
+# WebDAV 对外基地址（不含 /dav/，应用会自动补上）：界面「服务器地址」按它显示。
+# 留空则由应用按访问请求推断（自建反代时请留空，或在 Nginx 里自己加 /dav/ 转发）。
+WEBDAV_PUBLIC_URL=${webdav_public}
 # 注：应用遇到未捕获异常会主动退出，由进程管理器（systemd Restart=always /
 # docker restart: unless-stopped）负责拉起，无需额外配置。"
   write_file "$env_path" "$content" 0640
@@ -1510,6 +1627,18 @@ write_nginx_conf() {
     if [[ -n "$h2" ]]; then ipv6="listen [::]:${HTTPS_PORT} ssl;"; else ipv6="listen [::]:${HTTPS_PORT} ssl http2;"; fi
   fi
 
+  # —— HSTS 策略按证书来源区分（实测踩过）——
+  # 自签名证书**绝不能**声明长期 HSTS：浏览器一旦记录，之后证书换成自签名
+  # （比如正式证书签发失败回退、或换域名重部署）时，Chrome 对 HSTS 站点的
+  # 证书错误**不提供「继续访问」入口**，表现为「您目前无法访问 … 使用了 HSTS」，
+  # 站点彻底进不去。对自签名改发 max-age=0：主动清除浏览器里可能已存在的旧记录。
+  local hsts_header
+  if [[ "$cert_fullchain" == "${SELF_SIGNED_DIR}/fullchain.pem" ]]; then
+    hsts_header='    add_header Strict-Transport-Security "max-age=0" always;'
+  else
+    hsts_header='    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;'
+  fi
+
   # —— 反代片段：所有 location 共用 ——
   local proxy_snippet
   proxy_snippet="        proxy_http_version 1.1;
@@ -1518,6 +1647,9 @@ write_nginx_conf() {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
+        # 浏览器实际连接的端口：Nginx 的 \$host 已被去掉端口，非 443/80 部署时
+        # 应用侧只能靠这个头还原出对外地址（WebDAV「服务器地址」用得到）
+        proxy_set_header X-Forwarded-Port \$server_port;
         proxy_set_header X-Requested-With \$http_x_requested_with;
         proxy_connect_timeout 60s;
         proxy_send_timeout 3600s;
@@ -1529,6 +1661,22 @@ write_nginx_conf() {
   local acme_block="    location ^~ /.well-known/acme-challenge/ {
         root ${WEBROOT};
         default_type \"text/plain\";
+    }"
+
+  # —— WebDAV 反代（默认开启）——
+  # 应用内开启 WebDAV 后，客户端（Windows 资源管理器 / macOS Finder）访问的就是这一个入口。
+  # 这里**必须默认写进配置**，不能像旧版那样留一段注释让人手动取消注释：
+  # 界面会把 https://<域名>/dav/ 当作「服务器地址」给出去，用户照着填却撞上 404 ——
+  # 因为没有任何人把 /dav/ 转发到应用内置的 WebDAV 端口。表现就是「配置全对但用不了」，
+  # 且从界面上完全看不出差在哪一步。
+  # 上游是应用自己起的 HTTPS WebDAV 服务（自签名证书），所以必须 proxy_ssl_verify off；
+  # 未开启 WebDAV 时上游端口没人监听，Nginx 只对 /dav* 返回 502，不影响面板其它路径。
+  local webdav_block="    # WebDAV 反向代理（应用内开启后立即生效）
+    location ^~ /dav {
+        proxy_pass https://127.0.0.1:${WEBDAV_PORT};
+        proxy_ssl_verify off;
+        proxy_set_header Authorization \$http_authorization;
+${proxy_snippet}
     }"
 
   local http_server="server {
@@ -1543,12 +1691,15 @@ __HTTP_LOCATION__
 
   local http_location
   if [[ "$with_tls" == "1" ]]; then
+    # 未启用 HTTPS 时这里直接反代（含 /dav，见下）；启用后统一 301 到 https，
+    # /dav/ 也跟着跳到 https，无需在这段里重复一遍 WebDAV 反代。
     http_location="    location / { return 301 https://\$host__EXT_PORT__\$request_uri; }"
   else
     http_location="    location / {
         proxy_pass http://127.0.0.1:__APP_PORT__;
 ${proxy_snippet}
-    }"
+    }
+${webdav_block}"
   fi
 
   local content="$http_server"
@@ -1594,7 +1745,7 @@ server {
     ssl_session_cache   shared:KeplerSSL:10m;
     ssl_session_timeout 1d;
 
-    add_header Strict-Transport-Security \"max-age=31536000; includeSubDomains\" always;
+${hsts_header}
     add_header X-Content-Type-Options nosniff always;
 
     # 上传大文件：交由应用自身分片，此处不做体积限制
@@ -1604,17 +1755,9 @@ server {
 
 ${acme_block}
 
-${root_loc}
+${webdav_block}
 
-    # 可选：WebDAV（应用内开启后，取消注释并把 8443 放行到 Nginx）
-    # location ^~ /dav/ {
-    #     proxy_pass https://127.0.0.1:8443;
-    #     proxy_ssl_verify off;
-    #     proxy_set_header Host \$host;
-    #     proxy_set_header Authorization \$http_authorization;
-    #     proxy_buffering off;
-    #     proxy_request_buffering off;
-    # }
+${root_loc}
 }"
   fi
 
@@ -1761,8 +1904,148 @@ nginx_apply() {
 # 8. HTTPS 证书
 # ------------------------------------------------------------------------------
 SELF_SIGNED_DIR="/etc/${SERVICE_NAME}/ssl"
+ACME_CERT_DIR="${SELF_SIGNED_DIR}/acme"     # acme.sh 签发的证书安装到固定路径（与自签名分开存，便于切换）
 CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
 CERT_KEY="${CERT_KEY:-}"
+
+# ------------------------------------------------------------------------------
+# 8.0 ACME 证书颁发机构（CA）注册表
+#
+# 为什么要有多家：Let's Encrypt 的 API 在境外，国内服务器经常**连不上**
+# （宝塔官方对同类问题的回复就是「服务器无法连接到 Let's Encrypt 的海外 API 服务器」）。
+# 可选项里除了 LE，其余都要求 EAB（外部账户绑定）—— 这是**协议层**要求，不是网络问题：
+# 实测 https://acme.litessl.com/acme/v2/directory 的 meta 里写着
+#   "externalAccountRequired": true, "caaIdentities": ["trustasia.com"]
+#   https://acme.zerossl.com/v2/DV90/directory 同样是 externalAccountRequired: true
+# 所以「换个 --server 就行」是错的，必须先拿到一对 EAB 凭据（KID + HMAC KEY）。
+#   · zerossl —— acme.sh 能用注册邮箱**自动换取** EAB；拿不到时（"Can not resolve _eab_id"）
+#                才需要去 https://app.zerossl.com/developer 手工取
+#   · litessl —— 亚数 TrustAsia（中国 CA）的免费 DV 证书，**必须**去 litessl.com 注册后
+#                手工取 EAB。宝塔面板之所以能申请成功，就是它替你保管了这份凭据。
+#
+# 引擎选择：非 LE 一律走 acme.sh。原因是 CentOS 8 的 certbot 是 1.22（Python 3.6），
+# **不支持 --eab-kid/--eab-hmac-key**，用 certbot 接 EAB 类 CA 必然失败；acme.sh 支持
+# EAB，且对 ZeroSSL 有自动换取 EAB 的特化处理。
+# ------------------------------------------------------------------------------
+ca_names() { printf 'zerossl | letsencrypt | litessl'; }
+
+ca_is_valid() {
+  case "${1:-}" in
+    letsencrypt|zerossl|litessl) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ACME directory（RFC 8555）地址
+ca_server() {
+  case "${1:-}" in
+    letsencrypt) printf 'https://acme-v02.api.letsencrypt.org/directory' ;;
+    zerossl)     printf 'https://acme.zerossl.com/v2/DV90' ;;
+    litessl)     printf 'https://acme.litessl.com/acme/v2/directory' ;;
+    *)           printf '' ;;
+  esac
+}
+
+ca_label() {
+  case "${1:-}" in
+    letsencrypt) printf "Let's Encrypt" ;;
+    zerossl)     printf 'ZeroSSL' ;;
+    litessl)     printf 'LiteSSL（亚数 TrustAsia）' ;;
+    *)           printf '%s' "${1:-}" ;;
+  esac
+}
+
+# acme.sh 里给这家 CA 取 EAB 的入口（没有就打印空）
+ca_eab_page() {
+  case "${1:-}" in
+    zerossl) printf 'https://app.zerossl.com/developer' ;;
+    litessl) printf 'https://www.litessl.com' ;;
+    *)       printf '' ;;
+  esac
+}
+
+# 是否「必须」手工提供 EAB（zerossl 可由 acme.sh 用邮箱自动换取，故不算必须）
+# 注意：必须显式 return —— 末条语句写成 `[[ ... ]]` 时条件为假会返回 1，
+# 裸调用点会被 set -e 的 ERR trap 当成「脚本意外失败」（本项目已踩过多次）。
+ca_needs_eab() {
+  if [[ "${1:-}" == "litessl" ]]; then return 0; fi
+  return 1
+}
+
+# acme.sh 存放某家 CA 账户密钥的目录。
+# **不能靠 glob 猜**：acme.sh 的规则是 CA_DIR="$CA_HOME/<host>/<path>"，也就是
+#   letsencrypt -> ca/acme-v02.api.letsencrypt.org/directory/
+#   zerossl     -> ca/acme.zerossl.com/v2/DV90/
+#   litessl     -> ca/acme.litessl.com/acme/v2/directory/
+# 账户密钥在**最里层**的目录里。写成 `ca/*<host>*/account.key` 只会命中外层父目录，
+# 永远判定「没注册过」—— 那就会在重跑时强行索要 EAB，而 acme.sh 其实早存好了。
+# 这里按 acme.sh 的算法原样推导（用 bash 参数展开，不依赖 cut/tr）。
+acme_ca_dir() {
+  local url rest host path
+  url="$(ca_server "${1:-}")"
+  if [[ -z "$url" ]]; then return 1; fi
+  rest="${url#*://}"          # 去掉 scheme
+  host="${rest%%/*}"          # 域名
+  path="${rest#*/}"           # directory 路径
+  if [[ -z "$host" || "$path" == "$rest" ]]; then return 1; fi
+  printf '%s/ca/%s/%s' "$ACME_HOME" "$host" "$path"
+}
+
+# acme.sh 是否已经为这家 CA 注册过账户。已注册则重装/续期**不再需要** EAB ——
+# acme.sh 会把 EAB 存进该 CA 的 ca.conf（CA_EAB_KEY_ID / CA_EAB_HMAC_KEY），注册时读回来；
+# 这既解释了「重装不该因为没带 EAB 就失败」，也让本脚本不必把 HMAC 密钥落盘。
+acme_account_exists() {
+  local ca_dir
+  ca_dir="$(acme_ca_dir "${1:-}")" || return 1
+  if [[ -s "${ca_dir}/account.key" ]]; then return 0; fi
+  return 1
+}
+
+# reload Nginx 的命令：certbot 的 --deploy-hook 与 acme.sh 的 --reloadcmd 共用一份。
+# **优先 `nginx -s reload`**（本脚本已把正确的 nginx 二进制加进 PATH，含宝塔 /www/server/nginx/sbin/nginx）
+# 再依次兜底 systemctl / init.d。不能只按 INIT_SYSTEM 二分：宝塔/自编译的 nginx 不是 systemd
+# native service（systemctl reload 会报 "is not active, cannot reload"），但机器本身又是 systemd 的。
+nginx_reload_cmd() {
+  printf 'nginx -s reload || systemctl reload nginx 2>/dev/null || /etc/init.d/nginx reload 2>/dev/null'
+}
+
+# acme.sh 可执行文件路径。现算而不缓存常量：ACME_HOME 允许被环境变量覆盖，
+# 在加载期缓存成常量会拿到覆盖前的旧值（表现为「明明指到临时目录，却读了真实账户」）。
+acme_bin() { printf '%s/acme.sh' "$ACME_HOME"; }
+
+# EAB 缺失/不可用时的指引（凭据要从 CA 控制台取，脚本变不出来）。
+# 拆成「只追加」与「重置后追加」两个入口：签发失败诊断路径已经在 HINTS 里写好了抬头，
+# 直接调 acme_eab_hints() 会把抬头冲掉（HINTS=() 是清空，不是清屏）。
+acme_eab_lines() {
+  local page; page="$(ca_eab_page "$CA_PROVIDER")"
+  add_hint "  $(ca_label "$CA_PROVIDER") 的 ACME 接口要求 EAB（外部账户绑定）："
+  add_hint "    接口 meta 里写着 externalAccountRequired: true —— 这是协议层要求，不是网络问题，"
+  add_hint "    也不是「换个 --server 就行」；必须先在该 CA 注册、拿到一对凭据才能签发："
+  add_hint "      EAB KID（公开标识）+ EAB HMAC KEY（机密，相当于签发密码）"
+  add_hint ""
+  if [[ -n "$page" ]]; then
+    add_hint "  1) 打开 ${page} 注册账号并生成 EAB，复制这两个值"
+    add_hint "  2) 带上它们重跑（HMAC 只经命令行交给 acme.sh；本脚本的状态文件里不保存它）："
+    add_hint "       $(rerun_cmd --ca "${CA_PROVIDER}" --eab-kid KID --eab-hmac-key HMAC)"
+    add_hint "     ※ 注册成功后 acme.sh 会把 EAB 存进它自己的 ca.conf，之后续期/重跑不必再带。"
+  else
+    add_hint "  1) 到该 CA 的控制台生成 EAB，再用 --eab-kid / --eab-hmac-key 重跑"
+  fi
+  add_hint ""
+  if [[ "$CA_PROVIDER" != "letsencrypt" ]]; then
+    add_hint "  不想再注册一家账号？用默认的 Let's Encrypt（免 EAB；前提是这台机器能连上它的境外 API）："
+    add_hint "    $(rerun_cmd --ca letsencrypt)"
+  fi
+  if [[ "$CA_PROVIDER" != "zerossl" ]]; then
+    add_hint "  或用 ZeroSSL：acme.sh 能用 --email 自动换取 EAB，不用手工填 ——"
+    add_hint "    $(rerun_cmd --ca zerossl)"
+  fi
+}
+
+acme_eab_hints() {
+  HINTS=()
+  acme_eab_lines
+}
 
 gen_self_signed() {
   mkdir -p "$SELF_SIGNED_DIR"
@@ -1781,13 +2064,15 @@ gen_self_signed() {
       add_hint "  手工生成（放到 ${SELF_SIGNED_DIR}）："
       add_hint "    mkdir -p ${SELF_SIGNED_DIR}"
       add_hint "    openssl req -x509 -nodes -newkey rsa:2048 -days 825 -keyout ${SELF_SIGNED_DIR}/privkey.pem -out ${SELF_SIGNED_DIR}/fullchain.pem -subj \"/CN=${DOMAIN}\""
-      add_hint "  或直接改用 Let's Encrypt（需 80 端口可达）：$(rerun_cmd --tls letsencrypt)"
+      add_hint "  或直接改用正式证书（需 80 端口可达）：$(rerun_cmd --tls "${CA_PROVIDER}")"
       die_with_hint "自签名证书生成失败（openssl 不可用或参数不被支持）" "${HINTS[@]}"
     fi
   fi
   chmod 0600 "$key"; chmod 0644 "$crt"
   CERT_FULLCHAIN="$crt"; CERT_KEY="$key"
   ok "自签名证书就绪：${crt}"
+  info "浏览器会提示「不安全」，在警告页选「高级 → 继续前往」即可（本配置对自签名不启用 HSTS，可以点进去）。"
+  return 0
 }
 
 ensure_certbot() {
@@ -1819,31 +2104,61 @@ domain_resolves_here() {
   pub="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "$pub" ]] && pub="$(curl -fsS --max-time 8 http://ifconfig.me 2>/dev/null || true)"
   if [[ -n "$pub" && "$ip" != "$pub" ]]; then
-    warn "域名 ${DOMAIN} 解析到 ${ip}，但本机公网 IP 为 ${pub}，Let's Encrypt 校验可能失败。"
+    warn "域名 ${DOMAIN} 解析到 ${ip}，但本机公网 IP 为 ${pub}，ACME 的 HTTP-01 校验可能失败（当前 CA：$(ca_label "$CA_PROVIDER")）。"
     return 1
   fi
   return 0
 }
 
-# Let's Encrypt 签发失败的针对性指引（非致命：脚本会回退自签名）
-le_failure_hints() {
+# 域名解析检测失败时的措辞（原来是写死 Let's Encrypt 的）
+domain_resolve_warn() {
+  warn "域名解析检测未通过，仍会尝试签发（HTTP-01 需要 80 端口可被外网访问）。"
+}
+
+# 正式证书签发失败的针对性指引（非致命：脚本会回退自签名）。
+# 按 CA 泛化 —— 日志里的报错形态与「境外 CA 连不上」「EAB 没给」都区分开了。
+acme_failure_hints() {
   local tail_log; tail_log="$(log_since_mark)"
   HINTS=()
   add_hint "已自动回退到自签名证书（功能不受影响，浏览器会提示不安全）。要换正式证书，请对症处理："
+  add_hint "  本次 CA ：$(ca_label "$CA_PROVIDER")"
+  add_hint "  接口    ：$(ca_server "$CA_PROVIDER")"
   add_hint ""
-  if grep -qiE 'connection refused|timed out|timeout|could not connect|unreachable|fetch' <<<"$tail_log"; then
-    add_hint "  【判断】80 端口对外不通（HTTP-01 校验需要外网能访问本机 80 端口）。"
-    add_hint "    1) 云厂商安全组放行 80/443；本机防火墙：ufw allow 80,443/tcp 或 firewall-cmd --add-service=http --add-service=https --permanent && firewall-cmd --reload"
-    add_hint "    2) 确认 Nginx 在监听：ss -ltnp | grep ':80'"
-    add_hint "    3) 确认没有别的程序占用 80：ss -ltnp | grep ':80'"
+  if grep -qiE 'eab|external ?account|_eab_id' <<<"$tail_log"; then
+    add_hint "  【判断】这家 CA 要求 EAB（外部账户绑定）凭据，当前缺失或不被接受。"
+    acme_eab_lines
+  elif grep -qiE 'acme\.sh 安装失败|下载到的 (文件|acme\.sh)' <<<"$tail_log"; then
+    add_hint "  【判断】acme.sh 本体没装上（官方源在 GitHub，官方安装器就是从那儿取文件）。"
+    add_hint "  脚本已自动尝试 gitee 镜像仍失败 —— 多半是这台机器的出口对两个源都不通。"
+    add_hint "  手工装好后再重跑（二选一）："
+    add_hint "    ① gitee 克隆：git clone https://gitee.com/neilpang/acme.sh.git /root/acme-sh-src && cd /root/acme-sh-src && ./acme.sh --install -m ${EMAIL}"
+    add_hint "    ② 任何能上网的机器下载后传到服务器：https://gitee.com/neilpang/acme.sh/raw/master/acme.sh → 放到 ${ACME_HOME}/acme.sh（chmod 0700）"
+    add_hint "  装好后重跑：$(rerun_cmd --tls "${CA_PROVIDER}")"
+  elif grep -qiE 'rate ?limit|ratelimited|too many|exceeded|Le_OrderFinalize|429|retry after' <<<"$tail_log"; then
+    add_hint "  【判断】触发 CA 的速率限制（rateLimited / 429）：不是账户坏了，也不是网络不通。"
+    add_hint "    · Let's Encrypt 等按「注册域名」（公共后缀一级，如 l.cd / example.com）7 天限发约 50 张证书，"
+    add_hint "      同一后缀下所有人共享配额 —— 你看到的「已存在 ACME 账户」是账户本身有效，受限的是域名配额。"
+    add_hint "    1) 立刻换 CA 避开配额（照样走 HTTP-01，无需改域名解析）："
+    add_hint "         $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)   # 或 --ca zerossl 自动换 EAB"
+    add_hint "    2) 想留在这家 CA 就等日志里 retry-after 时间过后重跑，先 --tls selfsigned 把站点跑起来"
+  elif grep -qiE 'cannot connect|connection (refused|reset|error)|failed to connect|could not connect|timed out|timeout|unreachable|no route|temporary failure in name resolution|ssl: ' <<<"$tail_log"; then
+    add_hint "  【判断】连不上 ACME 服务器。注意这**多半不是** 80 端口的问题 —— 国内服务器连"
+    add_hint "  境外 CA 的 API 超时是最常见的原因（站点能正常访问，证书就是签不下来）。"
+    add_hint "  先在服务器上实测这个接口通不通（返回 200 才算通；超时/000 就是连不上 CA）："
+    add_hint "    curl -s -o /dev/null -m 10 -w '%{http_code} %{time_total}\n' $(ca_server "$CA_PROVIDER")"
+    add_hint ""
+    add_hint "  a) 连不上 → 换一家能连上的 CA。换 --server 不够：非 LE 的 CA 都要 EAB 凭据，"
+    add_hint "     优先用国内节点（到 litessl.com 取 EAB 后重跑）："
+    add_hint "       $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)"
+    add_hint "     或 ZeroSSL（acme.sh 能用 --email 自动换取 EAB，免手工）："
+    add_hint "       $(rerun_cmd --ca zerossl)"
+    add_hint "  b) 能连上 → 那就是 HTTP-01 校验失败，继续按下面排查 80 端口："
+    add_hint "       1) 云厂商安全组放行 80/443；本机防火墙：ufw allow 80,443/tcp 或 firewall-cmd --add-service=http --add-service=https --permanent && firewall-cmd --reload"
+    add_hint "       2) 确认 Nginx 在监听：ss -ltnp | grep ':80'"
   elif grep -qiE 'unauthorized|invalid response|403|404' <<<"$tail_log"; then
     add_hint "  【判断】域名解析到的机器不是本机，或请求被 CDN 拦截。"
     add_hint "    1) 核对解析：dig +short ${DOMAIN} 应等于本机公网 IP（curl -s https://api.ipify.org）"
     add_hint "    2) 走 Cloudflare 等 CDN 时先临时关闭代理（灰云），或改用 DNS-01 校验"
-  elif grep -qiE 'rate limit|too many|exceeded' <<<"$tail_log"; then
-    add_hint "  【判断】触发 Let's Encrypt 频次限制（同一域名每周 5 张）。"
-    add_hint "    1) 稍后再试；先用测试环境验证流程：--staging"
-    add_hint "    2) 或先 --tls selfsigned 把站点跑起来，过几天再换正式证书"
   elif grep -qiE 'nxdomain|no valid ip|dns problem|dns-01' <<<"$tail_log"; then
     add_hint "  【判断】域名解析异常。先在 DNS 控制台加 A 记录指向本机公网 IP，等生效后重试。"
   else
@@ -1854,74 +2169,190 @@ le_failure_hints() {
   while IFS= read -r l; do [[ -n "$l" ]] && add_hint "    | ${l}"; done <<<"$(log_key_lines 4)"
   add_hint ""
   add_hint "处理好后重跑即可自动换成正式证书（不会重复建站，只换证书）："
-  add_hint "    $(rerun_cmd --tls letsencrypt)"
-  warn_with_hint "Let's Encrypt 证书签发失败" "${HINTS[@]}"
+  add_hint "    $(rerun_cmd --tls "${CA_PROVIDER}")"
+  warn_with_hint "$(ca_label "$CA_PROVIDER") 证书签发失败" "${HINTS[@]}"
 }
 
-issue_letsencrypt() {
-  info "准备通过 Let's Encrypt 签发证书…"
-  domain_resolves_here || warn "域名解析检测未通过，仍会尝试签发（HTTP-01 需要 80 端口可被外网访问）。"
-
-  if ! ensure_certbot; then
-    warn "certbot 不可用（RHEL 系通常在 EPEL 源里：$(epel_rpm_cmd)），改用 acme.sh 申请证书…"
-    issue_acme_sh
-    return $?
-  fi
-
+# 用 certbot 签发（只走 Let's Encrypt 路径：CentOS 8 的 certbot 1.22 / Python 3.6
+# 不支持 --eab-kid/--eab-hmac-key，接 EAB 类 CA 必然失败）。失败只返回 1，由调用方出提示。
+issue_via_certbot() {
   local args=(certonly --webroot -w "$WEBROOT" -d "$DOMAIN" --non-interactive --agree-tos
               -m "$EMAIL" --keep-until-expiring --cert-name "$DOMAIN")
   [[ "$STAGING" == "1" ]] && args+=(--staging)
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    args+=(--deploy-hook "systemctl reload nginx")
-  else
-    args+=(--deploy-hook "nginx -s reload")
-  fi
+  args+=(--deploy-hook "$(nginx_reload_cmd)")
 
   mark_log
-  if ! run certbot "${args[@]}"; then
-    le_failure_hints
-    return 1
-  fi
+  if ! run certbot "${args[@]}" </dev/null; then return 1; fi
   local live="/etc/letsencrypt/live/${DOMAIN}"
-  if [[ ! -s "${live}/fullchain.pem" || ! -s "${live}/privkey.pem" ]]; then
-    le_failure_hints
-    return 1
-  fi
+  if [[ ! -s "${live}/fullchain.pem" || ! -s "${live}/privkey.pem" ]]; then return 1; fi
   CERT_FULLCHAIN="${live}/fullchain.pem"; CERT_KEY="${live}/privkey.pem"
 
   # 自动续期：certbot 包通常自带 timer/cron，这里显式确认一次
   if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | grep -q 'certbot.timer'; then
     run_soft systemctl enable --now certbot.timer
     ok "已启用 certbot.timer 自动续期"
-  else
-    if ! grep -rq 'certbot' /etc/crontab /etc/cron.d 2>/dev/null; then
-      printf '0 3 * * * root certbot renew --quiet --deploy-hook "systemctl reload nginx" >/dev/null 2>&1\n' \
-        > "/etc/cron.d/${SERVICE_NAME}-certbot"
-      chmod 0644 "/etc/cron.d/${SERVICE_NAME}-certbot"
-      ok "已添加每日续期定时任务：/etc/cron.d/${SERVICE_NAME}-certbot"
-    fi
+  elif ! grep -rq 'certbot' /etc/crontab /etc/cron.d 2>/dev/null; then
+    printf '0 3 * * * root certbot renew --quiet --deploy-hook "%s" >/dev/null 2>&1\n' "$(nginx_reload_cmd)" \
+      > "/etc/cron.d/${SERVICE_NAME}-certbot"
+    chmod 0644 "/etc/cron.d/${SERVICE_NAME}-certbot"
+    ok "已添加每日续期定时任务：/etc/cron.d/${SERVICE_NAME}-certbot"
   fi
-  ok "Let's Encrypt 证书签发成功：${CERT_FULLCHAIN}"
+  ok "Let's Encrypt 证书签发成功（certbot）：${CERT_FULLCHAIN}"
   return 0
 }
 
-issue_acme_sh() {
-  have curl || return 1
-  local acme_home="/root/.acme.sh"
-  if [[ ! -s "${acme_home}/acme.sh" ]]; then
-    if ! run bash -c "curl -fsSL https://get.acme.sh | sh -s email=${EMAIL}"; then
-      warn "acme.sh 安装失败。"
+# 统一入口：按 CA 选引擎，失败只返回 1（回退自签名由 setup_tls 决定）
+issue_cert() {
+  info "准备通过 $(ca_label "$CA_PROVIDER") 签发证书…"
+  info "  ACME 接口：$(ca_server "$CA_PROVIDER")　校验方式：HTTP-01 / webroot（${WEBROOT}）"
+  domain_resolves_here || domain_resolve_warn
+
+  if [[ "$CA_PROVIDER" != "letsencrypt" ]]; then
+    # 非 LE 一律 acme.sh：certbot 的 EAB 参数在 CentOS 8 那代根本不认
+    info "  使用 acme.sh 引擎（certbot 不支持 EAB 参数）"
+    if issue_acme_sh; then return 0; fi
+    acme_failure_hints
+    return 1
+  fi
+
+  if ensure_certbot; then
+    if issue_via_certbot; then return 0; fi
+    warn "certbot 签发 Let's Encrypt 证书失败，改用 acme.sh 再试一次…"
+  else
+    warn "certbot 不可用（RHEL 系通常在 EPEL 源里：$(epel_rpm_cmd)），改用 acme.sh 申请证书…"
+  fi
+  if issue_acme_sh; then return 0; fi
+  acme_failure_hints
+  return 1
+}
+
+# 把签发好的证书安装到固定路径（Nginx 只认这两个文件），并把 reloadcmd 一并登记到
+# acme.sh 的域名配置里 —— 这样**后续自动续期**也会同步覆盖这两个文件并重载 Nginx。
+acme_install_cert() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local args=(--install-cert --home "$ACME_HOME" -d "$DOMAIN"
+              --key-file "${dir}/privkey.pem"
+              --fullchain-file "${dir}/fullchain.pem"
+              --reloadcmd "$(nginx_reload_cmd)")
+  # 成功判据是「证书文件是否落盘」，不是 run 的返回码：acme.sh 的 --install-cert 会先把
+  # key/fullchain 写进指定路径，**之后**才跑 --reloadcmd；若 reload 命令失败（宝塔/自编译
+  # nginx 下 systemctl reload 报 "is not active"），acme.sh 返回非零并打 "Reload error"，
+  # 但证书其实已经装好了。这里不能据此判「安装失败」回退自签名 —— reload 稍后由
+  # setup_tls 末尾的 nginx_apply 统一兜底（它已经 reload 过一次）。
+  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then
+    warn "acme.sh --install-cert 返回非零（多半是 --reloadcmd 那步失败）；证书可能已落盘，继续核对文件。"
+  fi
+  chmod 0600 "${dir}/privkey.pem" 2>/dev/null || true
+  chmod 0644 "${dir}/fullchain.pem" 2>/dev/null || true
+  if [[ ! -s "${dir}/privkey.pem" || ! -s "${dir}/fullchain.pem" ]]; then
+    warn "证书文件未正确落盘：${dir}/privkey.pem 或 fullchain.pem 缺失/为空。"
+    return 1
+  fi
+  return 0
+}
+
+# 安装 acme.sh 本体（不含账户注册）。
+# 官方安装器（get.acme.sh）实际从 raw.githubusercontent.com 取文件 —— 国内服务器
+# 经常连不上 GitHub，装不上 acme.sh 就等于所有需要 EAB 的 CA 全军覆没（certbot 又
+# 不支持 EAB 参数），最后必然回退自签名。所以这里：
+#   1) 不用 `curl … | sh`：管道会把左侧下载失败吞掉（$? 取到右侧 sh 的 0），
+#      404/错误页也可能被当成脚本执行 —— 与 D1-06 同一条教训；
+#   2) 官方源失败自动改走 gitee 镜像（acme.sh 官方 wiki《Install in China》给的地址）；
+#   3) 落盘后双检：首行 shebang（拦「内容不是脚本」）+ bash -n（拦「是脚本但被截断」）。
+install_acme_sh() {
+  if [[ -s "$(acme_bin)" ]]; then return 0; fi
+  have curl || { warn "缺少 curl，无法安装 acme.sh。"; return 1; }
+  mkdir -p "$ACME_HOME"
+  local tmp; tmp="$(mktemp "${ACME_HOME}/.acme.sh.download.XXXXXX")"
+  local src=""
+  if run curl -fsSL --connect-timeout 15 -o "$tmp" \
+       https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then
+    src="官方源（GitHub）"
+  else
+    warn "从官方源（raw.githubusercontent.com）下载 acme.sh 失败（国内服务器常见），改用 gitee 镜像…"
+    if run curl -fsSL --connect-timeout 15 -o "$tmp" \
+         https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then
+      src="gitee 镜像"
+    else
+      rm -f "$tmp"
+      warn "acme.sh 安装失败：官方源与 gitee 镜像都连不上。"
       return 1
     fi
   fi
-  local acme="${acme_home}/acme.sh"
-  local args=(--issue -d "$DOMAIN" --webroot "$WEBROOT" --keylength 2048)
+  # 双检（缺一不可）：shebang 拦「镜像返回了错误页」，bash -n 拦「脚本被截断」
+  if [[ "$(head -c 2 "$tmp")" != '#!' ]]; then
+    rm -f "$tmp"
+    warn "下载到的文件不是脚本（首行不是 shebang），已丢弃：${src}"
+    return 1
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    warn "下载到的 acme.sh 语法检查不过（可能被截断），已丢弃：${src}"
+    return 1
+  fi
+  mv -f "$tmp" "$(acme_bin)"
+  chmod 0700 "$(acme_bin)"
+  # 续期定时任务：官方 --install 会写 root 的 crontab，这里改成 cron.d（与 certbot 同一风格），
+  # 幂等：已存在同样的行就不重写。
+  local cron="/etc/cron.d/${SERVICE_NAME}-acme"
+  if ! grep -q 'acme\.sh --cron' /etc/crontab /etc/cron.d 2>/dev/null; then
+    printf '17 3 * * * root %s --cron --home %s >/dev/null 2>&1\n' "$(acme_bin)" "$ACME_HOME" > "$cron"
+    chmod 0644 "$cron"
+    ok "已添加 acme.sh 每日续期任务：${cron}"
+  fi
+  ok "acme.sh 已就位（${src}）：$(acme_bin)"
+  return 0
+}
+
+# 用 acme.sh 签发。支持任意 ACME CA（含需要 EAB 的 ZeroSSL / LiteSSL）。
+#
+# 三处都是照 acme.sh 源码确认过的，不是凭印象：
+#   · EAB 只能由命令行传（--eab-kid / --eab-hmac-key），acme.sh **没有**对应的环境变量；
+#   · 注册成功后 EAB 会被写进 ~/.acme.sh/ca/<CA 主机>/<path>/ca.conf，之后续期/重跑不必再给；
+#   · --staging 只改默认 CA，一旦同时给了 --server 就以 --server 为准（不会把 LiteSSL 打回 LE 测试环境）。
+# 另：所有调用都显式 --home —— acme.sh 的默认家目录是「当前用户的 ~/.acme.sh」，
+# 与脚本变量 ACME_HOME 一致（root），但显式传才能在 ACME_HOME 被覆盖时保持一致。
+issue_acme_sh() {
+  install_acme_sh || return 1
+
+  local server; server="$(ca_server "$CA_PROVIDER")"
+  if [[ -z "$server" ]]; then warn "未知的证书颁发机构：${CA_PROVIDER}"; return 1; fi
+
+  # 1) 注册 ACME 账户（EAB 只有这一步用得上）
+  if acme_account_exists "$CA_PROVIDER"; then
+    info "已存在 $(ca_label "$CA_PROVIDER") 的 ACME 账户，跳过注册（无需再次提供 EAB）。"
+  else
+    local reg=(--register-account --home "$ACME_HOME" --server "$server" -m "$EMAIL")
+    if ca_needs_eab "$CA_PROVIDER"; then
+      if [[ -z "$EAB_KID" || -z "$EAB_HMAC_KEY" ]]; then
+        warn "$(ca_label "$CA_PROVIDER") 需要 EAB 凭据（--eab-kid / --eab-hmac-key 未提供）。"
+        return 1
+      fi
+      reg+=(--eab-kid "$EAB_KID" --eab-hmac-key "$EAB_HMAC_KEY")
+    fi
+    mark_log
+    if ! run "$(acme_bin)" "${reg[@]}" </dev/null; then
+      warn "在 $(ca_label "$CA_PROVIDER") 注册 ACME 账户失败。"
+      return 1
+    fi
+  fi
+
+  # 2) 签发（HTTP-01 / webroot：需要外网能访问 80 端口下的 .well-known/acme-challenge/）
+  local args=(--issue --home "$ACME_HOME" --server "$server" -d "$DOMAIN" --webroot "$WEBROOT" --keylength 2048)
   [[ "$STAGING" == "1" ]] && args+=(--staging)
-  if ! run "$acme" "${args[@]}"; then warn "acme.sh 签发失败。"; return 1; fi
-  local dir="${acme_home}/${DOMAIN}"
-  [[ -s "${dir}/fullchain.cer" && -s "${dir}/${DOMAIN}.key" ]] || return 1
-  CERT_FULLCHAIN="${dir}/fullchain.cer"; CERT_KEY="${dir}/${DOMAIN}.key"
-  ok "acme.sh 证书签发成功（已自动注册续期任务）：${CERT_FULLCHAIN}"
+  mark_log
+  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then
+    warn "acme.sh 在 $(ca_label "$CA_PROVIDER") 签发失败。"
+    return 1
+  fi
+  if ! acme_install_cert "$ACME_CERT_DIR"; then
+    warn "证书安装到 ${ACME_CERT_DIR} 失败。"
+    return 1
+  fi
+  CERT_FULLCHAIN="${ACME_CERT_DIR}/fullchain.pem"
+  CERT_KEY="${ACME_CERT_DIR}/privkey.pem"
+  ok "$(ca_label "$CA_PROVIDER") 证书签发成功（acme.sh 已注册自动续期任务）：${CERT_FULLCHAIN}"
   return 0
 }
 
@@ -1934,12 +2365,12 @@ setup_tls() {
       return 0 ;;
     selfsigned)
       gen_self_signed ;;
-    auto|letsencrypt)
+    auto|acme)
       # 先写入「仅 HTTP」配置并启动 Nginx，让 ACME 的 HTTP-01 校验能通过
       write_nginx_conf 0 "" ""
       nginx_apply
-      if issue_letsencrypt; then :; else
-        warn "回退：改用自签名证书（浏览器会提示不安全，可在网络就绪后重跑本脚本自动升级为 LE 证书）。"
+      if issue_cert; then :; else
+        warn "回退：改用自签名证书（浏览器会提示不安全，可在网络就绪后重跑本脚本自动升级为正式证书）。"
         gen_self_signed
       fi ;;
   esac
@@ -1959,11 +2390,11 @@ port_in_use() {
   return 1
 }
 
-# 建议的「换一个端口」值：避开对外端口与应用内置端口（3443/8443），并注意 65535 上界
+# 建议的「换一个端口」值：避开对外端口与应用内置端口（3443 / WEBDAV_PORT），并注意 65535 上界
 next_port() {
   local p=$((APP_PORT + 1))
   if ((p > 65535)); then p=$((APP_PORT - 1)); fi
-  while [[ "$p" == "$HTTP_PORT" || "$p" == "$HTTPS_PORT" || "$p" == "3443" || "$p" == "8443" ]]; do
+  while [[ "$p" == "$HTTP_PORT" || "$p" == "$HTTPS_PORT" || "$p" == "3443" || "$p" == "$WEBDAV_PORT" ]]; do
     p=$((p + 1))
   done
   if ((p < 1 || p > 65535)); then p=3000; fi
@@ -2516,7 +2947,7 @@ apply_port_change() {
   local new_port="$1"
   [[ "$new_port" =~ ^[0-9]+$ ]] && ((new_port >= 1 && new_port <= 65535)) || die "端口不合法：${new_port}"
   [[ "$new_port" != "$HTTP_PORT" && "$new_port" != "$HTTPS_PORT" ]] || die "应用端口不能与 Nginx 对外端口相同。"
-  [[ "$new_port" != "3443" && "$new_port" != "8443" ]] || die "应用端口不能使用 3443 或 8443（应用内置 HTTPS/WebDAV 已占用）。"
+  [[ "$new_port" != "3443" && "$new_port" != "$WEBDAV_PORT" ]] || die "应用端口不能使用 3443 或 ${WEBDAV_PORT}（分别为应用内置 HTTPS / WebDAV，已占用）。"
   [[ "$new_port" != "$APP_PORT" ]] || { info "端口未变化：${APP_PORT}"; return 0; }
   if port_in_use "$new_port"; then
     warn "端口 ${new_port} 当前已被占用，修改后可能与其他进程冲突。"
@@ -2698,11 +3129,11 @@ do_uninstall() {
     run_soft firewall-cmd --permanent --remove-port="${HTTPS_PORT}/tcp"
     run_soft firewall-cmd --reload
   fi
-  rm -f "/etc/cron.d/${SERVICE_NAME}-certbot"
+  rm -f "/etc/cron.d/${SERVICE_NAME}-certbot" "/etc/cron.d/${SERVICE_NAME}-acme"
   if have certbot && [[ "$CERT_FULLCHAIN" == "/etc/letsencrypt/live/${DOMAIN}/"* ]]; then
     run_soft certbot delete --non-interactive --cert-name "$DOMAIN"
   fi
-  if [[ -x /root/.acme.sh/acme.sh ]]; then run_soft /root/.acme.sh/acme.sh --remove -d "$DOMAIN"; fi
+  if [[ -x "$(acme_bin)" ]]; then run_soft "$(acme_bin)" --remove -d "$DOMAIN"; fi
 
   rm -f -- "$GLOBAL_COMMAND"
   # 脚本可能正站在安装目录里（install_app 会 cd 进去），先把工作目录挪走，
@@ -2793,12 +3224,15 @@ print_summary() {
     log "    Nginx 配置 （本次未配置，由你自建反代）"
   fi
   if [[ "$TLS_MODE" != "none" && -n "$CERT_FULLCHAIN" ]]; then
-    if [[ "$CERT_FULLCHAIN" == /etc/letsencrypt/* || "$CERT_FULLCHAIN" == */.acme.sh/* ]]; then
+    if [[ "$CERT_FULLCHAIN" == "${ACME_CERT_DIR}/"* ]]; then
+      log "    证书     ${CERT_FULLCHAIN}（$(ca_label "$CA_PROVIDER")，acme.sh 自动续期）"
+      log "    手动续期 $(acme_bin) --cron --home ${ACME_HOME} && $(nginx_reload_cmd)"
+    elif [[ "$CERT_FULLCHAIN" == /etc/letsencrypt/* || "$CERT_FULLCHAIN" == */.acme.sh/* ]]; then
       log "    证书     ${CERT_FULLCHAIN}（到期自动续期）"
-      log "    手动续期 certbot renew --force-renewal && systemctl reload nginx"
+      log "    手动续期 certbot renew --force-renewal && $(nginx_reload_cmd)"
     else
       log "    证书     ${CERT_FULLCHAIN}（自签名，浏览器会提示不安全）"
-      log "    换正式证书 网络与 DNS 就绪后重跑：bash ${SCRIPT_NAME} --domain ${DOMAIN} --tls letsencrypt"
+      log "    换正式证书 网络与 DNS 就绪后重跑：bash ${SCRIPT_NAME} --domain ${DOMAIN} --tls ${CA_PROVIDER}"
     fi
   fi
   log ""
@@ -2809,7 +3243,9 @@ print_summary() {
   log "       其中含 AES 主密钥与全部云厂商密钥 —— 丢失后已加密文件无法解密，且不可恢复。"
   log "       备份示例：tar -czf kepler-data-\$(date +%F).tar.gz -C ${DATA_DIR} ."
   log "    4. 本服务为${C_BOLD}单实例${C_RESET}设计（data/ 目录有单实例锁），请勿同时运行多个实例。"
-  log "    5. 应用内开启 WebDAV 后需放行 ${SERVICE_NAME} 的 8443 端口，并在 Nginx 中启用 /dav/ 反代（配置内已给出注释模板）。"
+  log "    5. 应用内开启 WebDAV 后，界面会显示客户端要填的地址（.env 中 WEBDAV_PUBLIC_URL + /dav/）；"
+  log "       Nginx 已默认反代 /dav 到应用内置的 ${WEBDAV_PORT} 端口，无需手工改配置，${C_BOLD}也不需要把 ${WEBDAV_PORT} 暴露到公网${C_RESET}。"
+  log "       若该端口已被占用，用 ${C_BOLD}WEBDAV_PORT=<其它端口>${C_RESET} 重跑本脚本，.env 与 Nginx 会一起改。"
   log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始管理员用户名/密码、修改端口或卸载。"
   log "    7. 重新执行本脚本可升级部署：会重新拉取源码并同步配置，数据目录不会被触碰。"
   if ((${#todos[@]} > 0)); then

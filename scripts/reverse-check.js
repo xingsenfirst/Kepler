@@ -1322,10 +1322,10 @@ const CASES = [
        */
       name: 'D1-05 · 删掉「域名带端口」校验（静默自签名 + server_name 带端口打挂 nginx -t）',
       file: 'deploy.sh',
-      anchor: '  if [[ "$DOMAIN" =~ ^[^:]+:[0-9]+$ ]]; then\n'
+      anchor: '  if [[ "$DOMAIN" =~ :[0-9]+$ ]] && [[ "$DOMAIN" != *::* ]]; then\n'
         + '    die "域名里不要带端口：${DOMAIN}（端口请用 --https-port / --http-port 指定，例如：--domain ${DOMAIN%%:*} --https-port ${DOMAIN##*:}）"\n'
         + '  fi',
-      replacement: '',
+      replacement: '  : # 「带端口」校验已被反向对照移除',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -1440,6 +1440,225 @@ const CASES = [
       anchor: 'function isShellPatternAt(src, i) {',
       replacement: 'function isShellPatternAt(src, i) {\n  return false;\n}\nfunction _deadShellPattern(src, i) {',
       testFile: 'invariants.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把 acme.sh 账户目录的推导退回「只按主机名找」——这正是最初写错的那版
+       * （用通配符去匹配 ca/ 下一层目录）。acme.sh 的 CA_DIR 是 ca/<host>/<path>/，
+       * 账户密钥在**最里层**，只看外层目录永远判成「没注册过」。
+       * 后果：每次重跑都强索 EAB（而 acme.sh 早把 EAB 存进 ca.conf），
+       * 用户被要求反复去 CA 控制台复制凭据，却怎么填都「还是没注册」。
+       */
+      name: 'D1-14 · acme.sh 账户目录退回「只按主机名找」（已注册的账户永远判不出来）',
+      file: 'deploy.sh',
+      anchor: `  printf '%s/ca/%s/%s' "$ACME_HOME" "$host" "$path"`,
+      replacement: `  printf '%s/ca/%s' "$ACME_HOME" "$host"`,
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * rerun_cmd 不再脱敏 → 把原始命令行原样回显。用户带 --eab-hmac-key 重跑时，
+       * 提示与日志里就会出现明文 HMAC（相当于签发密码），而且会被复制粘贴到处传。
+       */
+      name: 'D1-15 · 重跑提示不再抹掉 EAB HMAC（明文密钥回显到屏幕与日志）',
+      file: 'deploy.sh',
+      anchor: '  orig="$(redact_args "$ORIG_ARGS")"  # 原样重跑，但不把 EAB 密钥回显出来',
+      replacement: '  orig="$ORIG_ARGS"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 去掉「非 LE 一律走 acme.sh」的分流 → 所有 CA 都落到 certbot 通道。
+       * CentOS 8 的 certbot 是 1.22（Python 3.6），**不支持 --eab-kid/--eab-hmac-key**，
+       * 于是 LiteSSL / ZeroSSL 这类强制 EAB 的 CA 在签发那一步必然失败 ——
+       * 而失败又是「回退自签名」的非致命路径，用户只会看到一句「证书签发失败」。
+       */
+      name: 'D1-16 · 非 LE 的 CA 也交给 certbot（1.22 不支持 EAB，CentOS 8 那类机器必失败）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$CA_PROVIDER" != "letsencrypt" ]]; then\n    # 非 LE 一律 acme.sh：certbot 的 EAB 参数在 CentOS 8 那代根本不认',
+      replacement: '  if false; then\n    # 非 LE 一律 acme.sh：certbot 的 EAB 参数在 CentOS 8 那代根本不认',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 去掉 --install-cert → 证书只留在 acme.sh 的私有目录，Nginx 仍指向
+       * /etc/kepler/ssl/acme/。表现极隐蔽：首次签发看着成功了（文件在别处也齐全），
+       * 但**续期后 Nginx 一直用着旧证书**，直到过期才被发现。
+       */
+      name: 'D1-17 · 不再 --install-cert（续期只更新 acme.sh 私有目录，Nginx 一直用旧证书）',
+      file: 'deploy.sh',
+      anchor: '  if ! acme_install_cert "$ACME_CERT_DIR"; then',
+      replacement: '  if false; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把 EAB HMAC 写进部署状态文件。状态文件是 0600 的普通文本，会被备份/同步/贴到群里
+       * 排障（README 里就让人备份数据目录）；HMAC 相当于该 CA 的签发密码，泄漏即可冒名签发。
+       * 而且这是**多余**的落盘：acme.sh 自己已经把 EAB 存在 ca.conf 里，重跑并不需要它。
+       */
+      name: 'D1-18 · EAB HMAC 密钥落进部署状态文件（多余且等于明文泄漏签发密码）',
+      file: 'deploy.sh',
+      anchor: 'EAB_KID=${EAB_KID}"',
+      replacement: 'EAB_KID=${EAB_KID}\nEAB_HMAC_KEY=${EAB_HMAC_KEY}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把「按证书来源区分 HSTS」退回成「一律 max-age=31536000」——正是本轮之前的写法。
+       * 后果：正式证书签发失败回退自签名时，浏览器已经记住了该域名的长期 HSTS，
+       * 随后对自签名的证书错误不再给「继续访问」入口（提示「此网站使用了 HSTS」），
+       * 站点对浏览器**彻底不可达**——回退方案比不回退还糟。
+       */
+      name: 'D1-19 · 自签名证书也下发长期 HSTS（回退自签名后浏览器锁死，无「继续访问」入口）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$cert_fullchain" == "${SELF_SIGNED_DIR}/fullchain.pem" ]]; then\n    hsts_header=\'    add_header Strict-Transport-Security "max-age=0" always;\'\n  else\n    hsts_header=\'    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;\'\n  fi',
+      replacement: '  hsts_header=\'    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;\'',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 去掉 acme.sh 的 gitee 兜底 + 落盘双检，退回 `curl … | sh`（官方安装器从
+       * raw.githubusercontent.com 取文件）。国内服务器连不上 GitHub → acme.sh 装不上
+       * → 所有需要 EAB 的 CA 全军覆没（certbot 又不支持 EAB），必然回退自签名。
+       * 而且管道写法违反 D1-06：下载失败被右侧 sh 吞掉。
+       */
+      name: 'D1-20 · acme.sh 退回「curl … | sh」且无国内镜像（GitHub 不通时装不上）',
+      file: 'deploy.sh',
+      anchor: 'install_acme_sh() {',
+      replacement: 'install_acme_sh() { bash -c "curl -fsSL https://get.acme.sh | sh -s email=${EMAIL}"; return 0; }\nfunction _dead_install_acme_sh() {',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把速率限制判据退回「只认 rate limit / too many / exceeded」，漏掉 acme.sh 实际的
+       * 驼峰措辞 rateLimited、Le_OrderFinalize、429。后果：acme.sh 被限流时的日志（
+       * error:rateLimited / status 429）匹配不到限流分支，掉进「未能识别」兜底，
+       * 用户只看到笼统的「签发失败」。而且原来的分支还排在「连接失败」之后，
+       * 429 的日志一旦同时含 timeout/ssl 之类词会被更宽泛的连接判据抢先吞掉，
+       * 报成「连不上 CA」——方向全错（429 恰恰说明网络是通的、请求到了 CA）。
+       */
+      name: 'D1-21 · CA 速率限制（rateLimited/429）判据漏匹配且排到「连接失败」之后',
+      file: 'deploy.sh',
+      anchor: "elif grep -qiE 'rate ?limit|ratelimited|too many|exceeded|Le_OrderFinalize|429|retry after' <<<\"$tail_log\"; then",
+      replacement: "elif grep -qiE 'rate limit|too many|exceeded' <<<\"$tail_log\"; then",
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 默认 CA 退回 letsencrypt。用户实测在公共后缀域名（*.l.cd）上反复用 LE 被
+       * rateLimited(429) 拒签，明确要求「不要再使用 LE」。LE 按「注册域名/公共后缀」
+       * 7 天共享约 50 张配额，公共后缀下所有人都挤一个池子，不适合当默认 CA；
+       * ZeroSSL 走 HTTP-01、acme.sh 能用 --email 自动换 EAB（零手工），更稳妥。
+       */
+      name: 'D1-22 · 默认 CA 退回 letsencrypt（公共后缀域名反复 rateLimited）',
+      file: 'deploy.sh',
+      anchor: 'CA_PROVIDER="zerossl"',
+      replacement: 'CA_PROVIDER="letsencrypt"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 把 acme_install_cert 退回「拿 run 返回码直接判失败」。宝塔/自编译的 nginx 不是
+       * systemd native service（systemctl reload 报 "is not active, cannot reload"），
+       * acme.sh 的 --install-cert 会先把 key/fullchain 写进指定路径、之后才跑 --reloadcmd，
+       * reload 失败时 acme.sh 返回非零打 "Reload error"，但证书其实已经装好了。
+       * 拿返回码判失败 → 误回退自签名，用户看到的是「证书签发失败」而证书其实已到手。
+       */
+      name: 'D1-23 · acme 证书落盘后仍因 reload 失败误判「安装失败」回退自签名',
+      file: 'deploy.sh',
+      anchor: '  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then\n'
+        + '    warn "acme.sh --install-cert 返回非零（多半是 --reloadcmd 那步失败）；证书可能已落盘，继续核对文件。"\n'
+        + '  fi',
+      replacement: '  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then return 1; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 「界面显示 https://localhost:8443/dav/，WebDAV 用不了」两处根因之一：
+       * Nginx 站点配置里的 /dav 反代只是一段**注释**（「应用内开启后取消注释」），
+       * 于是 https://<域名>/dav/ 根本没人转发 → 404。把 location 行退回注释态即可复现。
+       */
+      name: 'D2-01 · Nginx 的 /dav 反代退回「注释待手工启用」（界面给的地址必然 404）',
+      file: 'deploy.sh',
+      anchor: '    location ^~ /dav {',
+      replacement: '    # location ^~ /dav {',
+      testFile: 'audit16-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 同一条链路的第二种坏法：反代在、端口写死。用户改 WEBDAV_PORT 后 .env 与 Nginx
+       * 各说各话 —— 应用监听 9443、Nginx 转发 8443，界面有地址但连不上。
+       * 这是「端口只有一个事实来源」这条契约的反向对照。
+       */
+      name: 'D2-01 · Nginx 上游端口写死 8443（WEBDAV_PORT 改了也不跟，反代打空）',
+      file: 'deploy.sh',
+      anchor: '        proxy_pass https://127.0.0.1:${WEBDAV_PORT};',
+      replacement: '        proxy_pass https://127.0.0.1:8443;',
+      testFile: 'audit16-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * .env 里的 WEBDAV_PORT 写死 8443：应用侧 DEFAULT_PORT 读的是它，
+       * 于是「脚本以为的端口」与「应用实际监听的端口」脱节，反代必然打空。
+       */
+      name: 'D2-03 · .env 的 WEBDAV_PORT 写死 8443（不再跟随环境变量）',
+      file: 'deploy.sh',
+      anchor: 'WEBDAV_PORT=${WEBDAV_PORT}',
+      replacement: 'WEBDAV_PORT=8443',
+      testFile: 'audit16-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * serverUrl 退回「只拼监听地址 + 端口」——即故障现场那一版。
+       * `.env` 里 HOST=0.0.0.0，于是界面恒显示 https://localhost:8443/dav/。
+       * 变异手法：让主路径拿不到请求主机（退化成末档兜底），等价于原来的行为。
+       */
+      name: 'D2-02 · WebDAV 地址退回「只拼监听地址」（界面恒显示 localhost:8443）',
+      file: 'server/webdav-server.js',
+      anchor: '  const host = reqHost(req);',
+      replacement: "  const host = '';",
+      testFile: 'audit16-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 路由层不把 req 传下去：serverUrl 拿不到请求主机 → 退化成监听地址。
+       * 这条最隐蔽 —— 界面照常显示地址、服务照常「运行中」，静态读代码看不出问题。
+       */
+      name: 'D2-04 · WebDAV 路由不把 req 传给 serverUrl（地址静默退化成监听地址）',
+      file: 'server/routes/webdav.js',
+      anchor: '    serverUrl: webdav.serverUrl(req),',
+      replacement: '    serverUrl: webdav.serverUrl(),',
+      testFile: 'audit16-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * 前端兜底退回写死的 `https://<本机IP>:<端口>`：那不是可用地址而是伪地址，
+       * 用户照抄必然连不上，且完全看不出问题出在哪。
+       */
+      name: 'D2-05 · 前端地址兜底退回「写死 <本机IP>:端口」（误导性伪地址）',
+      file: 'public/js/syssettings.js',
+      anchor: "  const urlEl = document.getElementById('webdav-url');\n"
+        + '  if (urlEl) urlEl.textContent = w.serverUrl || (w.enabled ? webdavFallbackUrl(w) : \'—\');',
+      replacement: "  const urlEl = document.getElementById('webdav-url');\n"
+        + "  if (urlEl) urlEl.textContent = w.serverUrl || (w.enabled ? 'https://<本机IP>:' + w.port + w.mount : '—');",
+      testFile: 'audit16-regressions.test.js',
       minFail: 1,
     },
   ];

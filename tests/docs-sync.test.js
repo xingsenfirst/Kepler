@@ -591,7 +591,14 @@ test('文档：一键安装命令必须 fail-fast（-f + 先落盘再执行）�
   assert(hits.length >= 2,
     `README 与 deploy.sh 头注释都应给出一键安装命令（实际命中 ${hits.length} 处）`);
 
-  for (const h of hits) {
+  // 只有「下载 deploy.sh 本体」的行才受本护栏约束。deploy.sh 里还从
+  // raw.githubusercontent.com 拉取第三方脚本（acme.sh 本体 install_acme_sh），
+  // 那是合法的第三方源、不带 -f 也有自己的双检，不该被本仓库地址约束一并拦下。
+  const selfHits = hits.filter((h) => /\/deploy\.sh$/.test(h.url));
+  assert(selfHits.length >= 2,
+    `README 与 deploy.sh 头注释都应给出「下载 deploy.sh 本体」的一键安装命令（实际命中 ${selfHits.length} 处）`);
+
+  for (const h of selfHits) {
     const where = `${h.file}:${h.line}`;
 
     // ① 地址必须指向本仓库 main 分支下的 deploy.sh —— 写错就是 404

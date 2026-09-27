@@ -260,6 +260,20 @@ async function saveExcludes() {
 
 let webdavState = null; // { enabled, accounts, mount, port, serverUrl, running }
 
+/**
+ * 后端没给出对外地址时的兜底。
+ * 旧实现写死 `https://<本机IP>:${port}${mount}` —— 那是**服务器自己**的地址，
+ * 用户复制到资源管理器里必然连不上（端口通常也不对外放行）。
+ * 改按「此刻打开面板的地址」推断：面板本身就在域名（或内网 IP）上可达，
+ * 同一来源 + 挂载点才是客户端真正能用的地址。
+ */
+function webdavFallbackUrl(w) {
+  const mount = (w && w.mount) || '/dav';
+  const origin = (typeof location !== 'undefined' && location.origin && location.origin !== 'null')
+    ? location.origin : '';
+  return origin ? `${origin}${mount}/` : `${mount}/`;
+}
+
 function loadWebdav() {
   API.webdav().then((w) => {
     webdavState = w;
@@ -274,12 +288,12 @@ function renderWebdav(w) {
   if (swText) swText.textContent = w.enabled ? '启用' : '停用';
 
   const urlEl = document.getElementById('webdav-url');
-  if (urlEl) urlEl.textContent = w.serverUrl || (w.enabled ? `https://<本机IP>:${w.port}${w.mount}` : '—');
+  if (urlEl) urlEl.textContent = w.serverUrl || (w.enabled ? webdavFallbackUrl(w) : '—');
 
   const hint = document.getElementById('webdav-run-hint');
   if (hint) {
     if (w.running) {
-      hint.textContent = `服务运行中 · 端口 ${w.port} · 挂载点 ${w.mount}（强制 HTTPS）。`;
+      hint.textContent = `服务运行中 · 内部端口 ${w.port} · 挂载点 ${w.mount}（强制 HTTPS）；客户端填上方「服务器地址」即可，无需直连该端口。`;
       hint.style.color = '#16a34a';
     } else if (w.enabled && (!w.accounts || w.accounts.length === 0)) {
       hint.textContent = '已启用，但尚无账户。请添加至少一个账户后服务将自动启动。';
@@ -322,7 +336,7 @@ function getAccountById(id) {
 function accountCardHTML(a, w) {
   const accName = escapeHtml(a.appName || '');
   const username = escapeHtml(a.username || '');
-  const serverUrl = escapeHtml(w.serverUrl || `https://<本机IP>:${w.port}${w.mount}`);
+  const serverUrl = escapeHtml(w.serverUrl || webdavFallbackUrl(w));
   const hasPw = a.hasPassword ? '已设置' : '未设置';
   return `<div class="wd-card">
     <div class="wd-card-main">
@@ -480,7 +494,10 @@ async function deleteAccount(id) {
 }
 
 async function copyWebdavUrl() {
-  const url = (webdavState && webdavState.serverUrl) || '';
+  // 与界面上显示的地址保持一致：serverUrl 为空（自建反代未设 WEBDAV_PUBLIC_URL）时
+  // 界面显示的是兜底推断地址，这里也必须能复制同一串，否则「看得见、复制不了」。
+  const w = webdavState;
+  const url = w ? (w.serverUrl || (w.enabled ? webdavFallbackUrl(w) : '')) : '';
   if (!url || url === '—') { toast('服务未运行，暂无地址可复制', { type: 'warn' }); return; }
   try {
     await navigator.clipboard.writeText(url);

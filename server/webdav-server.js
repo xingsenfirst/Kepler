@@ -1094,9 +1094,85 @@ function buildApp() {
 
 /* ------------------------------ 生命周期 ------------------------------ */
 
-function serverUrl() {
-  const host = HOST === '0.0.0.0' ? 'localhost' : HOST;
-  return `https://${host}:${DEFAULT_PORT}${MOUNT}/`;
+/** 是否位于可信反向代理之后（与 security.js 同一判据：仅显式 TRUST_PROXY=1 才信转发头） */
+function trustProxy() {
+  return String(process.env.TRUST_PROXY || '') === '1';
+}
+
+/** 用户访问面板用的主机名[:端口]；反代后 Nginx 已按 server_name 覆写 Host，故它就是域名本身 */
+function reqHost(req) {
+  if (!req) return '';
+  const h = (typeof req.get === 'function' ? req.get('host') : '') || (req.headers && req.headers.host) || '';
+  return String(h).trim();
+}
+
+/**
+ * 本次请求是否确实经过了可信反代。
+ * 只看 `TRUST_PROXY=1` 不够：部署脚本把它写进了 `.env`，而管理员完全可能绕过 Nginx
+ * 直连应用端口（`http://IP:3000`）——那种情况下按「反代入口」拼出来的地址是错的。
+ * 因此还要求请求里真的带 Nginx 注入的转发头。
+ */
+function viaTrustedProxy(req) {
+  if (!trustProxy() || !req || !req.headers) return false;
+  return Boolean(req.headers['x-forwarded-proto'] || req.headers['x-forwarded-for']);
+}
+
+/** Nginx 注入的协议（只有 TRUST_PROXY=1 时才可信，否则可被请求方伪造） */
+function reqProto(req) {
+  if (trustProxy() && req && req.headers) {
+    const xfp = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    if (xfp === 'http' || xfp === 'https') return xfp;
+  }
+  return 'https'; // WebDAV 只跑 HTTPS，外网一律按 https 呈现
+}
+
+/**
+ * 浏览器实际连接的端口（非默认端口时才需要写进地址）。
+ *
+ * 为什么不能只看 Host：Nginx 的 `$host` 已经把端口剥掉了，所以站点跑在 8443 时
+ * 反代传来的 Host 依然是 `pan.example.com` —— 照它拼出来的是 `https://pan.example.com/dav/`，
+ * 少了端口就指向 443，客户端照样连不上。判据取两处，取到即用：
+ *   ① 请求头里带端口的 Host（自建反代可能原样透传）；
+ *   ② `X-Forwarded-Port`（部署脚本写的 Nginx 会注入 `$server_port`）。
+ * 与协议默认端口一致时返回空串，保证 443/https、80/http 的地址保持干净。
+ */
+function reqExtPort(req) {
+  if (!req || !req.headers) return '';
+  const raw = String(req.headers['x-forwarded-port'] || '').split(',')[0].trim();
+  if (!/^\d{1,5}$/.test(raw)) return '';
+  return raw;
+}
+
+/**
+ * 对外访问地址 —— 挂载到资源管理器 / Finder 时填的就是这一条。
+ *
+ * 旧实现只拼「监听地址 + 端口」：部署时 `.env` 里是 `HOST=0.0.0.0`，
+ * 于是界面**恒显示 `https://localhost:8443/dav/`**。那是**服务器自己**的回环地址，
+ * 客户端照着填必然连不上（而且 8443 是自签证书，多数客户端会直接拒绝），
+ * 表现就是「WebDAV 配置好了但用不了」。
+ *
+ * 地址必须反映「用户从哪儿访问」，按确定性从高到低取：
+ *   ① `WEBDAV_PUBLIC_URL` —— 部署脚本写入的对外基地址（Nginx `/dav/` 反代入口，含非默认端口）；
+ *   ② 面板域名 —— 请求经可信反代时，用管理员此刻访问的域名 + 实际端口（见 reqExtPort）；
+ *   ③ 直连回退 —— 未经反代时，用面板主机名 + WebDAV 自己的端口（本机/内网自测）。
+ */
+function serverUrl(req) {
+  const base = String(process.env.WEBDAV_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  if (base) return base + MOUNT + '/';
+
+  const host = reqHost(req);
+  if (host && viaTrustedProxy(req)) {
+    const proto = reqProto(req);
+    // Nginx 的 $host 不含端口；Host 自带的端口优先，其次看 X-Forwarded-Port
+    const m = /:(\d{1,5})$/.exec(host);
+    const hostOnly = m ? host.slice(0, -(m[1].length + 1)) : host;
+    const port = m ? m[1] : reqExtPort(req);
+    const defPort = proto === 'https' ? '443' : '80';
+    const shown = port && port !== defPort ? `:${port}` : '';
+    return `${proto}://${hostOnly}${shown}${MOUNT}/`;
+  }
+  if (host) return `https://${host.replace(/:\d+$/, '')}:${DEFAULT_PORT}${MOUNT}/`;
+  return `https://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${DEFAULT_PORT}${MOUNT}/`;
 }
 
 /** 读取配置，按开关状态启动或停止 HTTPS WebDAV 服务 */

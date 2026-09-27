@@ -7,20 +7,25 @@ const { requireAdmin } = require('./_shared');
 
 const router = express.Router();
 
-/** 组装返回给前端的 WebDAV 视图（含服务器地址与运行状态） */
-function webdavView() {
+/**
+ * 组装返回给前端的 WebDAV 视图（含服务器地址与运行状态）
+ *
+ * 必须带上 `req`：对外地址要按「管理员此刻访问的域名」推断，
+ * 否则界面只能显示监听地址（`https://localhost:8443/dav/`），客户端填了也连不上。
+ */
+function webdavView(req) {
   const w = configStore.getWebdav();
   return Object.assign({}, w, {
     mount: webdav.MOUNT + '/',
     port: webdav.DEFAULT_PORT,
-    serverUrl: webdav.serverUrl(),
+    serverUrl: webdav.serverUrl(req),
     running: webdav.isRunning(),
   });
 }
 
 // 查看 WebDAV 开关 / 账户列表（不含明文密码）/ 服务器地址 / 运行状态（仅管理员）
 router.get('/webdav', requireAdmin, (req, res) => {
-  res.json(webdavView());
+  res.json(webdavView(req));
 });
 
 // 启用 / 停用 WebDAV（停用后立即关闭 HTTPS 端口；仅管理员）
@@ -33,7 +38,7 @@ router.put('/webdav/enabled', requireAdmin, async (req, res) => {
     configStore.setWebdavEnabled(enabled);
     await webdav.apply();
     statsStore.addLog({ action: 'webdav.toggle', level: 'warn', detail: `${enabled ? '启用' : '停用'} WebDAV 服务（HTTPS :${webdav.DEFAULT_PORT}）` });
-    res.json(webdavView());
+    res.json(webdavView(req));
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -49,7 +54,7 @@ router.post('/webdav/accounts', requireAdmin, async (req, res) => {
     const acc = configStore.addWebdavAccount(b);
     statsStore.addLog({ action: 'webdav.account', level: 'info', detail: `新增 WebDAV 账户「${acc.appName}」（${acc.username}）` });
     await webdav.apply(); // 开关已开时新账户即时生效
-    res.json(Object.assign({ ok: true, account: acc }, webdavView()));
+    res.json(Object.assign({ ok: true, account: acc }, webdavView(req)));
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -70,7 +75,7 @@ router.put('/webdav/accounts/:id', requireAdmin, async (req, res) => {
     const acc = configStore.updateWebdavAccount(req.params.id, patch);
     statsStore.addLog({ action: 'webdav.account', level: 'info', detail: `修改 WebDAV 账户「${acc.appName}」` });
     await webdav.apply();
-    res.json(Object.assign({ ok: true, account: acc }, webdavView()));
+    res.json(Object.assign({ ok: true, account: acc }, webdavView(req)));
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -88,7 +93,7 @@ router.delete('/webdav/accounts/:id', requireAdmin, async (req, res) => {
       configStore.setWebdavEnabled(false);
     }
     await webdav.apply();
-    res.json(Object.assign({ ok: true }, webdavView()));
+    res.json(Object.assign({ ok: true }, webdavView(req)));
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }

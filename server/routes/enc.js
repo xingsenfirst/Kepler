@@ -3,7 +3,7 @@
  *  — 设置类接口仅管理员；/enc/unlock 为密码验证（限流 + 失败锁定）
  */
 const { express, security, configStore, statsStore, encStore } = require('./_context');
-const { requireAdmin } = require('./_shared');
+const { requireAdmin, asyncHandler } = require('./_shared');
 
 const router = express.Router();
 
@@ -47,7 +47,7 @@ router.put('/enc/settings', requireAdmin, async (req, res) => {
 });
 
 // 加密访问密码验证 → 签发 30 分钟查看/下载令牌（限流 + 失败锁定，防爆破）
-router.post('/enc/unlock', async (req, res) => {
+router.post('/enc/unlock', asyncHandler(async (req, res) => {
   const ip = security.clientIp(req);
   const rl = security.encUnlockLimiter(ip);
   if (!rl.ok) {
@@ -71,7 +71,7 @@ router.post('/enc/unlock', async (req, res) => {
   const t = encStore.issueToken();
   statsStore.addLog({ action: 'enc.unlock', detail: '加密访问密码验证通过（签发 30 分钟令牌）' });
   res.json({ ok: true, token: t.token, expiresIn: t.expiresIn });
-});
+}));
 
 /* ============================ 上传排除设置 ============================ */
 

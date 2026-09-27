@@ -81,6 +81,30 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+/**
+ * R17-04：把 `async` 处理器的 rejection 交回统一错误中间件。
+ *
+ * Express 4（本项目 `express@^4.19.2`）**不会**捕获 async handler 抛出的错误 ——
+ * 它只认 `next(err)`。于是 `router.get('/x', async (req, res) => { throw ... })`
+ * 一旦抛错，请求既不会 500 也不会结束，症状是**客户端一直转圈**，比 500 难排查得多
+ * （`process.on('unhandledRejection')` 只 `console.error`，不产生响应）。
+ *
+ * 用法（只包住 handlers 列表的最后一个函数）：
+ *
+ *   router.post('/x', asyncHandler(async (req, res) => { ... }));
+ *
+ * 同步 URL 层中间件（`requireAdmin` 等）**不要**包 —— 它们本就该调用 `next`。
+ * 下标不会被改变：包装后的函数仍是 `(req, res, next)` 三参签名。
+ *
+ * @param {(req, res, next) => any} fn
+ * @returns {(req, res, next) => void}
+ */
+function asyncHandler(fn) {
+  return function wrapped(req, res, next) {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 /* ============================ 配置前置条件 ============================ */
 
 /** 获取配置（未配置时抛出 428） */
@@ -526,6 +550,7 @@ Object.assign(module.exports, {
   typeOf, baseName, parentOf,
   roleOf, bucketsFor, credentialsFor,
   requireAdmin, requireConfig, validateCredentialFormat,
+  asyncHandler,
   sessionCookie, clearCookie,
   webauthnContext, splitHostPort,
   requireLocalBucket, bucketClient, requireNameConfirm,

@@ -16,7 +16,7 @@
  *  - 敏感字段（密钥 / 证书 / Secret）任何情况下都不回传明文，只回传「是否已配置」；
  *  - 审计日志只记录"哪个平台、改了什么开关"，绝不记录字段值。
  */
-const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore } = require('./_context');
+const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore, security } = require('./_context');
 const { requireAdmin } = require('./_shared');
 
 const router = express.Router();
@@ -164,6 +164,12 @@ router.put('/payment/enabled', requireAdmin, (req, res) => {
  *
  * 本机回环地址收不到公网回调，生产环境必须填对外可达的 https 地址；
  * 留空则按每次请求的 Host 兜底（仅适合本地调试）。
+ *
+ * R17-03：**形状合法 ≠ 属于本站**。该值会被 `share-routes.siteUrlFor()` 拼成
+ * `return_url` / `notify_url` 交给支付网关，支付完成后由**网关**把用户浏览器
+ * 重定向过来 —— 指向外站即是一条「经支付网关背书」的开放重定向。因此除形状外
+ * 还要能回答「这是不是本站」，判据与 HTTPS 跳转同源（`security.isOwnSiteHost`：
+ * 本机 HOST + 已配置的主域名 / 备用域名）。
  */
 router.put('/payment/site-url', requireAdmin, (req, res) => {
   try {
@@ -171,6 +177,11 @@ router.put('/payment/site-url', requireAdmin, (req, res) => {
     let url = raw.replace(/\/+$/, '');
     if (url && !/^https?:\/\/[^\s]+$/i.test(url)) {
       return res.status(400).json({ error: '站点对外地址必须是 http(s):// 开头的完整地址' });
+    }
+    if (url && !security.isOwnSiteHost(url, [req.headers.host])) {
+      return res.status(400).json({
+        error: '站点对外地址必须是本站地址（本机主机名或已在系统中配置的主域名 / 备用域名）',
+      });
     }
     const after = configStore.setPaymentSiteUrl(url);
     logChange(req, 'site-url', url ? `将站点对外地址设为 ${url}` : '清除站点对外地址（改为按请求 Host 兜底）');

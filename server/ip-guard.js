@@ -7,7 +7,9 @@
  *               （历史字段 bucketId 单值在 load() 时自动迁移为 bucketIds）
  *  - 作用范围与优先级：黑名单叠加语义——回环放行后，先判定「桶级规则」（仅当请求目标为该桶时参与），
  *    再判定「全局规则」，最后判定「按桶屏蔽海外 IP」；任一级别命中即屏蔽，全部未命中才放行。
- *  - 中间件：回环地址（127.0.0.1 / ::1）永远放行，保证本机管理界面不会被锁死
+ *  - 中间件：回环地址（127.0.0.1 / ::1）永远放行，保证本机管理界面不会被锁死。
+ *    R17-01：该豁免**只对 socket 对端地址成立** —— 经反向代理时 IP 取自
+ *    `X-Forwarded-For`（请求方可控），若照样享受豁免，任何请求头都能把自己写成「本机」。
  *  - 按桶屏蔽海外 IP：存储桶的 blockOverseasIP = true 时，访问该桶的请求仅放行国内 IP
  *    （server/china-ips.txt 白名单）与内网/回环地址，其余全部屏蔽。
  *    该开关随存储桶保存（见 config-store.js），因此可针对单个桶独立启用，互不影响。
@@ -19,6 +21,8 @@ const path = require('path');
 const configStore = require('./config-store');
 const shareStore = require('./share-store');
 const secureStore = require('./secure-store');
+// R17-01：取客户端 IP 的唯一实现点（含 X-Forwarded-For 解析与「值是否来自转发头」）
+const security = require('./security');
 
 // COS_DATA_DIR：与 stats-store / payment-orders / enc-store / share-store 一致的测试隔离
 // 开关 —— 未设置时落到项目 data/，测试进程可指向临时目录（否则用例会写真实 ipguard.json）。
@@ -503,12 +507,23 @@ function invalidateOverseasCache(bucketId) {
 
 /* ------------------------- 判定与中间件 ------------------------- */
 
-/** 从请求中提取客户端 IPv4（处理 IPv4-mapped IPv6） */
+/**
+ * 客户端 IPv4（兼容既有调用方：WebDAV 的 403 提示页用它回显 IP）。
+ *
+ * R17-01：**必须复用 `security.clientIpInfo()`——全库唯一的取 IP 实现**。
+ *
+ * 此前这里自带一份「只看 `socket.remoteAddress`、没有任何 X-Forwarded-For 分支」的
+ * 私有实现，而 `deploy.sh` 的默认部署恰好是「Nginx 反代（`proxy_pass
+ * http://127.0.0.1:$APP_PORT`）+ `TRUST_PROXY=1`」，于是守卫恒看到 `127.0.0.1`：
+ * `evaluate()` 第一条「本机永远放行」直接把请求放出去，**桶级规则 / 全局规则 /
+ * 按桶屏蔽海外 IP 一条都不会被求值** —— 界面里配得好好的屏蔽规则全是摆设，
+ * 而管理员会据此产生错误的安全假设。WebDAV（`/dav`）复用同一入口，同样失效。
+ *
+ * 同一进程里两条取 IP 路径还会分叉：限流 / 失败锁定 / 分享冻结（`security.clientIp`）
+ * 拿到真实 IP，IP 守卫拿到回环 —— 日志与审计口径也对不齐。
+ */
 function clientIp(req) {
-  let ip = (req.socket && req.socket.remoteAddress) || '';
-  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
-  if (ip === '::1') ip = '127.0.0.1';
-  return ip;
+  return security.clientIpInfo(req).ip;
 }
 
 /**
@@ -624,6 +639,8 @@ function matchRules(rules, ipInfo, method) {
  * @param {string} ip 客户端 IPv4
  * @param {string} method HTTP 方法
  * @param {string|null} bucketId 请求的目标存储桶（本地绑定 id）；null/'' 表示无桶上下文
+ * @param {{fromForwarded?: boolean}} [opts] `fromForwarded=true` 表示 `ip` 取自
+ *        `X-Forwarded-For`（请求方可控输入，见下）；省略 = 视为 socket 对端地址
  * @returns {ok: boolean, reason?: 'rule'|'overseas', rule?: object, ip: string, bucketId: string|null}
  *
  * 优先级与生效逻辑（黑名单叠加）：
@@ -633,12 +650,21 @@ function matchRules(rules, ipInfo, method) {
  * 海外屏蔽为「按桶生效」：仅当请求能解析出目标桶（bucketId 非空）且该桶开启了
  * blockOverseasIP 时才参与判定。无法解析目标桶的请求（配置管理、IP 规则管理、静态页面、
  * 全局分享页等）不受任何海外屏蔽影响 —— 避免误伤管理界面导致自己被锁在门外。
+ *
+ * R17-01：「本机永远放行」这条豁免**只对 socket 对端地址成立**。`TRUST_PROXY=1` 时
+ * IP 取自 `X-Forwarded-For`，任何人都能写一个 `127.0.0.1` 把自己变成「本机」；
+ * 若豁免照样生效，则「屏蔽规则在反代下生效」这一修复会被一个请求头整条抵消
+ * （等价于没修）。因此来自转发头的 `127.0.0.1` 按**普通 IP** 参与判定：
+ * 它仍受自己配的规则约束，而正常的本机直连（socket 即回环）不受影响。
  */
-function evaluate(ip, method, bucketId) {
+function evaluate(ip, method, bucketId, opts) {
   const m = String(method || 'GET').toUpperCase();
   const g = load();
+  const fromForwarded = Boolean(opts && opts.fromForwarded);
 
-  if (ip === '127.0.0.1' || ip === '::1') return { ok: true, ip, bucketId: bucketId || null }; // 本机永远放行
+  if (!fromForwarded && (ip === '127.0.0.1' || ip === '::1')) {
+    return { ok: true, ip, bucketId: bucketId || null }; // 本机永远放行（仅 socket 对端）
+  }
 
   const info = parseIpInfo(ip); // IPv4 / IPv6 统一结构（S10）
   if (info) {
@@ -681,8 +707,8 @@ setInterval(() => {
  * 响应形态（JSON / HTML / 纯文本）由各调用方自行决定。
  */
 function guardRequest(req) {
-  const ip = clientIp(req);
-  const v = evaluate(ip, req.method, resolveBucketId(req));
+  const info = security.clientIpInfo(req);
+  const v = evaluate(info.ip, req.method, resolveBucketId(req), { fromForwarded: info.fromForwarded });
   if (!v.ok) {
     if (v.reason === 'rule') markHit(v.rule.id); else markOverseasHit();
   }

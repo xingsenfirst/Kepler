@@ -14,6 +14,8 @@
  *  3. 敏感字段（secret）任何接口都不回传明文，仅返回「是否已配置」。
  */
 
+const { assertSafeEndpoint } = require('./endpoint-guard');
+
 /* ============================ 字段级校验器 ============================ */
 
 /** 是否是 PEM 包裹的密钥 / 证书（允许头尾前后有空行与说明文字） */
@@ -48,7 +50,15 @@ const VALIDATORS = {
     if (isBase64Blob(v, 100)) return true;
     return '不是有效的公钥：应为 PEM 格式（-----BEGIN PUBLIC KEY-----）或至少 100 字符的 Base64 密钥体';
   },
-  /** 网关 / 回调地址：必须为 https */
+  /**
+   * 网关 / 回调地址：必须为 https，且**不得指向回环 / 内网 / 云元数据地址**（SEC-03 / R17-02）。
+   *
+   * 协议合法 ≠ 地址安全：`gateway` 决定服务端把付款人送到哪里、以及服务端自己
+   * 主动出站的去向（`payment-gateway.js` 的 `alipayCreate` 生成收银台 302 跳转、
+   * `alipayQuery` 用 `fetchWithTimeout` 主动请求）。因此它必须与对象存储端点
+   * 走**同一套**主机判定（`assertSafeEndpoint`），而不是像旧实现那样只查协议 ——
+   * 否则 `https://127.0.0.1:8443/gateway.do` 之类能通过校验并存盘。
+   */
   httpsUrl(v) {
     let u;
     try {
@@ -57,6 +67,12 @@ const VALIDATORS = {
       return '不是合法的 URL 地址';
     }
     if (u.protocol !== 'https:') return '必须使用 https:// 协议';
+    // 主机层校验：云元数据 / 回环 / 内网字面量一律拒绝（允许的开关见 endpoint-guard）
+    try {
+      assertSafeEndpoint(v);
+    } catch (e) {
+      return e.message;
+    }
     return true;
   },
 };

@@ -108,20 +108,14 @@ app.use((req, res, next) => {
   return res.redirect(301, `https://${host}:${HTTPS_PORT}${req.originalUrl}`);
 });
 
-/** 允许出现在 HTTPS 跳转目标里的主机名：本机 HOST + 已配置的站点域名 */
+/**
+ * 允许出现在 HTTPS 跳转目标里的主机名：本机 HOST + 已配置的站点域名。
+ *
+ * R17-03：判据收敛到 `security.isOwnSiteHost()` —— 支付「站点对外地址」问的是
+ * 同一个问题（「这个地址是不是本站」），两处各写一份必然在某一轮只改一份。
+ */
 function isAllowedRedirectHost(host) {
-  if (!host) return false;
-  if (host === String(HOST).toLowerCase()) return true;
-  try {
-    const cfg = configStore.load();
-    const list = [cfg && cfg.domains && cfg.domains.primary, cfg && cfg.domains && cfg.domains.backup];
-    for (const d of list) {
-      if (!d) continue;
-      const h = String(d).replace(/^https?:\/\//i, '').split(/[/?#:]/)[0].trim().toLowerCase();
-      if (h && h === host) return true;
-    }
-  } catch (e) { /* 配置不可读时只认 HOST */ }
-  return false;
+  return security.isOwnSiteHost(host, [HOST]);
 }
 
 // IP 访问守卫（黑名单 + 国内白名单；回环地址永远放行，本机管理界面不会被锁死）

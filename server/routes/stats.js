@@ -5,7 +5,7 @@ const { express, configStore, statsStore } = require('./_context');
 const secureStore = require('../secure-store');
 const { LIMITS } = require('../limits');
 const { getClient, p, translateError, listAll } = require('../cos');
-const { requireConfig, requireAdmin, bucketCacheKey } = require('./_shared');
+const { requireConfig, requireAdmin, bucketCacheKey, asyncHandler } = require('./_shared');
 
 const router = express.Router();
 
@@ -146,11 +146,11 @@ router.get('/stats/summary', async (req, res) => {
 // SEC-07：日志 detail 字段包含用户名、客户端 IP、对象键、桶名
 // （如 auth.login / fs.delete / share.download），对普通用户开放等于泄露
 // 全部存储桶清单与其它用户的完整操作轨迹，违反「普通用户仅见自己可见资源」的约定。
-router.get('/stats/logs', requireAdmin, async (req, res) => {
+router.get('/stats/logs', requireAdmin, asyncHandler(async (req, res) => {
   const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
   const logs = await statsStore.getLogs({ limit, level: String(req.query.level || ''), action: String(req.query.action || '') });
   res.json({ logs });
-});
+}));
 
 /* ============================ 健康检查 ============================ */
 

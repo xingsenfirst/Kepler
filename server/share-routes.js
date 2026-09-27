@@ -22,6 +22,7 @@ const { getClient, p, tracked } = require('./cos');
 const { streamDownload } = require('./download-stream');
 const { classifyDownloadSource } = require('./share-origin');
 const { singleFlight } = require('./coalesce'); // R14-10：并发合并读（唯一实现点）
+const { asyncHandler } = require('./routes/_shared'); // R17-04：async 抛错交回统一错误中间件
 
 const router = express.Router();
 router.use(express.urlencoded({ extended: false }));
@@ -668,6 +669,10 @@ router.get('/s/:id', async (req, res) => {
 function siteUrlFor(req) {
   let base = '';
   try { base = String((configStore.getPayment().siteUrl || '')).trim(); } catch (e) { base = ''; }
+  // R17-03：`PUT /payment/site-url` 已校验「必须属本站」，但配置可能是旧版本写入、
+  // 或管理员直接改写了配置文件。这里再兜一次：地址不属本站时退回按请求 Host 推断，
+  // 宁可回落到本次访问的主机，也不把付款人 302 到外站。
+  if (base && !security.isOwnSiteHost(base, [])) base = '';
   if (!base) {
     const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
     base = proto + '://' + (req.headers.host || '127.0.0.1');
@@ -681,7 +686,7 @@ function chargeSubject(l) {
 }
 
 /** 发起支付：创建 pending 订单 → 调网关下单 → 跳转收银台或展示二维码 */
-router.post('/s/:id/pay', async (req, res) => {
+router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const st = shareStore.status(l);
@@ -764,7 +769,7 @@ router.post('/s/:id/pay', async (req, res) => {
   if (charge.kind === 'qrcode') return qrPayPage(res, l, order, ps, charge);
   if (charge.kind === 'redirect' && charge.url) return res.redirect(302, charge.url);
   return payingPage(res, l, order, ps);
-});
+}));
 
 /**
  * 向网关查单并落地订单状态 —— **支付结果判定的唯一入口**。
@@ -841,7 +846,7 @@ function payCheckRateLimited(req, res, l) {
 }
 
 /** 支付完成后的回跳（支付宝 return_url / PayPal return_url） */
-router.get('/s/:id/pay/return', async (req, res) => {
+router.get('/s/:id/pay/return', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
@@ -849,10 +854,10 @@ router.get('/s/:id/pay/return', async (req, res) => {
   if (payCheckRateLimited(req, res, l)) return undefined; // R8-20
   await finalizeOrderThrottled(l, order);
   return res.redirect(303, '/s/' + l.id);
-});
+}));
 
 /** 手动触发一次查单（「我已完成支付」按钮） */
-router.post('/s/:id/pay/check', async (req, res) => {
+router.post('/s/:id/pay/check', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
@@ -860,7 +865,7 @@ router.post('/s/:id/pay/check', async (req, res) => {
   if (payCheckRateLimited(req, res, l)) return undefined; // R8-20
   await finalizeOrderThrottled(l, order);
   return res.redirect(303, '/s/' + l.id);
-});
+}));
 
 /**
  * 轮询支付状态（供支付中 / 二维码页面使用）。
@@ -868,7 +873,7 @@ router.post('/s/:id/pay/check', async (req, res) => {
  * 微信 Native 没有回跳，只能靠这里推进：每次被轮询时主动向网关查单。
  * 为避免被刷成网关压力，同一订单最快 3 秒查一次网关（页面轮询间隔同为 3 秒）。
  */
-router.get('/s/:id/pay/status', async (req, res) => {
+router.get('/s/:id/pay/status', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return res.status(404).json({ error: '链接不存在' });
   const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
@@ -895,7 +900,7 @@ router.get('/s/:id/pay/status', async (req, res) => {
   }
   const o = paymentOrders.get(order.id) || order;
   res.json({ state: o.status, paid: o.status === 'paid' });
-});
+}));
 
 /**
  * 网关异步通知（仅作**触发信号**，不采信其内容判定结果）。
@@ -903,7 +908,7 @@ router.get('/s/:id/pay/status', async (req, res) => {
  * 放在 `/pay/*` 而不是 `/api/*`：后者对非安全方法强制同源头与登录态，
  * 网关回调两样都没有，放过去必然 403。
  */
-router.post('/pay/notify/:platform', async (req, res) => {
+router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {
   const platform = String(req.params.platform || '');
   if (!paymentProviders.isKnown(platform)) return res.status(404).end();
 
@@ -935,7 +940,7 @@ router.post('/pay/notify/:platform', async (req, res) => {
     if (l) await finalizeOrder(l, order);
   }
   return done();
-});
+}));
 
 /**
  * 异步通知的真实性校验（SEC-03）
@@ -1037,7 +1042,7 @@ function shareCookieOptions(id) {
   };
 }
 
-router.post('/s/:id', async (req, res) => {
+router.post('/s/:id', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const st = shareStore.status(l);
@@ -1068,7 +1073,7 @@ router.post('/s/:id', async (req, res) => {
   statsStore.addLog({ action: 'share.auth', detail: `分享链接 ${l.id} 密码验证失败（IP：${ip}）`, level: 'warn' });
   if (left > 0) return passwordPage(res, l, true, `密码错误次数过多，该链接已临时冻结，请 ${left} 秒后重试`);
   return passwordPage(res, l, true);
-});
+}));
 
 /* ------------------------------ 下载 ------------------------------ */
 

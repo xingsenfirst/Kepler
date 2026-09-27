@@ -1661,6 +1661,97 @@ const CASES = [
       testFile: 'audit16-regressions.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * R17-01：把 ip-guard 的取 IP 退回「只看 socket.remoteAddress」——即故障现场那一版。
+       * 默认部署是「Nginx 反代 + TRUST_PROXY=1」，socket 对端恒为 127.0.0.1，
+       * 于是守卫判定的永远是回环地址，紧接着被「本机永远放行」短路。
+       * 症状是**所有屏蔽规则整体失效而界面一切正常**。
+       */
+      name: 'R17-01 · ip-guard 取 IP 退回「只看 socket」（反代下恒见 127.0.0.1）',
+      file: 'server/ip-guard.js',
+      anchor: 'function clientIp(req) {\n  return security.clientIpInfo(req).ip;\n}',
+      replacement: "function clientIp(req) {\n  return (req && req.socket && req.socket.remoteAddress) || '';\n}",
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-01：把「回环豁免」退回**无条件**。此时 TRUST_PROXY=1 下任何人只要发一个
+       * `X-Forwarded-For: 127.0.0.1` 就把自己变成「本机」——R17-01 的修复被一个请求头
+       * 整条抵消（等价于没修）。这条对照钉的就是「豁免只对 socket 对端成立」。
+       */
+      name: 'R17-01 · 「本机永远放行」退回无条件（一个 XFF: 127.0.0.1 即重获豁免）',
+      file: 'server/ip-guard.js',
+      anchor: '  if (!fromForwarded && (ip === \'127.0.0.1\' || ip === \'::1\')) {',
+      replacement: "  if (ip === '127.0.0.1' || ip === '::1') {",
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-02：把 `httpsUrl` 退回「只查协议不查主机」——即报告里的原始实现。
+       * 于是 `https://127.0.0.1:8443/gateway.do`、云元数据地址都能通过支付设置校验并存盘，
+       * 服务端会带着商户私钥主动出站（`alipayQuery`），并把下载者 302 过去。
+       */
+      name: 'R17-02 · 支付宝网关地址退回「只查协议」（内网 / 元数据地址被放行）',
+      file: 'server/payment-providers.js',
+      anchor: '    try {\n      assertSafeEndpoint(v);\n    } catch (e) {\n      return e.message;\n    }\n',
+      replacement: '',
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-03：把「站点对外地址」退回「只查形状」。该值会被拼成 return_url 交给支付
+       * 网关，支付完成后由网关把用户浏览器重定向过来 —— 指向外站就是一条经网关背书的
+       * 开放重定向（地址栏走的是支付宝 → 攻击者站点）。
+       */
+      name: 'R17-03 · 「站点对外地址」退回「只查形状」（外站可被当作回跳目标）',
+      file: 'server/routes/payment.js',
+      anchor: 'if (url && !security.isOwnSiteHost(url, [req.headers.host])) {',
+      replacement: 'if (url && false) {',
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-03 的第二道：`siteUrlFor()` 对**配置值**的兜底校验。保存路径已挡了外站，
+       * 但配置可能是旧版本写入或手改的文件 —— 少了这道兜底，展示层会把付款人 302 到外站。
+       */
+      name: 'R17-03 · siteUrlFor 不再兜底校验配置值（旧配置可把付款人 302 到外站）',
+      file: 'server/share-routes.js',
+      anchor: "  if (base && !security.isOwnSiteHost(base, [])) base = '';",
+      replacement: "  if (false) base = '';",
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-04：asyncHandler 把抛错「吞掉」而不是交给 next(err)。Express 4 既不接
+       * async 抛错、这里又不转交，于是客户端拿不到任何响应 —— 请求永久挂起（转圈），
+       * 比 500 更难排查。
+       */
+      name: 'R17-04 · asyncHandler 吞掉抛错而非 next(err)（请求永久挂起）',
+      file: 'server/routes/_shared.js',
+      anchor: '    Promise.resolve(fn(req, res, next)).catch(next);',
+      replacement: '    Promise.resolve(fn(req, res, next)).catch(() => {});',
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R17-04 的第二道：某个公开匿名可达的 async 处理器退回「裸 async」。
+       * 静态上少一层包装看不出来，实际效果是这条路径的抛错不再有兜底 ——
+       * 正是 8 处清单要钉住的契约。
+       */
+      name: 'R17-04 · /s/:id/pay 退回裸 async handler（该路径抛错即挂起）',
+      file: 'server/share-routes.js',
+      anchor: "router.post('/s/:id/pay', asyncHandler(async (req, res) => {",
+      replacement: "router.post('/s/:id/pay', async (req, res) => {",
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

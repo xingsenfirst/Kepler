@@ -27,20 +27,96 @@ function secureCookieAttr() {
 }
 
 /**
+ * 回环 / IPv4-mapped IPv6 归一化：`::ffff:127.0.0.1` → `127.0.0.1`、`::1` → `127.0.0.1`。
+ * 全库只有这一份写法（ip-guard 曾自带一份等价的私有实现，见下）。
+ */
+function normalizeIp(raw) {
+  let ip = String(raw == null ? '' : raw).trim();
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip === '::1') ip = '127.0.0.1';
+  return ip;
+}
+
+/**
+ * 取「反向代理注入的真实客户端 IP」：仅 `TRUST_PROXY=1` 且确有 `X-Forwarded-For`
+ * 时返回首段（最接近真实客户端的值），否则返回空串。
+ *
+ * R17-01：这是全库**唯一一份** XFF 解析实现。此前 `ip-guard.js` 自带了另一份
+ * 「只看 `socket.remoteAddress`、没有任何 XFF 分支」的实现，而 `deploy.sh` 生成的
+ * 默认部署恰好是「Nginx 反代 + `TRUST_PROXY=1`」——于是同一进程里两条取 IP 路径分叉：
+ * 限流 / 失败锁定 / 分享冻结拿到真实 IP，IP 守卫却永远拿到 Nginx 的回环地址。
+ */
+function forwardedClientIp(req) {
+  if (!TRUST_PROXY) return '';
+  const h = req && req.headers;
+  const xf = String((h && h['x-forwarded-for']) || '');
+  if (!xf) return '';
+  return xf.split(',')[0].trim();
+}
+
+/**
+ * 取客户端 IP **以及它的来源**（R17-01）。
+ *
+ * 返回「来源」是必需的：开启 `TRUST_PROXY` 后 IP 取自请求头，属**请求方可控输入**，
+ * 调用方必须据此决定还能不能套用「回环永远放行」——否则任何人只要发一个
+ * `X-Forwarded-For: 127.0.0.1` 就重新变成「本机」，屏蔽规则被一个请求头整条绕过。
+ * 只返回字符串时这两件事无法区分（旧的 `ip-guard.clientIp()` 正是这么丢掉了信息）。
+ *
+ * @returns {{ip: string, fromForwarded: boolean}} fromForwarded=true 表示该值来自请求头
+ */
+function clientIpInfo(req) {
+  const fwd = forwardedClientIp(req);
+  if (fwd) return { ip: normalizeIp(fwd), fromForwarded: true };
+  const raw = (req && req.socket && req.socket.remoteAddress) || (req && req.ip) || '';
+  return { ip: normalizeIp(raw), fromForwarded: false };
+}
+
+/**
  * 取客户端 IP（N1 修复）：
- *  - 默认（未配置可信代理）：直接使用 socket.remoteAddress，与 ip-guard.js 一致，不信任 XFF
+ *  - 默认（未配置可信代理）：直接使用 socket.remoteAddress，不信任 XFF
  *  - TRUST_PROXY=1（部署在反向代理后）：信任 XFF 首段（最接近真实客户端的值）
+ *
+ * R17-01：`ip-guard.js` 直接复用本函数，不再自带一份实现 —— 同一逻辑两份实现，
+ * 必然在某一轮改动里只改一份（本轮就是）。
  */
 function clientIp(req) {
-  const xf = String(req.headers['x-forwarded-for'] || '');
-  if (TRUST_PROXY && xf) {
-    const first = xf.split(',')[0].trim();
-    if (first) return first;
-  }
-  let ip = (req.socket && req.socket.remoteAddress) || req.ip || '';
-  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
-  if (ip === '::1') ip = '127.0.0.1'; // 统一回环表示，与 ip-guard 一致
-  return ip;
+  return clientIpInfo(req).ip;
+}
+
+/**
+ * 主机名归一化：去首尾空白、小写、剥掉 `http(s)://` 前缀、去掉端口与路径。
+ * 空 / 非法输入返回 `''`（调用方一律按「不匹配」处理）。
+ */
+function normalizeHost(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  return s.replace(/^[a-z]+:\/\//, '').split(/[/?#]/)[0].split(':')[0].trim();
+}
+
+/**
+ * 该主机名是否属于「本站自身」（R17-03）：本机 `HOST` + 配置里的主/备站点域名
+ * + 调用方补充的允许主机（如当前请求的 `Host`）。
+ *
+ * 用于回答「这个地址是不是本站」——支付「站点对外地址」与 HTTPS 跳转目标都要问
+ * 同一个问题，因此收敛到这一处（`index.js` 的同名判据已改为调用本函数）。
+ * 配置读取走惰性 require，避免 security → config-store → … 的加载顺序耦合。
+ *
+ * @param {string} host 待判定的主机名（可带协议前缀 / 端口）
+ * @param {string[]} [extra] 调用方补充的允许主机
+ * @returns {boolean}
+ */
+function isOwnSiteHost(host, extra) {
+  const h = normalizeHost(host);
+  if (!h) return false;
+  const own = new Set([normalizeHost(DEPLOY_HOST)]);
+  try {
+    const cfg = require('./config-store').load();
+    own.add(normalizeHost(cfg && cfg.domains && cfg.domains.primary));
+    own.add(normalizeHost(cfg && cfg.domains && cfg.domains.backup));
+  } catch (e) { /* 配置不可读时只认本机 HOST */ }
+  for (const e of extra || []) own.add(normalizeHost(e));
+  own.delete('');
+  return own.has(h);
 }
 
 /* ============================ CSRF ============================ */
@@ -301,6 +377,8 @@ const shareViewLimiter = createLimiter({ name: 'share-view', windowMs: 10 * 60 *
 module.exports = {
   DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY,
   secureCookieAttr, clientIp,
+  // R17-01：唯一的 XFF 解析实现 + 「IP 及其来源」；R17-03：「这个地址是不是本站」
+  normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
   csrfGuard, SAFE_METHODS,
   createLimiter, limitMiddleware,
   createFailLock,

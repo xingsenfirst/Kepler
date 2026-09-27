@@ -341,7 +341,7 @@
                 </label>
               </h3>
               <div class="enc-warn">
-                <b>简要说明</b>：启用后，系统会在独立端口提供 <b>WebDAV over HTTPS</b> 服务，可将当前存储桶挂载到系统文件管理器（Windows 资源管理器 / macOS Finder）或支持 WebDAV 的应用中。<b>由于涉及密钥传输和解密，本功能强制要求 TLS 加密传输</b>；访问需使用下方账户进行 Basic 认证，账户密码均加密存储于服务器端。
+                <b>简要说明</b>：启用后，系统会在独立端口提供 WebDAV 服务，可将当前存储桶挂载到系统文件管理器（Windows 资源管理器 / macOS Finder）或支持 WebDAV 的应用中。
               </div>
 
               <div class="form-item">
@@ -365,7 +365,6 @@
                 <ul class="note-list">
                   <li>每个账户包含应用名称、用户名与密码；第三方应用挂载时以<b>用户名 + 密码</b>完成 Basic 认证。</li>
                   <li>账户口令以 AES-256-GCM 字段级加密后随本地配置保存（<code>data/config.enc</code>）。</li>
-                  <li>因使用自签名证书，部分客户端首次连接需信任证书。</li>
                 </ul>
               </div>
             </div>
@@ -478,7 +477,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Standard V1.2.2</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.2.2</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

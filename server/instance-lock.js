@@ -42,6 +42,31 @@ function readLock() {
 }
 
 /**
+ * R21-10：接管「读不出持有者」的锁之前，必须先确认这个文件**已经足够旧**。
+ *
+ * `fs.writeFileSync(file, payload, { flag: 'wx' })` 只保证「**创建**」是原子的
+ * （O_CREAT|O_EXCL），而**创建与内容落盘不是同一个原子步骤** —— 内核先建出 0 字节
+ * 文件并返回 fd，进程再写入。若 B 恰好落在 A「已创建、内容尚未落盘」这个窗口里
+ * `readFileSync`，拿到的是空串 → `JSON.parse` 抛错 → `readLock()` 返回 `null`；
+ * 旧实现把 `!cur` 直接当作「锁损坏 / 无主」，于是 `unlink` 掉 A **正在持有**的锁并
+ * 接管。两个进程同时认为持锁，`config.enc` 被交替整体覆盖 —— 正是这把锁要防的事。
+ *
+ * 现在把「读到空 / 坏内容」与「确认无主」区分开：内容不可解析时，只有 mtime 超过
+ * 宽限期才允许接管；新鲜的空锁一律按「有人正在建」处理，直接判为被占用。
+ * 真正的崩溃残留（进程已死）仍由 `pidAlive` 判定接管，不受本宽限期影响。
+ */
+const LOCK_SHAPE_GRACE_MS = 2000;
+
+/** 锁文件自最后一次修改以来的毫秒数；文件已不存在时返回 Infinity（并发释放 → 不该因「新鲜」而拒接管） */
+function lockAgeMs() {
+  try {
+    return Math.max(0, Date.now() - fs.statSync(LOCK_FILE).mtimeMs);
+  } catch (e) {
+    return Infinity;
+  }
+}
+
+/**
  * 尝试获取单实例锁。
  * @returns {{ ok: true } | { ok: false, stale: boolean, pid: number|null }}
  *   ok=false 且 stale=true 表示旧锁持有者已不存在（调用方可选择 force 接管）
@@ -68,6 +93,11 @@ function acquire({ force = false } = {}) {
     if (e && e.code === 'EEXIST') {
       // 锁文件已存在但持有者已死（或内容损坏）→ 清理后重试一次
       const cur = readLock();
+      // R21-10：内容不可解析 ≠ 无主。别人可能只是「刚建好、内容还没落盘」——
+      // 宽限期内一律按被占用处理，绝不 unlink（详见 lockAgeMs 上的说明）。
+      if (!cur && !force && lockAgeMs() < LOCK_SHAPE_GRACE_MS) {
+        return { ok: false, stale: false, pid: null };
+      }
       if (!cur || !cur.pid || !pidAlive(cur.pid) || force) {
         try {
           fs.unlinkSync(LOCK_FILE);

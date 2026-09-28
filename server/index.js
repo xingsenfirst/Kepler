@@ -102,20 +102,32 @@ app.use((req, res, next) => {
   }
   // SEC-05：跳转目标不能直接取 Host 头 —— 它是客户端可控的，直接拼接就成了
   // 开放重定向（`https://evil.example:3443/...` 看起来像是本站的链接）。
-  // 只认「本机配置的 HOST」与「已配置的站点域名」，其余一律回退 HOST。
-  const raw = String(req.headers.host || '').split(':')[0].trim().toLowerCase();
-  const host = isAllowedRedirectHost(raw) ? raw : HOST;
-  return res.redirect(301, `https://${host}:${HTTPS_PORT}${req.originalUrl}`);
+  // 只认「本机配置的 HOST」与「已配置的站点域名」，其余走回退（R21-13：回退时
+  // 优先取配置的站点域名，避免落到 `0.0.0.0` 这种不可解析的通配绑定地址）。
+  const pick = security.httpsRedirectHost(req.headers.host);
+  if (pick.fallbackToBindAll) warnBindAllRedirect();
+  return res.redirect(301, `https://${pick.host}:${HTTPS_PORT}${req.originalUrl}`);
 });
 
 /**
- * 允许出现在 HTTPS 跳转目标里的主机名：本机 HOST + 已配置的站点域名。
+ * R21-13：回退用的跳转目标由 `security.httpsRedirectHost()` 统一决定
+ * （允许的请求 Host → 配置的站点域名 → 本机 HOST）。
  *
- * R17-03：判据收敛到 `security.isOwnSiteHost()` —— 支付「站点对外地址」问的是
- * 同一个问题（「这个地址是不是本站」），两处各写一份必然在某一轮只改一份。
+ * `Dockerfile` 里 `HOST=0.0.0.0`（容器必须监听通配地址才能被外部访问），而
+ * `0.0.0.0` 作为**跳转目标**毫无意义 —— 按 README 的 Docker 快速启动（不注入
+ * `TRUST_PROXY`、不配置站点域名）访问 `http://<服务器>:3000`，会被 301 到
+ * `https://0.0.0.0:3443/…`。这里只保留「告警」这一件事：判定本身在 security.js，
+ * 与支付「站点对外地址」共用同一份「这个主机是不是本站」的判据。
  */
-function isAllowedRedirectHost(host) {
-  return security.isOwnSiteHost(host, [HOST]);
+let warnedBindAllRedirect = false;
+
+function warnBindAllRedirect() {
+  if (warnedBindAllRedirect) return;
+  warnedBindAllRedirect = true;
+  statsStore.addLog({
+    action: 'http.redirect', level: 'warn',
+    detail: `HTTPS 跳转目标回退到了通配绑定地址 ${HOST}（不可解析）—— 请把 HOST 设为对外域名，或在配置里填写站点域名`,
+  });
 }
 
 // IP 访问守卫（黑名单 + 国内白名单；回环地址永远放行，本机管理界面不会被锁死）

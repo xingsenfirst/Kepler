@@ -92,6 +92,20 @@ const cookieName = (id) => 'sp_' + id;
 /** 已支付订单票据（与密码票据分开存放，互不干扰） */
 const payCookieName = (id) => 'sp_' + id + '_pay';
 
+/**
+ * R21-01：加密访问令牌在**分享侧**的存放位置。
+ *
+ * 分享页是服务端渲染的（下载入口就是一条普通 `<a href="/s/:id/dl">` 导航），
+ * 没法像管理端那样给 `fetch` 挂 `X-Enc-Token` 请求头 —— 而服务端**只有**
+ * `GET /s/:id/dl` 与 `HEAD /s/:id/dl` 会解密下发。因此分享侧另发一枚
+ * HttpOnly Cookie，作用域限定 `path: '/s/'`：
+ *   · 它不会出现在 URL / 浏览器历史 / Referer / 访问日志里（与 S5 同一条理由）；
+ *   · 它**不会被任何 `/api/**` 请求携带** —— 管理端仍只认请求头，两套互不干扰。
+ * 令牌本身与管理端同一枚（`encStore.issueToken()`：30 分钟、与查看密码哈希绑定，
+ * 改密即全部失效）。
+ */
+const ENC_COOKIE = 'ke_enc';
+
 /** 轮询查单的最小间隔（毫秒）—— 与页面轮询间隔一致，避免被刷成网关压力 */
 const STATUS_QUERY_MIN_GAP_MS = 3000;
 const statusQueryAt = new Map(); // orderId -> 上次查单时间戳
@@ -166,6 +180,48 @@ function getCookie(req, name) {
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ---------------------- R21-01：加密访问门禁 ---------------------- */
+
+/**
+ * 本次访问是否必须**先过「加密访问密码」**。
+ *
+ * 判据与 `.routes/fs.js` 的 `/fs/download`、`/fs/head` 完全一致
+ * （`encMeta && encStore.passwordSet()`）—— 全库只有这一份实现，分享侧直接复用，
+ * 避免同一件事出现第二种口径。
+ *
+ * 背景：README「查看密码」一节写的是「设置后**查看 / 下载**加密文件前须验证」，
+ * 而分享下载路径此前**完全没有这道门禁**：任何登录用户（无需管理员、无需知道
+ * 加密访问密码）对自己看得见的密文对象建一条分享链接，访问 `/s/:id/dl` 即可
+ * 拿到**解密后的明文**；匿名访客拿到这样一条链接同样能下载。服务端「加密」的
+ * 唯一访问控制在分享路径上被整体绕过。
+ */
+function encGateNeeded(l) {
+  if (!l) return false;
+  if (!encStore.passwordSet()) return false; // 未设访问密码 → 加密只是静态保护，不拦下载
+  return !!encStore.getMeta(l.bucket, l.key); // 只有密文对象才需要解密权限
+}
+
+/** 分享侧加密令牌：优先请求头（脚本 / curl），其次本页作用域的 Cookie */
+function encTokenOf(req) {
+  const h = String(req.get('x-enc-token') || '');
+  return h || getCookie(req, ENC_COOKIE);
+}
+
+function encUnlocked(req) {
+  return encStore.verifyToken(encTokenOf(req));
+}
+
+/** 加密访问令牌 Cookie 的选项（与分享密码 Cookie 同样：HttpOnly + 部署模式 Secure） */
+function encCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: !!security.IS_DEPLOY,
+    maxAge: encStore.TOKEN_TTL_MS,
+    path: '/s/', // 只发给分享路由，绝不进入 /api/**
+  };
 }
 
 function fmtSize(bytes) {
@@ -626,6 +682,12 @@ router.get('/s/:id', async (req, res) => {
     }
   }
 
+  /* R21-01：密文对象 + 已设「加密访问密码」→ 与 `/api/fs/download` **同一道门禁**。
+   *
+   * 位置与分享密码同层、且**早于**付费与下载入口：本页会给出一条 `/s/:id/dl` 链接，
+   * 如果先渲染下载按钮再在下载时拦，用户看到的仍是一个"能点"的按钮。 */
+  if (encGateNeeded(l) && !encUnlocked(req)) return encUnlockPage(res, l, false);
+
   // ---- 付费下载（第四种限制）----
   const ps = paidStateFor(l);
   if (ps.effective) {
@@ -752,7 +814,11 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     order,
     subject: chargeSubject(l),
     returnUrl: `${base}/s/${encodeURIComponent(l.id)}/pay/return`,
-    notifyUrl: `${base}/pay/notify/${encodeURIComponent(platform)}`,
+    // R21-06：回调地址必须与**实际下单渠道**同源。旧实现取的是请求体里的 `platform`，
+    // 而命中「复用在途 pending 订单」分支时下单走的是 `order.platform` —— 客户端提交
+    // 另一条渠道（两者都能通过 available 校验）就会「下单走 A、回调地址写 B」，真实
+    // 异步通知被 B 的验签拒绝而丢弃，只能靠页面轮询推进（关掉浏览器支付即挂起）。
+    notifyUrl: `${base}/pay/notify/${encodeURIComponent(chargePlatform)}`,
     cancelUrl: `${base}/s/${encodeURIComponent(l.id)}`,
   });
 
@@ -1031,6 +1097,33 @@ function passwordPage(res, l, wrong, customMsg) {
   });
 }
 
+/**
+ * R21-01：加密访问密码输入页。
+ *
+ * 与 `passwordPage`（分享链接自身密码）刻意分成两个页面、两条表单：两者是**独立**
+ * 的访问控制（一个是分享者设的链接密码，一个是管理员设的全站加密访问密码），
+ * 混在一张表单里会让人以为「输一次就够了」。
+ */
+function encUnlockPage(res, l, wrong, customMsg) {
+  const msg = typeof customMsg === 'string' && customMsg
+    ? esc(customMsg)
+    : (wrong ? '密码不正确，请重试。' : '');
+  renderPage(res, wrong ? 401 : 200, {
+    title: '加密文件访问验证',
+    head: `<div class="center-head">
+      <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:20px">🔐</div>
+      <h1>该文件已加密存储</h1>
+      <p class="sub">请输入系统设置的「加密访问密码」，验证通过后才能下载明文。</p>
+      </div>`,
+    body: `
+      <form method="POST" action="/s/${esc(l.id)}/unlock" style="margin-top:16px">
+        ${msg ? `<div class="warn">${msg}</div>` : ''}
+        <input type="password" name="password" placeholder="加密访问密码" autofocus autocomplete="off" required>
+        <button class="btn primary" type="submit">验证并继续下载</button>
+      </form>`,
+  });
+}
+
 /** 分享密码 Cookie 的统一选项（SEC-10：部署模式下必须带 Secure，与主会话一致） */
 function shareCookieOptions(id) {
   return {
@@ -1041,6 +1134,45 @@ function shareCookieOptions(id) {
     path: '/',
   };
 }
+
+/**
+ * R21-01：分享侧的「加密访问密码」验证 → 签发分享作用域的加密令牌。
+ *
+ * 校验与限流复用管理端 `POST /api/enc/unlock` 的**同一批实现**
+ * （`encStore.checkPassword` 异步 scrypt + `security.encUnlockLimiter` /
+ * `encUnlockLock` 的 IP 级限流与指数退避冻结），差别只在令牌的**携带方式**：
+ * 分享页是服务端渲染的普通导航，挂不了自定义请求头，故走 `path: '/s/'` 的
+ * HttpOnly Cookie。
+ */
+router.post('/s/:id/unlock', asyncHandler(async (req, res) => {
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
+  const st = shareStore.status(l);
+  if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  if (!encGateNeeded(l)) return res.redirect(303, '/s/' + l.id); // 无需验证（未设密码 / 明文对象）
+
+  const ip = security.clientIp(req);
+  const rl = security.encUnlockLimiter(ip);
+  if (!rl.ok) {
+    res.setHeader('Retry-After', String(rl.retryAfter));
+    return encUnlockPage(res, l, true, `尝试过于频繁，请 ${rl.retryAfter} 秒后重试`);
+  }
+  const lockedLeft = security.encUnlockLock.locked(ip);
+  if (lockedLeft > 0) return encUnlockPage(res, l, true, `失败次数过多，请 ${lockedLeft} 秒后重试`);
+
+  const pw = String((req.body && req.body.password) || '');
+  if (!(await encStore.checkPassword(pw))) {
+    const left = security.encUnlockLock.fail(ip);
+    statsStore.addLog({ action: 'enc.unlock', level: 'warn', detail: `分享页加密访问密码验证失败（链接 ${l.id}，IP：${ip}）` });
+    if (left > 0) return encUnlockPage(res, l, true, `失败次数过多，请 ${left} 秒后重试`);
+    return encUnlockPage(res, l, true);
+  }
+  security.encUnlockLock.reset(ip);
+  const t = encStore.issueToken();
+  res.cookie(ENC_COOKIE, t.token, encCookieOptions());
+  statsStore.addLog({ action: 'enc.unlock', detail: `分享页加密访问密码验证通过（链接 ${l.id}，IP：${ip}，签发 30 分钟令牌）` });
+  return res.redirect(303, '/s/' + l.id);
+}));
 
 router.post('/s/:id', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
@@ -1109,6 +1241,10 @@ router.head('/s/:id/dl', (req, res) => {
     const token = getCookie(req, cookieName(l.id));
     if (!shareStore.verifyToken(l, token)) return res.redirect(303, '/s/' + l.id); // 与 GET 一致
   }
+  /* R21-01：密文对象的加密门禁同样要在这里判定，理由与上一条完全相同 ——
+   * 探测（HEAD）与真实下载必须看到同一结果，否则 HEAD 会以 200 + Content-Length
+   * 告诉你「这个密文文件多大」，而 GET 只把你送回分享页。 */
+  if (encGateNeeded(l) && !encUnlocked(req)) return res.redirect(303, '/s/' + l.id);
   const ps = paidStateFor(l);
   if (ps.effective && payerStateFor(l, req).state !== 'paid') {
     return res.status(402).end(); // 与 payBlockedPage 的状态码一致
@@ -1133,6 +1269,13 @@ router.get('/s/:id/dl', async (req, res) => {
     const token = getCookie(req, cookieName(l.id));
     if (!shareStore.verifyToken(l, token)) return res.redirect(303, '/s/' + l.id);
   }
+
+  /* R21-01：加密门禁必须**早于** tryAcquire（占用下载名额）。
+   *
+   * 与付费拦截同一条纪律：没通过访问控制的人一字节都拿不到，就不该消耗额度 ——
+   * 否则反复探测密文链接既能刷光 maxDownloads，也让「剩余次数」变成可观测的
+   * 侧信道。判据与 `/api/fs/download` / `/api/fs/head` 共用 {@link encGateNeeded}。 */
+  if (encGateNeeded(l) && !encUnlocked(req)) return res.redirect(303, '/s/' + l.id);
 
   // ---- 付费下载拦截 ----
   // 必须**早于** tryAcquire：未支付的请求不应消耗下载次数，

@@ -141,9 +141,31 @@ function isS3(id) {
 function endpointFor(id, region) {
   const p = resolve(id);
   if (p.endpointTemplate && region) {
-    return p.endpointTemplate.replace('{region}', String(region).trim());
+    return p.endpointTemplate.replace('{region}', safeRegion(region));
   }
   return p.endpoint || '';
+}
+
+/**
+ * R21-12：`region` 会被**直接拼进端点模板**（`s3.{region}.amazonaws.com`），
+ * 因此它的字符集必须是「不可能改变主机或路径」的那种。
+ *
+ * 旧实现只做 `String(region).trim()`。而厂商默认端点这条路**不过**
+ * `assertSafeEndpoint` —— `cos.js` 里只有用户自定义的 `cfg.endpoint` 走校验
+ * （且 `assertSafeEndpoint('')` 是 no-op）。于是 `region` 里带 `/`、`?`、`#`
+ * 就能改写模板端点的主机 / 路径，把出站请求引向别处。收敛字符集比事后解析更可靠：
+ * 合法地域名只含字母、数字、`.`、`-`、`_`。
+ */
+const REGION_SAFE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function safeRegion(region) {
+  const r = String(region).trim();
+  if (!REGION_SAFE_RE.test(r)) {
+    const err = new Error('存储地域（region）含有非法字符，请检查配置');
+    err.status = 400;
+    throw err;
+  }
+  return r;
 }
 
 module.exports = {

@@ -38,6 +38,41 @@ function normalizeIp(raw) {
 }
 
 /**
+ * R22-02：语法上是否是一个 IP **字面量**（不接受端口 / 域名 / 任意字符串）。
+ *
+ * 为什么必须有这道校验：`X-Forwarded-For` 即便在 `TRUST_PROXY=1` 下也仍是
+ * **请求方可控输入**。若取值不做格式校验，攻击者可以给每个请求**换一个不同的非法串**
+ * （`a`、`b`、`c`…），而限流键与失败锁定键正是 `ip` / `ip|username` —— 键随头轮换，
+ * 等于把「按 IP 限流 + 账户锁定」整条绕开（比「取首段」本身更致命）。
+ * 把「不是 IP 的一律不接受」收敛到这一处，杜绝各处自行判断。
+ *
+ * 只做**语法**判定，不判归属：内网 / 回环地址在局域网部署里是完全合法的客户端 IP，
+ * 归属（公网 / 内网 / 国内）一律交给 `ip-guard` 判定。
+ */
+function isIpLiteral(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s || s.length > 45) return false;
+  if (s.includes(':')) {
+    // IPv6：字符集 + 结构。`::` 简写（含 `::ffff:1.2.3.4`）直接放行，
+    // 完整形态要求恰好 8 组、每组 1–4 个十六进制字符。
+    if (!/^[0-9a-fA-F:.]+$/.test(s)) return false;
+    if (s.includes('::')) return true;
+    const groups = s.split(':');
+    return groups.length === 8 && groups.every((g) => g.length >= 1 && g.length <= 4);
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return false;
+  for (let i = 1; i <= 4; i++) if (Number(m[i]) > 255) return false;
+  return true;
+}
+
+/** `X-Forwarded-For` 头是否存在且非空 —— 用于区分「没有头」与「头在但值不可用」 */
+function hasForwardedHeader(req) {
+  const h = req && req.headers;
+  return Boolean(String((h && h['x-forwarded-for']) || '').trim());
+}
+
+/**
  * 取「反向代理注入的真实客户端 IP」：仅 `TRUST_PROXY=1` 且确有 `X-Forwarded-For`
  * 时返回首段（最接近真实客户端的值），否则返回空串。
  *
@@ -45,13 +80,16 @@ function normalizeIp(raw) {
  * 「只看 `socket.remoteAddress`、没有任何 XFF 分支」的实现，而 `deploy.sh` 生成的
  * 默认部署恰好是「Nginx 反代 + `TRUST_PROXY=1`」——于是同一进程里两条取 IP 路径分叉：
  * 限流 / 失败锁定 / 分享冻结拿到真实 IP，IP 守卫却永远拿到 Nginx 的回环地址。
+ *
+ * R22-02：取值前必须过 `isIpLiteral()` —— 非 IP 字面量一律不接受（理由见上）。
+ * 同时 `deploy.sh` 生成的 Nginx 侧已改为**重写**该头（`$remote_addr`），
+ * 使首段不再可能来自请求方原值；这里的格式校验是第二道防线（老配置 / 自建反代）。
  */
 function forwardedClientIp(req) {
   if (!TRUST_PROXY) return '';
-  const h = req && req.headers;
-  const xf = String((h && h['x-forwarded-for']) || '');
-  if (!xf) return '';
-  return xf.split(',')[0].trim();
+  if (!hasForwardedHeader(req)) return '';
+  const first = String(req.headers['x-forwarded-for']).split(',')[0].trim();
+  return isIpLiteral(first) ? first : '';
 }
 
 /**
@@ -62,11 +100,18 @@ function forwardedClientIp(req) {
  * `X-Forwarded-For: 127.0.0.1` 就重新变成「本机」，屏蔽规则被一个请求头整条绕过。
  * 只返回字符串时这两件事无法区分（旧的 `ip-guard.clientIp()` 正是这么丢掉了信息）。
  *
+ * R22-02：「头在、但值不是 IP 字面量」必须与「根本没有头」区分开。两者若都落进
+ * socket 分支，反代部署下 socket 恰好是 Nginx 的 `127.0.0.1`，这个来源根本不可辨认的
+ * 请求就会被当成**本机直连**而白拿回环豁免（R17-01 刚堵掉的洞又换个形式回来）。
+ * 因此显式标记 `fromForwarded=true` 且置空 IP：调用方既不得套回环豁免，这类请求也
+ * 一律共用同一个限流 / 锁定键（无法靠轮换非法串重置预算）。
+ *
  * @returns {{ip: string, fromForwarded: boolean}} fromForwarded=true 表示该值来自请求头
  */
 function clientIpInfo(req) {
   const fwd = forwardedClientIp(req);
   if (fwd) return { ip: normalizeIp(fwd), fromForwarded: true };
+  if (TRUST_PROXY && hasForwardedHeader(req)) return { ip: '', fromForwarded: true };
   const raw = (req && req.socket && req.socket.remoteAddress) || (req && req.ip) || '';
   return { ip: normalizeIp(raw), fromForwarded: false };
 }
@@ -98,7 +143,8 @@ function normalizeHost(v) {
  * + 调用方补充的允许主机（如当前请求的 `Host`）。
  *
  * 用于回答「这个地址是不是本站」——支付「站点对外地址」与 HTTPS 跳转目标都要问
- * 同一个问题，因此收敛到这一处（`index.js` 的同名判据已改为调用本函数）。
+ * 同一个问题，因此收敛到这一处（HTTPS 跳转目标自 R21-13 起改由 `httpsRedirectHost()`
+ * 统一决定，而后者内部仍调本函数；`index.js` 不再自持一份判据）。
  * 配置读取走惰性 require，避免 security → config-store → … 的加载顺序耦合。
  *
  * @param {string} host 待判定的主机名（可带协议前缀 / 端口）
@@ -117,6 +163,56 @@ function isOwnSiteHost(host, extra) {
   for (const e of extra || []) own.add(normalizeHost(e));
   own.delete('');
   return own.has(h);
+}
+
+/** 配置里的站点主/备域名（取第一个非空），读不到返回 '' */
+function configuredSiteHost() {
+  try {
+    const cfg = require('./config-store').load();
+    const d = cfg && cfg.domains;
+    return normalizeHost((d && (d.primary || d.backup)) || '');
+  } catch (e) {
+    return '';
+  }
+}
+
+/** 是否为「监听全部网卡」的通配绑定地址（它作为跳转目标没有意义） */
+function isBindAllHost(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (s === '0.0.0.0' || s === '::' || s === '[::]' || s === '*') return true;
+  return normalizeHost(s) === '0.0.0.0';
+}
+
+/**
+ * R21-13：明文 → HTTPS 跳转目标的**唯一实现点**。
+ *
+ * 目标选取顺序（R22-06：注释必须与 `:158-168` 的实现**逐项同序**，否则下轮会被
+ * 当成「文档不同步」再报一次）：**被允许的请求 Host → 本机 HOST（非通配时）
+ * → 配置的站点主/备域名 → 通配回退并告警**。
+ *
+ * 为什么不直接用 HOST 兜底：`Dockerfile` 里 `HOST=0.0.0.0`（容器必须监听通配地址
+ * 才能被外部访问），而 `0.0.0.0` 作为**跳转目标**毫无意义 —— 按 README 的 Docker
+ * 快速启动（不注入 `TRUST_PROXY`、不配置站点域名）访问 `http://<服务器>:3000`，
+ * 会被 301 到 `https://0.0.0.0:3443/…`（Windows 上根本无法解析）。这不是安全问题，
+ * 而是「照文档做即坏」。因此通配绑定地址**不再作为首选兜底**：先看有没有配置站点
+ * 域名；都没有时保留原行为并置 `fallbackToBindAll`，由调用方打一条显式告警
+ * （保持跳转比默默不跳更可诊断 —— 后者会让人以为 HTTPS 已经就绪，而部署模式下
+ * Secure Cookie 其实不会下发）。
+ *
+ * @param {string} rawHost 请求的 Host 头（可带端口）
+ * @returns {{ host: string, fallbackToBindAll: boolean }}
+ */
+function httpsRedirectHost(rawHost) {
+  const raw = normalizeHost(rawHost);
+  // 请求的 Host 是通配绑定地址时同样不可用（它并不指向任何可访问的名字）
+  if (raw && !isBindAllHost(rawHost) && isOwnSiteHost(raw, [DEPLOY_HOST])) {
+    return { host: raw, fallbackToBindAll: false };
+  }
+  const local = normalizeHost(DEPLOY_HOST);
+  if (!isBindAllHost(local)) return { host: local, fallbackToBindAll: false };
+  const dom = configuredSiteHost();
+  if (dom) return { host: dom, fallbackToBindAll: false };
+  return { host: local, fallbackToBindAll: true };
 }
 
 /* ============================ CSRF ============================ */
@@ -378,7 +474,10 @@ module.exports = {
   DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY,
   secureCookieAttr, clientIp,
   // R17-01：唯一的 XFF 解析实现 + 「IP 及其来源」；R17-03：「这个地址是不是本站」
+  // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
   normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
+  isIpLiteral, hasForwardedHeader,
+  httpsRedirectHost, isBindAllHost,
   csrfGuard, SAFE_METHODS,
   createLimiter, limitMiddleware,
   createFailLock,

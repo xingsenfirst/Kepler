@@ -38,6 +38,11 @@ export function openProfileDialog() {
       <div class="hint">角色由管理员分配，不能自行修改。</div>
     </div>
     <div class="form-item">
+      <label>当前密码 <span class="hint" style="margin-left:6px">修改密码 / 调整 Windows Hello 时必填</span></label>
+      <input type="password" id="p-f-current" maxlength="128" placeholder="用于确认身份" autocomplete="current-password">
+      <div class="hint">改动密码前需重新输入一次当前密码 —— 会话被盗用时光有会话不足以改掉你的密码。</div>
+    </div>
+    <div class="form-item">
       <label>新密码 <span class="hint" style="margin-left:6px">留空则不修改密码</span></label>
       <input type="password" id="p-f-password" maxlength="128" placeholder="留空保持原密码不变" autocomplete="new-password">
     </div>
@@ -52,7 +57,7 @@ export function openProfileDialog() {
       </label>
       <div class="hint">
         ${helloUsable
-          ? '启用后，登录时在输入密码之后<b>还需通过本机 Windows Hello</b>验证才能真正进入系统。需输入当前密码才能绑定 Windows Hello。'
+          ? '启用后，登录时在输入密码之后<b>还需通过本机 Windows Hello</b>验证才能真正进入系统。需在「当前密码」栏输入当前密码才能绑定 Windows Hello。'
           : '当前环境不可用：需使用支持 WebAuthn 的浏览器，并通过 HTTPS 或 127.0.0.1 / localhost 访问。'}
       </div>
       <div id="p-f-hello-msg" class="form-msg"></div>
@@ -87,10 +92,10 @@ export function openProfileDialog() {
   if (helloBox) {
     helloBox.addEventListener('change', async () => {
       if (!helloBox.checked) return; // 取消勾选只改 UI，真正关闭在保存时处理
-      const pwd = (q('#p-f-password') || {}).value || '';
+      const pwd = (q('#p-f-current') || {}).value || '';
       if (!pwd) {
         helloBox.checked = false;
-        if (helloMsg) { helloMsg.textContent = '请先在「新密码」栏输入当前密码，用于确认是本人在操作'; helloMsg.className = 'form-msg show bad'; }
+        if (helloMsg) { helloMsg.textContent = '请先在「当前密码」栏输入当前密码，用于确认是本人在操作'; helloMsg.className = 'form-msg show bad'; }
         return;
       }
       if (helloMsg) { helloMsg.textContent = '正在唤起 Windows Hello，请按系统提示完成验证…'; helloMsg.className = 'form-msg show'; }
@@ -110,6 +115,7 @@ export function openProfileDialog() {
 
   async function save(overlay, close) {
     const username = (overlay.querySelector('#p-f-username') || {}).value || '';
+    const currentPw = (overlay.querySelector('#p-f-current') || {}).value || '';
     const password = (overlay.querySelector('#p-f-password') || {}).value || '';
     const confirm = (overlay.querySelector('#p-f-confirm') || {}).value || '';
 
@@ -118,12 +124,18 @@ export function openProfileDialog() {
     if (password !== confirm) { showMsg('两次输入的密码不一致', 'bad'); return; }
 
     const body = { username: username.trim() };
-    if (password) { body.password = password; body.confirmPassword = confirm; }
+    if (password) {
+      // R21-09：服务端要求二次确认当前密码；前端先拦一次，省掉一次必然失败的往返
+      if (!currentPw) { showMsg('修改密码前请先输入当前密码', 'bad'); return; }
+      body.password = password;
+      body.confirmPassword = confirm;
+      body.currentPassword = currentPw;
+    }
 
     // 关闭 Windows Hello：勾选被取消时必须提供当前密码（服务端同样要求）
     const wantDisable = !!me.webauthnEnabled && helloBox && helloBox.checked === false;
-    if (wantDisable && !password) {
-      showMsg('关闭 Windows Hello 需要在此输入当前密码以确认身份', 'bad');
+    if (wantDisable && !currentPw) {
+      showMsg('关闭 Windows Hello 需要输入当前密码以确认身份', 'bad');
       return;
     }
 
@@ -136,7 +148,7 @@ export function openProfileDialog() {
         return;
       }
       if (wantDisable) {
-        await API.webauthnDisable(password);
+        await API.webauthnDisable(currentPw);
         me.webauthnEnabled = false;
       }
       // 同步本地显示（用户名 / 账户菜单抬头）

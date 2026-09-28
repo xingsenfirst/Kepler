@@ -141,16 +141,29 @@ router.post('/auth/login/webauthn', (req, res) => {
     const pre = precheckLogin(req, res, username);
     if (!pre) return;
 
-    const raw = configStore.findUserRaw(username);
-    if (!raw) {
+    /**
+     * R21-05：三条「进不去」的分支必须**完全同形**（同状态码 + 同文案 + 同计数）。
+     *
+     * 旧实现里「用户不存在」回 `401 Windows Hello 验证失败，请重试`，而
+     * 「用户存在但未启用 Windows Hello」回 `400 该账户未启用 Windows Hello，请使用密码登录`
+     * —— 状态码与文案都不同，于是本端点（在 `PUBLIC_API` 白名单内，匿名可达）成了一个
+     * **不需要密码的用户名 oracle**：先用它枚举出有效用户名，再拿这些用户名去撞库 / 社工。
+     *
+     * 登录第一步 `/auth/login` 在这点上是正确的（用户不存在与密码错误返回同一条 401 文案），
+     * 这里向它对齐。`precheckLogin` 的 IP 级限流与 `ip|username` 冻结照常生效，
+     * 枚举速率与撞库速率完全相同（本端点的限流此前对「未启用」分支是**不计数**的，
+     * 等于给枚举留了一条不限速的支路）。
+     */
+    const authFail = (detail) => {
       const left = security.loginLock.fail(pre.lockKey);
-      statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `Windows Hello 登录失败：用户不存在（用户名：${username || '(空)'}）` });
+      statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `Windows Hello 登录失败：${detail}（用户名：${username || '(空)'}）` });
       if (left > 0) return res.status(429).json({ error: `失败次数过多，账户已临时锁定，请 ${left} 秒后重试` });
       return res.status(401).json({ error: 'Windows Hello 验证失败，请重试' });
-    }
-    if (!configStore.isWebauthnEnabled(raw)) {
-      return res.status(400).json({ error: '该账户未启用 Windows Hello，请使用密码登录' });
-    }
+    };
+
+    const raw = configStore.findUserRaw(username);
+    if (!raw) return authFail('用户不存在');
+    if (!configStore.isWebauthnEnabled(raw)) return authFail('该账户未启用 Windows Hello');
 
     const cred = configStore.getWebauthn(raw);
     const ctx = webauthnContext(req);
@@ -170,10 +183,23 @@ router.post('/auth/login/webauthn', (req, res) => {
     });
 
     if (!r.ok) {
-      const left = security.loginLock.fail(pre.lockKey);
-      statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `用户「${username}」Windows Hello 验证失败（${r.reason}）` });
-      if (left > 0) return res.status(429).json({ error: `失败次数过多，账户已临时锁定，请 ${left} 秒后重试` });
-      return res.status(401).json({ error: webauthn.publicReason(r.reason), reason: r.reason });
+      /**
+       * R22-01：这一支**必须与前两支同形** —— 它是 R21-05 收敛时唯一漏掉的一支。
+       *
+       * 旧实现回 `401 { error: webauthn.publicReason(r.reason), reason: r.reason }`：
+       * 多了一个 `reason` 键、文案也换成了「挑战缺失 / 挑战已过期 / 签名校验失败 …」
+       * 这类**细节文案**，与 `authFail()` 的固定 `401 { error: 'Windows Hello 验证失败，请重试' }`
+       * 在**状态码之外的文案与键集两处都不同形**。
+       *
+       * 而这一支的**可达前提**恰好是「用户名存在 **且** 已启用 Windows Hello」——
+       * 攻击者提交 `{ username }` 单字段（`b.challenge` 为空串即可）就能命中
+       * `challenge_missing` 走完这一支，于是它成了一个「用户名是否存在且启用了二次验证」
+       * 的匿名 oracle（通常指管理员账户），比 R21-05 修的「是否启用」更精确。
+       *
+       * `r.reason` 只进服务端日志（排查要它），**绝不进响应体** —— 同 R21-05 的纪律：
+       * 「进不去」的所有分支对匿名者必须完全不可区分。
+       */
+      return authFail(`验签失败（${r.reason}）`);
     }
 
     // 验签通过：更新签名计数（单调递增，供克隆检测）并签发会话

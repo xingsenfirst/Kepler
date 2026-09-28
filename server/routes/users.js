@@ -49,6 +49,26 @@ router.put('/users/me', async (req, res) => {
       if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password)) {
         return res.status(400).json({ error: '两次输入的密码不一致' });
       }
+      /**
+       * R21-09：涉及**凭据变更**的自助接口必须二次校验当前密码。
+       *
+       * 旧实现只接受 `username` / `password` / `confirmPassword`，**不要求**当前密码，
+       * 改完还 `destroyUserSessionsExcept` 保留当前会话。于是会话一旦被劫持
+       * （XSS、共享机器未登出、Cookie 泄露），攻击者可以直接改密，把真正的 owner
+       * 锁在外面（`destroyUserSessions` 还会顺带踢掉 owner 的其它设备）——
+       * 即「拿到了会话」直接升级为「永久接管账户」。
+       *
+       * 校验走 `configStore.verifyUserPassword`（与登录、WebDAV 认证共用的同一份
+       * scrypt 校验实现，不另写一套比较）。
+       */
+      const current = String(b.currentPassword == null ? '' : b.currentPassword);
+      if (!current) {
+        return res.status(400).json({ error: '请输入当前密码以确认身份', needCurrentPassword: true });
+      }
+      if (!(await configStore.verifyUserPassword(me.id, current))) {
+        statsStore.addLog({ action: 'users.self-update', level: 'warn', detail: `用户「${me.username}」自助改密：当前密码校验失败` });
+        return res.status(403).json({ error: '当前密码不正确' });
+      }
       patch.password = b.password;
     }
 

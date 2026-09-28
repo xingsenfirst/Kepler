@@ -16,12 +16,32 @@ const { URL } = require('url');
 const configStore = require('./config-store');
 const security = require('./security');
 const statsStore = require('./stats-store');
-const { getClient, p, normalizeKey, listAllExact } = require('./cos');
+const { getClient, p, normalizeKey, listAllExact, translateError } = require('./cos');
 const providers = require('./providers');
 const gateway = require('./fs-gateway');
 const ipGuard = require('./ip-guard');
 const { LIMITS } = require('./limits');
 const { getSelfSignedCert } = require('./local-cert');
+
+/**
+ * R21-14：回给 WebDAV 客户端的错误文案**不得包含上游原始 message**。
+ *
+ * 管理端刻意只回分类文案、把原始串放进 `err.rawMessage`（仅服务端日志）——
+ * 因为 SDK 的 message 里可能带请求 ID、端点、AccessKeyId 片段。WebDAV 侧此前
+ * 直接把 `e.message` 发给客户端（R21-14 只收口了 GET/HEAD 与 PUT 两处；
+ * R22-03 把 PROPFIND / MKCOL / DELETE / COPY 四处一并改调本函数 —— 该文件内
+ * **不得再出现裸 `send(e.message)`**）。
+ *
+ * 判据不是「哪些文案要翻译」而是「这个错误是不是上游来的」：
+ *  - 上游错误（COS SDK / s3-client）带 `statusCode`，或被 `translateError` 包过（带 `rawMessage`）；
+ *  - 本进程自己生成的校验错误（如 `Range 格式无效`、`上传数据超过上限…`，由 fs-gateway 抛出、
+ *    只带 `status`）不含任何上游信息，原文透出对排查更有价值，保留。
+ */
+function davErrorMessage(e) {
+  const fromUpstream = !!e && (e.statusCode !== undefined || e.rawMessage !== undefined);
+  if (!fromUpstream) return String((e && e.message) || '操作失败，请重试');
+  return translateError(e).message;
+}
 
 /** WebDAV 认证失败锁定：连续 5 次失败锁定 1 分钟起，最长 30 分钟（按用户名） */
 const webdavLock = security.createFailLock({ name: 'webdav', maxFails: 5, baseLockMs: 60 * 1000, maxLockMs: 30 * 60 * 1000 });
@@ -575,7 +595,8 @@ function buildApp() {
       };
       return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));
     } catch (e) {
-      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);
+      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志
+      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));
     }
   };
   // PROPFIND 为非标准 HTTP 方法，Express 以小写方法名注册
@@ -685,7 +706,7 @@ function buildApp() {
          */
         const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);
         if (out === 416 && e.contentRange) res.setHeader('Content-Range', e.contentRange);
-        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : e.message);
+        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : davErrorMessage(e));
       }
     }
   };
@@ -741,10 +762,10 @@ function buildApp() {
        */
       if (Number(e.status) === 413 && !res.headersSent) {
         return res.status(413).type('text/plain')
-          .send(`${e.message}\n（WebDAV 挂载写入不支持分片上传：请改用「AES-256-GCM」加密模式，`
+          .send(`${davErrorMessage(e)}\n（WebDAV 挂载写入不支持分片上传：请改用「AES-256-GCM」加密模式，`
             + '或改用管理界面的文件上传 —— 那里会自动按上限切分。）');
       }
-      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);
+      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));
     }
   });
 
@@ -763,7 +784,8 @@ function buildApp() {
       await p(cos, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: dirKey, Body: Buffer.alloc(0), ContentLength: 0 });
       res.status(201).end();
     } catch (e) {
-      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);
+      // R22-03：MKCOL 同型收口
+      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));
     }
   });
 
@@ -794,7 +816,7 @@ function buildApp() {
     } catch (e) {
       if (!res.headersSent) {
         const st = e.statusCode || e.status || 500;
-        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : e.message);
+        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : davErrorMessage(e));
       }
     }
   });
@@ -1082,7 +1104,7 @@ function buildApp() {
         // R13-07：但 401 是例外 —— s3-client 的错误只带 statusCode、不经 translateError
         // 的 401→502 映射（cos.js:146），直接透出会占用本地「会话过期」语义，先映射再透传。
         const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);
-        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : e.message);
+        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : davErrorMessage(e));
       }
     }
   }
@@ -1238,4 +1260,6 @@ module.exports = {
   // 仅供测试：SEC-12 路径→Key 的归一化必须可被直接驱动（幽灵对象的根源在它）
   __reqPathToKey: reqPathToKey,
   __PROPFIND_CAP: PROPFIND_CAP,
+  // 仅供测试：R21-14「错误响应不得回显上游原始 message」必须可被直接驱动
+  __davErrorMessage: davErrorMessage,
 };

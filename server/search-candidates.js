@@ -107,7 +107,9 @@ function enabled() {
  * 同一 prefix 会得到两套完全不同的键集合。
  */
 function keyOf(ident, prefix, scope) {
-  return [ident, prefix, scope || ''].join(SEP);
+  // R21-11：与 `list-cache.keyOf` 同一条纪律 —— 分隔符必须从每一段里剥掉，
+  // 不能依赖「某个字符不可能出现」的假设（`prefix` 来自请求参数，可含 `\u0000`）。
+  return [ident, prefix, scope || ''].map((v) => String(v == null ? '' : v).replace(/\u0000/g, '')).join(SEP);
 }
 
 /** 该子树是否已被判定为「太大、不物化」（且仍在 TTL 内） */

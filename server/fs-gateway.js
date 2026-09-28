@@ -39,10 +39,52 @@ const MAX_RANGE_BUFFER = 32 * 1024 * 1024;
 const MAX_WRITE_BUFFER = 128 * 1024 * 1024;
 /** 加密文件并发读取信号量上限（N4：限制同时解密的大文件数，避免内存线性增长） */
 const MAX_ENCRYPT_READERS = 3;
+/**
+ * R21-03：**流式写入**（WebDAV PUT）的并发上限。
+ *
+ * 读侧早就有 `MAX_ENCRYPT_READERS = 3`（峰值内存 ≈ 96MB），写侧却只有**单请求**上限
+ * `MAX_WRITE_BUFFER = 128MB`，没有任何并发闸门。而 WebDAV PUT 的路径是
+ * 「先把整个请求体流式缓冲成 Buffer」→ `encStore.encryptBuffer()` **再产出一份密文副本**，
+ * 即每个请求峰值 ≈ 2 × 128MB = 256MB。并发 N 个大文件 PUT 就是 N × 256MB：主站与
+ * WebDAV 共用同一个进程，几个并发大上传即可把进程推入 OOM（进程退出 → 全部会话失效）。
+ *
+ * 与读侧同构的信号量，但只罩**流式**路径：管理端上传走 `express.raw`（Buffer 由中间件
+ * 分配、另有 64MB 上限，且 `encryptBuffer` 内部还有自己的上限），对已经由中间件限定的
+ * 内存再加一道闸门只会凭空排队；WebDAV PUT 才是那条「用一个 128MB 上限保护无界并发」的路径。
+ */
+const MAX_WRITE_STREAMS = 2;
 /** 单次 PUT Copy 的服务端上限：超过必须走分块复制 —— 与 routes/fs.js 共用 limits.js 的同一份定义 */
 const COPY_SIMPLE_LIMIT = LIMITS.COPY_SIMPLE_LIMIT;
 let activeEncryptReaders = 0; // 当前正在进行的加密文件读取数
 const encryptReaderQueue = []; // 排队等待的读取请求
+
+/* ---- R21-03：流式写入信号量（与读侧同构，见 MAX_WRITE_STREAMS 的说明） ---- */
+let activeWriteStreams = 0;
+const writeStreamQueue = [];
+
+/** 获取一个写入槽位；无空位时排队等待（先进先出） */
+function acquireWriteStream() {
+  return new Promise((resolve) => {
+    if (activeWriteStreams < MAX_WRITE_STREAMS) { activeWriteStreams++; resolve(); return; }
+    writeStreamQueue.push(resolve);
+  });
+}
+
+/** 释放写入槽位：幂等 + 下界保护（与读侧 `makeEncryptReaderReleaser` 同一纪律） */
+function makeWriteStreamReleaser() {
+  let released = false;
+  return function release() {
+    if (released) return;
+    released = true;
+    if (activeWriteStreams > 0) {
+      activeWriteStreams--;
+    } else {
+      console.error('[fs-gateway] 写入信号量异常：release 时计数已为 0，已忽略');
+    }
+    const next = writeStreamQueue.shift();
+    if (next) { activeWriteStreams++; next(); }
+  };
+}
 
 /** 获取一个加密读取令牌；无空位时排队等待（先进先出） */
 function acquireEncryptReader() {
@@ -318,8 +360,36 @@ function parseRange(range, total) {
  * @param {string} [auditAction]   审计标记（如 'webdav.put'），null 跳过审计
  * @param {string} [auditPrefix]   审计详情前缀
  * @returns {Promise<{ encrypted: bool, bytesWritten: number }>}
+ *
+ * R21-03：对外入口负责**流式路径的并发闸门**，真正的写逻辑在 `writeObjectInner`。
+ * 槽位必须从「开始缓冲」一直持到「整个函数返回」—— 明文 Buffer 与 `encryptBuffer`
+ * 产出的密文副本都活到那时；只在缓冲结束时释放等于没限住峰值内存。
  */
 async function writeObject(bucket, key, data, contentType, auditAction, auditPrefix) {
+  if (Buffer.isBuffer(data) || typeof data === 'string') {
+    return writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix);
+  }
+  await acquireWriteStream(); // 排队发生在**缓冲之前**，否则内存早就吃满了
+  const release = makeWriteStreamReleaser();
+  try {
+    const buf = await bufferStream(data);
+    return await writeObjectInner(bucket, key, buf, contentType, auditAction, auditPrefix);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * 写入对象的实际实现（不自行做并发控制 —— 由 {@link writeObject} 决定是否持槽）。
+ *
+ * @param {string} bucket
+ * @param {string} key
+ * @param {Buffer|string|Readable} data
+ * @param {string} [contentType]
+ * @param {string} [auditAction]
+ * @param {string} [auditPrefix]
+ */
+async function writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix) {
   const k = normalizeKey(key);
   const { cfg, cos } = requireCfgCos();
   let plainBuf;
@@ -328,8 +398,9 @@ async function writeObject(bucket, key, data, contentType, auditAction, auditPre
   } else if (typeof data === 'string') {
     plainBuf = Buffer.from(data, 'utf8');
   } else {
-    // 流：先缓冲全量
-    plainBuf = await bufferStream(data);
+    // R21-03：流必须经 `writeObject` 进来 —— 那里的信号量才是并发上限的唯一实现点。
+    // 这里**不再**私自 bufferStream，否则将来有人直接调本函数就又绕过闸门了。
+    throw Object.assign(new Error('内部错误：流式写入必须经 writeObject（并发闸门在那一层）'), { status: 500 });
   }
 
   const enc = encStore.encryptBuffer(cfg.bucket, k, plainBuf);

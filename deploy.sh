@@ -1911,7 +1911,13 @@ write_nginx_conf() {
   proxy_snippet="        proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        # R22-02：**重写**而非追加。追加语义（proxy_add_x_forwarded_for）下该头的
+        # 首段就是请求方原样送进来的值 —— 任何人都能写一个内网或不可解析地址把自己
+        # 伪装成可信来源，黑名单、海外屏蔽与全部按 IP 限流会被一起按伪造值判定。
+        # 本文件与 Develop_Document.md 都要求「最外层代理会重写而非追加该头」。
+        # 注意：若本机 Nginx 之前还有 CDN，请改用 realip 模块还原客户端地址，
+        #       否则应用侧只会看到 CDN 的 IP（X-Real-IP 同步受此影响）。
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
         # 浏览器实际连接的端口：Nginx 的 \$host 已被去掉端口，非 443/80 部署时

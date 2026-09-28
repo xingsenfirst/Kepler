@@ -84,7 +84,25 @@ function enabled() {
  * 放在末尾（而非开头）是为了让 `invalidateBucket()` 的 `${bucket}\0` 前缀匹配继续成立。
  */
 function keyOf(bucket, prefix, marker, maxKeys, delimiter, kind = '') {
-  return [bucket, prefix, marker, maxKeys, delimiter, kind].join(SEP);
+  return [bucket, prefix, marker, maxKeys, delimiter, kind].map(seg).join(SEP);
+}
+
+/**
+ * R21-11：把分隔符从每一段里**剥掉**。
+ *
+ * 旧实现的注释写着「桶名里不可能出现 `\u0000`」—— 但键里不只有桶名：
+ * `prefix` 走 `normalizeKey()`（只归一斜杠、拒 `..`，**不剥 `\0`**），
+ * `marker` 连 `normalizeKey` 都没过（直接 `String(req.query.marker || '')`）。
+ * 于是请求方可以构造出与另一组参数**拼接完全相等**的键，让进程级共享缓存
+ * （`MAX_ENTRIES = 200`，任一客户端触发后影响其他用户整整一个 TTL）返回
+ * 另一个前缀的列举结果 —— 表现为「列表短暂错乱 / 串味」。
+ *
+ * 修法有两层，这里是最里层、也是最有价值的一层：**不依赖「某个字符不可能出现」
+ * 的假设**。调用方各自去消毒容易漏（`marker` 就漏了），而键构造是全库唯一一处，
+ * 在这里剥掉即对所有调用方生效。
+ */
+function seg(v) {
+  return String(v === undefined || v === null ? '' : v).replace(/\u0000/g, '');
 }
 
 function get(key) {

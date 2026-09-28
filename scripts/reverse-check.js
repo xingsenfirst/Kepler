@@ -417,8 +417,10 @@ const CASES = [
     {
       name: 'R8-11 · list-cache 键丢掉 kind 命名空间（list / search 互相命中）',
       file: 'server/list-cache.js',
-      anchor: '  return [bucket, prefix, marker, maxKeys, delimiter, kind].join(SEP);',
-      replacement: '  return [bucket, prefix, marker, maxKeys, delimiter].join(SEP);',
+      // R21-11 把 `keyOf` 的每一段加了 `seg()` 消毒（剥掉分隔符 `\u0000`），
+      // anchor 随之更新 —— 变异仍然只针对「丢掉 kind」这一件事。
+      anchor: '  return [bucket, prefix, marker, maxKeys, delimiter, kind].map(seg).join(SEP);',
+      replacement: '  return [bucket, prefix, marker, maxKeys, delimiter].map(seg).join(SEP);',
       testFile: 'audit8-regressions.test.js',
       minFail: 1,
     },
@@ -1221,8 +1223,9 @@ const CASES = [
        */
       name: '搜索候选集 · keyOf 丢掉 scope（递归与仅当前目录互相命中）',
       file: 'server/search-candidates.js',
-      anchor: "  return [ident, prefix, scope || ''].join(SEP);",
-      replacement: '  return [ident, prefix].join(SEP);',
+      // R21-11 同 list-cache：每段先经 `\u0000` 消毒再拼接，anchor 随之更新。
+      anchor: "  return [ident, prefix, scope || ''].map((v) => String(v == null ? '' : v).replace(/\\u0000/g, '')).join(SEP);",
+      replacement: "  return [ident, prefix].map((v) => String(v == null ? '' : v).replace(/\\u0000/g, '')).join(SEP);",
       testFile: 'search-candidates.test.js',
       minFail: 1,
     },
@@ -2036,6 +2039,255 @@ const CASES = [
       anchor: '  tls_probe_served || true\n',
       replacement: '',
       testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+
+    /* ==================================================================
+     * 第 21 轮（R21-xx）
+     *
+     * 每条都断言「退回旧实现后，`tests/audit21-regressions.test.js` 必须变红」。
+     * 变异刻意**等效于旧实现的可观测后果**，而不是「把源码搬个位置」：
+     *   · R21-01 把门禁判据整体置假（= 旧实现根本没有这道门禁）；
+     *   · R21-03 把写入并发上限放到无穷（= 旧实现只有单请求上限）；
+     *   · R21-12 撤掉 `redirect: 'manual'`（= 旧实现默认 follow，请求会真的打到 Location）。
+     * ================================================================== */
+    {
+      name: 'R21-01 · 分享下载的加密门禁整体失效（密文对象照样下发明文）',
+      file: 'server/share-routes.js',
+      anchor: 'function encGateNeeded(l) {\n  if (!l) return false;',
+      replacement: 'function encGateNeeded(l) {\n  if (true) return false; // 变异：门禁失效，等价于旧实现没有这道判据',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-03 · 流式写入并发上限失效（WebDAV PUT 可无限并发，N×256MB）',
+      file: 'server/fs-gateway.js',
+      anchor: 'const MAX_WRITE_STREAMS = 2;',
+      replacement: 'const MAX_WRITE_STREAMS = Infinity; // 变异：等价于旧实现只有单请求上限',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-05 · Windows Hello 失败分支恢复可区分（用户名 oracle 复活）',
+      file: 'server/routes/auth.js',
+      anchor: "    if (!configStore.isWebauthnEnabled(raw)) return authFail('该账户未启用 Windows Hello');",
+      replacement: "    if (!configStore.isWebauthnEnabled(raw)) return res.status(400).json({ error: '该账户未启用 Windows Hello，请使用密码登录' });",
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-06 · notifyUrl 退回「请求体渠道」（下单走 A、回调地址写 B）',
+      file: 'server/share-routes.js',
+      anchor: '    notifyUrl: `${base}/pay/notify/${encodeURIComponent(chargePlatform)}`,',
+      replacement: '    notifyUrl: `${base}/pay/notify/${encodeURIComponent(platform)}`,',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-09 · 自助改密不再校验当前密码（会话劫持即可永久接管账户）',
+      file: 'server/routes/users.js',
+      anchor: "      const current = String(b.currentPassword == null ? '' : b.currentPassword);",
+      replacement: "      const current = 'correct-pw'; // 变异：等价于旧实现完全不校验当前密码",
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-10 · 撤掉抢锁宽限期（新鲜空锁被当成无主 → 双持有）',
+      file: 'server/instance-lock.js',
+      anchor: '      if (!cur && !force && lockAgeMs() < LOCK_SHAPE_GRACE_MS) {\n        return { ok: false, stale: false, pid: null };\n      }\n',
+      replacement: '',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-11 · 列举缓存键不再消毒分隔符（参数可注入 → 进程级串味）',
+      file: 'server/list-cache.js',
+      anchor: '  return [bucket, prefix, marker, maxKeys, delimiter, kind].map(seg).join(SEP);',
+      replacement: '  return [bucket, prefix, marker, maxKeys, delimiter, kind].join(SEP);',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-11 · 搜索候选集键不再消毒分隔符（同型串味）',
+      file: 'server/search-candidates.js',
+      anchor: "  return [ident, prefix, scope || ''].map((v) => String(v == null ? '' : v).replace(/\\u0000/g, '')).join(SEP);",
+      replacement: "  return [ident, prefix, scope || ''].join(SEP);",
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-12 · S3 客户端恢复默认 follow（3xx 被静默跟随到内网地址）',
+      file: 'server/s3-client.js',
+      anchor: "    const init = { method, headers: signed, redirect: 'manual' };",
+      replacement: '    const init = { method, headers: signed };',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-12 · 支付网关恢复默认 follow（带商户凭据的请求被打到 Location 指向处）',
+      file: 'server/payment-gateway.js',
+      anchor: "    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));",
+      replacement: '    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal }));',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-13 · HTTPS 跳转目标退回 HOST（Docker 下 301 到 https://0.0.0.0:3443/…）',
+      file: 'server/security.js',
+      anchor: '  if (!isBindAllHost(local)) return { host: local, fallbackToBindAll: false };\n'
+        + '  const dom = configuredSiteHost();\n'
+        + '  if (dom) return { host: dom, fallbackToBindAll: false };\n'
+        + '  return { host: local, fallbackToBindAll: true };\n',
+      replacement: '  return { host: local, fallbackToBindAll: false };\n',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-14 · WebDAV 错误响应回显上游原始 message（泄漏请求 ID / 端点 / 密钥片段）',
+      file: 'server/webdav-server.js',
+      anchor: '  const fromUpstream = !!e && (e.statusCode !== undefined || e.rawMessage !== undefined);\n'
+        + "  if (!fromUpstream) return String((e && e.message) || '操作失败，请重试');\n"
+        + '  return translateError(e).message;\n',
+      replacement: "  return String((e && e.message) || '操作失败，请重试');\n",
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R21-15 · 跳过清单版本号漂移（读者无法判断清单对应哪个构建）',
+      file: 'SCAN-SKIPLIST.md',
+      anchor: '- 项目：`object-manager` v1.2.2',
+      replacement: '- 项目：`object-manager` v1.2.0',
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+      /**
+       * R22 退役：该清单从未纳入 git（仓库管理决策），R22 复核时已不在工作区 ——
+       * 目标文件不存在 ⇒ 变异无法施加，且对应的护栏（`audit21-regressions.test.js`
+       * 的 R21-15 用例）已改为「文件缺失即跳过」，撤掉修复与否都不可观测。
+       * 退役而非删除：留痕可审计；文件若回归仓库，把本条的 `retired` 去掉即可复活。
+       */
+      retired: true,
+      retiredReason: 'SCAN-SKIPLIST.md 未纳入 git 且已不在工作区，变异无目标、护栏空转；'
+        + '对应用例改为「文件缺失即跳过」，撤不撤修复都不可观测，故退役保留留痕。',
+    },
+
+    /* ==================== 第 22 轮（R22-01 ~ R22-06） ==================== */
+
+    {
+      name: 'R22-01 · Windows Hello 第三支恢复可区分（「用户名存在且已启用二次验证」的 oracle 复活）',
+      file: 'server/routes/auth.js',
+      anchor: '      return authFail(`验签失败（${r.reason}）`);',
+      replacement: '      return res.status(401).json({ error: webauthn.publicReason(r.reason), reason: r.reason });',
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-02 · 转发头取值不再校验格式（非法串各自成为独立来源 → 限流 / 锁定键随头轮换）',
+      file: 'server/security.js',
+      anchor: "  return isIpLiteral(first) ? first : '';",
+      replacement: '  return first;',
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-02 · 部署脚本退回追加语义（该头首段 = 客户端原值，IP 守卫与限流按伪造值判定）',
+      file: 'deploy.sh',
+      anchor: '        proxy_set_header X-Forwarded-For \\$remote_addr;',
+      replacement: '        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;',
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-03 · PROPFIND 出口退回裸发上游 message（泄漏请求 ID / 端点 / 密钥片段）',
+      file: 'server/webdav-server.js',
+      anchor: '      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));\n'
+        + '    } catch (e) {\n'
+        + '      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志\n'
+        + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));",
+      replacement: '      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));\n'
+        + '    } catch (e) {\n'
+        + '      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志\n'
+        + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);",
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-03 · MKCOL 出口退回裸发上游 message',
+      file: 'server/webdav-server.js',
+      anchor: '      res.status(201).end();\n'
+        + '    } catch (e) {\n'
+        + '      // R22-03：MKCOL 同型收口\n'
+        + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));",
+      replacement: '      res.status(201).end();\n'
+        + '    } catch (e) {\n'
+        + '      // R22-03：MKCOL 同型收口\n'
+        + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);",
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-03 · DELETE 出口退回裸发上游 message',
+      file: 'server/webdav-server.js',
+      anchor: "        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : davErrorMessage(e));",
+      replacement: "        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : e.message);",
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-03 · COPY 出口退回裸发上游 message',
+      file: 'server/webdav-server.js',
+      anchor: '        const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);\n'
+        + "        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : davErrorMessage(e));",
+      replacement: '        const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);\n'
+        + "        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : e.message);",
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-04 · README 删去「WebDAV 出口不叠加查看密码」的口径（文档又变成含糊承诺）',
+      file: 'README.md',
+      anchor: '；**WebDAV 挂载（`/dav`）不叠加这道门禁**，它由独立的 Basic 认证与 IP 守卫把关，凭据须由管理员授予。',
+      replacement: '。',
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-05 · README 退回「令牌仅通过 x-enc-token 请求头传递」（与分享页 Cookie 通道矛盾）',
+      file: 'README.md',
+      anchor: '管理端只从 `x-enc-token` 请求头读取该令牌，分享页另发一枚 `HttpOnly`、`path=/s/` 的 Cookie 复用（不进入 `/api/**`）；',
+      replacement: '令牌**仅通过 `x-enc-token` 请求头**传递；',
+      testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R22-06 · httpsRedirectHost 注释退回与实现相反的顺序（下轮会被再报一次文档不同步）',
+      file: 'server/security.js',
+      anchor: '/**\n'
+        + ' * R21-13：明文 → HTTPS 跳转目标的**唯一实现点**。\n'
+        + ' *\n'
+        + ' * 目标选取顺序（R22-06：注释必须与 `:158-168` 的实现**逐项同序**，否则下轮会被\n'
+        + ' * 当成「文档不同步」再报一次）：**被允许的请求 Host → 本机 HOST（非通配时）\n'
+        + ' * → 配置的站点主/备域名 → 通配回退并告警**。\n'
+        + ' *\n'
+        + ' * 为什么不直接用 HOST 兜底：`Dockerfile` 里 `HOST=0.0.0.0`（容器必须监听通配地址\n'
+        + ' * 才能被外部访问），而 `0.0.0.0` 作为**跳转目标**毫无意义 —— 按 README 的 Docker\n'
+        + ' * 快速启动（不注入 `TRUST_PROXY`、不配置站点域名）访问 `http://<服务器>:3000`，\n'
+        + ' * 会被 301 到 `https://0.0.0.0:3443/…`（Windows 上根本无法解析）。这不是安全问题，\n'
+        + ' * 而是「照文档做即坏」。因此通配绑定地址**不再作为首选兜底**：先看有没有配置站点\n'
+        + ' * 域名；都没有时保留原行为并置 `fallbackToBindAll`，由调用方打一条显式告警\n'
+        + ' * （保持跳转比默默不跳更可诊断 —— 后者会让人以为 HTTPS 已经就绪，而部署模式下\n'
+        + ' * Secure Cookie 其实不会下发）。\n'
+        + ' *\n'
+        + ' * @param {string} rawHost 请求的 Host 头（可带端口）\n'
+        + ' * @returns {{ host: string, fallbackToBindAll: boolean }}\n'
+        + ' */\n'
+        + 'function httpsRedirectHost(rawHost) {',
+      replacement: '/**\n'
+        + ' * R21-13：明文 → HTTPS 跳转目标的**唯一实现点**。\n'
+        + ' *\n'
+        + ' * 目标选取顺序：**被允许的请求 Host → 配置的站点主/备域名 → 本机 HOST**。\n'
+        + ' */\n'
+        + 'function httpsRedirectHost(rawHost) {',
+      testFile: 'audit22-regressions.test.js',
       minFail: 1,
     },
   ];

@@ -299,9 +299,16 @@ test('R17-03 · 站点地址的「是不是本站」判据与 HTTPS 跳转同源
   const paySrc = stripLineComments(read(ROUTES_PAYMENT));
   assert.match(paySrc, /security\.isOwnSiteHost\(/,
     '支付「站点对外地址」必须用 security.isOwnSiteHost 判定');
+  // R21-13 起：跳转目标改由 `security.httpsRedirectHost()` 统一决定（`HOST=0.0.0.0` 时
+  // 先取配置的站点域名、再回退，并对通配兜底告警），但「是不是本站」仍必须问同一个
+  // `isOwnSiteHost` —— 判据不得分叉成两份。故这里钉两处：调用方**整体委托**给唯一实现点，
+  // 且该实现点内部仍用同一个判据函数。
   const idxSrc = read(path.join(ROOT, 'server', 'index.js'));
-  assert.match(idxSrc, /security\.isOwnSiteHost\(host, \[HOST\]\)/,
-    'HTTPS 跳转判据必须收敛到同一函数（同型问题两处各写一份，必然在某一轮只改一份）');
+  assert.match(idxSrc, /security\.httpsRedirectHost\(/,
+    'HTTPS 跳转目标必须交给 security.httpsRedirectHost 统一决定（不得在 index.js 内联一份）');
+  const secSrc = read(path.join(ROOT, 'server', 'security.js'));
+  assert.match(secSrc, /function httpsRedirectHost\([\s\S]*?isOwnSiteHost\(/,
+    'HTTPS 跳转判据必须与支付站点判据同源（同一 isOwnSiteHost；同型问题两处各写一份，必然在某一轮只改一份）');
 
   // ③ 展示层兜底：配置值万一不属本站（旧版本写入 / 手改文件），回退按请求 Host 推断
   const shareSrc = stripLineComments(read(SHARE_ROUTES));

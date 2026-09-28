@@ -372,7 +372,20 @@ async function fetchWithTimeout(url, init) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    return await fetch(url, Object.assign({}, init, { signal: ctrl.signal }));
+    /**
+     * R21-12：出站**不跟随重定向**（`fetch` 默认是 `follow`）。
+     *
+     * 三个网关的 API 主机都是固定常量（支付宝网关 / 微信 APIv3 / PayPal），正常响应
+     * 不会重定向；一旦出现 3xx，说明链路被中间人终结、或主机/配置被人改写 ——
+     * 跟随它等于把「携带商户凭据的请求」发向我们从未批准过的主机。3xx 一律当错误，
+     * 由 `createCharge` / `queryCharge` 按「下单失败 / 未确认」处理（fail-closed：
+     * 绝不会因为一个重定向而把订单判成已支付）。
+     */
+    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));
+    if (res.status >= 300 && res.status < 400) {
+      throw new Error(`网关返回重定向（HTTP ${res.status}），已拒绝跟随（防 SSRF）`);
+    }
+    return res;
   } finally {
     clearTimeout(timer);
   }

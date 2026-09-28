@@ -19,6 +19,30 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const { Readable, pipeline } = require('stream');
 
+/**
+ * R21-12：出站请求**禁止自动跟随重定向**（`fetch` 默认是 `follow`）。
+ *
+ * 本项目出站目标由管理员配置的 endpoint / region 拼出。`endpoint-guard` 明确
+ * **不做 DNS 解析**（内网对象存储需要内部域名，解析还会引入新的 TOCTOU 面），
+ * 于是「主机名看着是公网、实际解析到内网」它挡不住；而「先放行一个公网域名、
+ * 再由 302 把实际连接引向 `http://169.254.169.254/…` 或内网地址」是同一个
+ * 结论的另一条入口 —— 出站不跟随重定向正是补这一条（盲 SSRF）。
+ *
+ * 3xx 一律按上游/配置错误处理（fail-closed，502）：S3 的分区重定向应当通过
+ * 正确配置 `region` 解决，静默跟随等于把「最终连到哪里」完全交给上游。
+ */
+function rejectRedirect(res) {
+  const st = Number(res && res.status) || 0;
+  if (st < 300 || st >= 400) return;
+  let loc = '';
+  try { loc = String((res.headers && res.headers.get && res.headers.get('location')) || ''); } catch (e) { loc = ''; }
+  const err = new Error(`上游端点返回重定向（HTTP ${st}${loc ? ' → ' + loc.slice(0, 200) : ''}），`
+    + '已拒绝跟随（防 SSRF）—— 请检查该端点的地址 / region 配置');
+  err.statusCode = 502;
+  err.code = 'RedirectNotAllowed';
+  throw err;
+}
+
 const DEFAULT_TIMEOUT_MS = Number(process.env.S3_TIMEOUT_MS) || 120000;
 const EMPTY_PAYLOAD_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
@@ -295,7 +319,7 @@ class S3Client {
       .map((k) => `${uriEncode(k, false)}=${uriEncode(query[k], false)}`).join('&');
     const target = `${this.protocol}//${hostHeader}${path}${qs ? '?' + qs : ''}`;
 
-    const init = { method, headers: signed };
+    const init = { method, headers: signed, redirect: 'manual' };
     if (hasBody) {
       if (spec.streamBody) {
         // fetch 需要标准 Web ReadableStream；Node 流需转换后才能作为 body
@@ -316,9 +340,13 @@ class S3Client {
       // 注意：timeout 由调用方在消费完 body 后清理（clearRequestTimeout），
       // 否则长下载会被 abort —— 见 getObject 中的显式清理。
       return fetch(target, init)
-        .then((res) => ({ res, body: undefined, timeoutTimer: timer }))
+        .then((res) => {
+          rejectRedirect(res);
+          return { res, body: undefined, timeoutTimer: timer };
+        })
         .catch((e) => {
           clearTimeout(timer);
+          if (e && e.code === 'RedirectNotAllowed') throw e; // 已分类的本地判定，不再包装
           throw this._normalizeNetworkError(e);
         });
     }
@@ -326,10 +354,12 @@ class S3Client {
     return fetch(target, init)
       .then(async (res) => {
         clearTimeout(timer);
+        rejectRedirect(res);
         return { res, body: await res.text() };
       })
       .catch((e) => {
         clearTimeout(timer);
+        if (e && e.code === 'RedirectNotAllowed') throw e;
         throw this._normalizeNetworkError(e);
       });
   }

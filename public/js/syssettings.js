@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, fmtTime } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize } from './util.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
@@ -26,7 +26,7 @@ function isAdmin() {
  * 换账号时就会残留上一个角色的 DOM（越权显示用户列表）。整卡按角色显隐之后，
  * 角色切换只是"显示 / 隐藏一个整块"，不存在需要还原的中间状态。
  */
-const ADMIN_ONLY_CARDS = ['sysset-user-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card'];
+const ADMIN_ONLY_CARDS = ['sysset-user-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card'];
 
 /** 隐藏仅管理员可见的卡片（非管理员直接不渲染其内容） */
 function setAdminCardVisible(cardId, visible) {
@@ -76,6 +76,7 @@ export function refresh() {
   ADMIN_ONLY_CARDS.forEach((id) => setAdminCardVisible(id, true));
 
   loadUsers();
+  loadLoadBalance();
   API.encSettings().then((s) => {
     current = s;
     render(s);
@@ -111,6 +112,9 @@ function wire() {
   // 用户管理
   const btnUserAdd = document.getElementById('btn-user-add');
   if (btnUserAdd) btnUserAdd.onclick = () => showUserForm(null);
+  // 负载均衡（仅管理员）：刷新用量
+  const lbRefresh = document.getElementById('btn-lb-refresh');
+  if (lbRefresh) lbRefresh.onclick = () => loadLoadBalance();
   // 验证码服务
   const capEnabled = document.getElementById('captcha-enabled');
   if (capEnabled) capEnabled.addEventListener('change', () => {
@@ -629,6 +633,14 @@ export function reset() {
   if (table) table.innerHTML = '';
   const countEl = document.getElementById('user-count');
   if (countEl) countEl.textContent = '';
+  // 负载均衡：作废在途响应并抹掉密钥清单（含掩码后的 SecretId —— 换账号不得残留）
+  lbRenderId++;
+  lbUsage = null;
+  lbOpen.clear();
+  const lbList = document.getElementById('lb-list');
+  if (lbList) lbList.innerHTML = '';
+  const lbSummary = document.getElementById('lb-summary');
+  if (lbSummary) lbSummary.textContent = '';
   // 支付凭证表单同样要丢弃（登出 / 换账号时调用，避免残留上一账号已渲染的凭证字段）
   resetPaymentView();
 }
@@ -923,5 +935,166 @@ async function deleteUser(user) {
     toast('用户已删除', { type: 'success' });
   } catch (e) {
     toast('删除失败：' + e.message, { type: 'error', duration: 6000 });
+  }
+}
+
+/* ============================ 负载均衡（按 API Key 的配额，R25） ============================ */
+/*
+ * **这张卡片同样只有管理员会看到**（纳入 ADMIN_ONLY_CARDS 整卡显隐）。
+ *
+ * 服务端返回的用量与写入闸门**同源**（`bucketStats.credentialUsage`）—— 卡片上写的数字
+ * 就是闸门实际用来判定的数字，不会出现「界面显示没超、上传却被拦」。
+ *
+ * 列表形态是风箱（手风琴）：默认全部折叠，点标题行展开该密钥下的各桶占用；
+ * 展开态存在 `lbOpen` 里并按密钥 id 记忆，刷新用量后不会把用户刚展开的项合上。
+ */
+
+const GB = 1024 * 1024 * 1024;
+let lbUsage = null; // 服务端返回的 { credentials: [...] }
+const lbOpen = new Set(); // 已展开的密钥 id（跨刷新保持）
+let lbRenderId = 0; // 单调递增渲染序号：丢弃过期响应，避免慢请求覆盖新状态
+
+/** 字节 → GB 数（保留 3 位小数，用于把配额回填到输入框） */
+function bytesToGb(bytes) {
+  const n = Number(bytes) || 0;
+  return n > 0 ? Math.round((n / GB) * 1000) / 1000 : 0;
+}
+
+function loadLoadBalance() {
+  if (!isAdmin()) return; // 普通用户连请求都不发（卡片已隐藏）
+  const list = document.getElementById('lb-list');
+  const myId = ++lbRenderId;
+  if (list && !lbUsage) list.innerHTML = '<div class="lb-empty">正在加载用量…</div>';
+  API.quotaUsage().then((r) => {
+    if (myId !== lbRenderId) return;
+    lbUsage = r;
+    renderLoadBalance();
+  }).catch((e) => {
+    if (myId !== lbRenderId) return;
+    if (e && e.status === 403) { // 非管理员（理论上不可达）→ 不暴露任何密钥信息
+      if (list) list.innerHTML = '';
+      return;
+    }
+    if (list) list.innerHTML = `<div class="lb-empty">用量加载失败：${escapeHtml(e.message)}</div>`;
+  });
+}
+
+/** 单个桶的进度条（分母 = 该密钥的上限；无限制时用「已用总量」以便表达相对大小） */
+function lbBucketHTML(b, credQuota, credUnlimited, credUsed) {
+  const denom = credUnlimited ? credUsed : credQuota;
+  const pct = denom > 0 ? Math.min(100, (b.sizeBytes / denom) * 100) : 0;
+  const overBucket = b.quotaBytes > 0 && b.sizeBytes > b.quotaBytes;
+  const meta = [];
+  if (b.region) meta.push(escapeHtml(b.region));
+  if (b.estimated) meta.push('估算');
+  if (!b.available) meta.push('容量不可用');
+  return `<div class="lb-bkt"${b.error ? ` title="${escapeHtml(b.error)}"` : ''}>
+    <div class="lb-bkt-name"><code>${escapeHtml(b.bucket)}</code>${meta.length ? ' <span class="lb-sub">（' + meta.join(' · ') + '）</span>' : ''}</div>
+    <div class="lb-bkt-bar"><div class="lb-bar${overBucket ? ' over' : ''}"><i style="width:${pct.toFixed(1)}%"></i></div></div>
+    <div class="lb-bkt-num">${fmtSize(b.sizeBytes)}${b.quotaBytes > 0 ? ' / ' + fmtSize(b.quotaBytes) : ''}</div>
+  </div>`;
+}
+
+function lbItemHTML(c) {
+  const used = c.usedBytes || 0;
+  const quota = c.quotaBytes || 0;
+  const unlimited = !!c.unlimited || quota <= 0;
+  const pct = unlimited ? 0 : Math.min(100, (used / quota) * 100);
+  const barCls = unlimited ? '' : (c.exceeded ? ' over' : (pct >= 80 ? ' warn' : ''));
+  const open = lbOpen.has(c.id);
+  const name = escapeHtml(c.remark || c.secretIdMasked || '（未命名密钥）');
+  const flags = [];
+  if (c.providerName) flags.push(escapeHtml(c.providerName));
+  if (!c.enabled) flags.push('已停用');
+  if (!c.visibleToUsers) flags.push('对普通用户不可见');
+  flags.push(`${c.bucketCount} 个存储桶`);
+  const usageText = unlimited
+    ? `无限制 · 已用 ${fmtSize(used)}`
+    : `已用 ${fmtSize(used)} / ${fmtSize(quota)}${c.exceeded ? ' · 已超额' : ''}`;
+  return `<div class="lb-item${c.exceeded ? ' over' : ''}${open ? ' open' : ''}" data-id="${escapeHtml(c.id)}">
+    <div class="lb-head">
+      <span class="lb-caret">▶</span>
+      <div class="lb-title">
+        <div class="lb-key">${name}</div>
+        <div class="lb-sub">${escapeHtml(c.secretIdMasked || '')} · ${flags.join(' · ')}</div>
+      </div>
+      <div class="lb-usage">
+        <div class="lb-num${c.exceeded ? ' over' : ''}">${usageText}</div>
+        <div class="lb-bar${barCls}"><i style="width:${pct.toFixed(1)}%"></i></div>
+      </div>
+      <label class="lb-quota">上限<input type="number" min="0" step="1" value="${bytesToGb(quota)}" data-quota="${quota}" title="单位 GB；填 0 表示无限制">GB</label>
+    </div>
+    <div class="lb-body">
+      ${(c.buckets && c.buckets.length)
+        ? c.buckets.map((b) => lbBucketHTML(b, quota, unlimited, used)).join('')
+        : '<div class="lb-empty">该密钥下暂无存储桶。</div>'}
+    </div>
+  </div>`;
+}
+
+function renderLoadBalance() {
+  const list = document.getElementById('lb-list');
+  const summary = document.getElementById('lb-summary');
+  if (!list) return;
+  const creds = (lbUsage && lbUsage.credentials) || [];
+  if (summary) {
+    const limited = creds.filter((c) => !c.unlimited).length;
+    const over = creds.filter((c) => c.exceeded).length;
+    summary.textContent = creds.length
+      ? `（${creds.length} 个密钥${limited ? ` · ${limited} 个已设上限` : ''}${over ? ` · ${over} 个已超额` : ''}）`
+      : '';
+  }
+  if (!creds.length) {
+    list.innerHTML = '<div class="lb-empty">暂无 API Key。请先在「访问密钥」中添加密钥与存储桶。</div>';
+    return;
+  }
+  list.innerHTML = creds.map(lbItemHTML).join('');
+
+  list.querySelectorAll('.lb-item').forEach((item) => {
+    const id = item.getAttribute('data-id');
+    const head = item.querySelector('.lb-head');
+    const input = item.querySelector('.lb-quota input');
+    const quotaBox = item.querySelector('.lb-quota');
+    if (head) {
+      head.onclick = () => {
+        const willOpen = !item.classList.contains('open');
+        item.classList.toggle('open', willOpen);
+        if (willOpen) lbOpen.add(id); else lbOpen.delete(id);
+      };
+    }
+    if (quotaBox) quotaBox.onclick = (ev) => ev.stopPropagation(); // 点配额区不触发折叠
+    if (input) {
+      input.onclick = (ev) => ev.stopPropagation();
+      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); input.blur(); } });
+      input.addEventListener('blur', () => saveQuota(id, input));
+    }
+  });
+}
+
+/**
+ * 保存某密钥的空间上限。
+ *
+ * 输入单位是 **GB**（人类可读），服务端只认字节 —— 换算与回填都在这里做。
+ * 「无变化」必须**早退**：blur 在用户只是点进点出时也会触发，若每次都发 PUT，
+ * 会平白产生一串写配置 + 记录日志的噪声操作。
+ */
+async function saveQuota(id, input) {
+  const gb = Number(input.value);
+  const prev = Number(input.getAttribute('data-quota')) || 0;
+  if (!Number.isFinite(gb) || gb < 0) {
+    toast('上限必须为非负数（填 0 表示无限制）', { type: 'error', duration: 5000 });
+    input.value = bytesToGb(prev);
+    return;
+  }
+  const bytes = Math.floor(gb * GB);
+  // GB 往返换算的精度损耗不应触发写入（例：1500000000B ⇄ 1.397GB）
+  if (bytesToGb(bytes) === bytesToGb(prev)) { input.value = bytesToGb(prev); return; }
+  try {
+    await API.setCredentialQuota(id, bytes);
+    toast(bytes > 0 ? `已设置空间上限：${fmtSize(bytes)}` : '已设为「无限制」', { type: 'success' });
+    loadLoadBalance();
+  } catch (e) {
+    toast('保存失败：' + e.message, { type: 'error', duration: 6000 });
+    input.value = bytesToGb(prev);
   }
 }

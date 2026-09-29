@@ -150,6 +150,48 @@ export function promptDialog({ title, label, value = '', okText = '确定', hint
   });
 }
 
+/* ------------------------------ 配额超限提示（R25） ------------------------------ */
+
+/**
+ * 服务端「超出 API Key 配额」的机器可读码（与 `server/bucket-stats.js` 的
+ * `QUOTA_EXCEEDED_CODE` **必须一致**，改一处就要改另一处）。
+ */
+export const QUOTA_EXCEEDED_CODE = 'CREDENTIAL_QUOTA_EXCEEDED';
+
+/**
+ * 把「超出 API Key 配额」的服务端错误渲染成**对话框**（其余错误返回 false 由调用方自理）。
+ *
+ * 放在 util.js 而不是 syssettings.js：它是纯展示助手（只用 openModal / escapeHtml / fmtSize），
+ * 而 syssettings.js 与 main.js 互相 import —— 上传模块再去 import 它就会绕成
+ * `upload → syssettings → main → upload` 的三方环。util.js 不依赖任何业务模块，零环风险。
+ *
+ * 为什么是对话框而不是 toast：需求要求「超出大小后…即弹窗告知」，且这个提示要给出
+ * 已用 / 上限 / 本次待写三个数字与可执行出路；toast 一闪而过，用户往往还没来得及看清，
+ * 就被后续每个文件各自的失败提示淹没。
+ *
+ * @param {Error & {code?: string, quota?: object}} err
+ * @returns {boolean} true 表示已按配额错误处理（调用方不要再弹通用提示）
+ */
+export function showQuotaDialog(err) {
+  if (!err || err.code !== QUOTA_EXCEEDED_CODE) return false;
+  const q = err.quota || {};
+  const rows = [
+    ['已使用', fmtSize(q.usedBytes || 0)],
+    ['空间上限', fmtSize(q.quotaBytes || 0)],
+  ];
+  if (q.addBytes) rows.push(['本次待写入', fmtSize(q.addBytes)]);
+  openModal({
+    title: '超出 API Key 空间上限',
+    body: { html: `<p style="line-height:1.7;font-size:13px">${escapeHtml(err.message || '该 API Key 的存储空间已达上限。')}</p>
+      <ul class="note-list" style="margin:8px 0 0">
+        ${rows.map(([k, v]) => `<li>${escapeHtml(k)}：<b>${escapeHtml(v)}</b></li>`).join('')}
+      </ul>
+      <div class="hint" style="margin-top:8px">可在「系统设置 → 负载均衡」中调大该密钥的上限（填 0 表示无限制），或清理该密钥下的文件后重试。</div>` },
+    foot: [{ text: '我知道了', cls: 'primary', onClick: (o, close) => close() }],
+  });
+  return true;
+}
+
 /* ------------------------------ 文件类型 ------------------------------ */
 
 export const TYPE_LABEL = { folder: '文件夹', image: '图片', video: '视频', audio: '音频', doc: '文档', archive: '压缩包', other: '文件' };

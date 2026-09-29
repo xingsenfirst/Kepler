@@ -196,6 +196,7 @@ function migrateV1(raw) {
       secretKey: String(raw.secretKey),
       remark: '',
       endpoint: '',
+      quotaBytes: 0, // R25：凭据级配额（0 = 无限制）
       createdAt: raw.createdAt || now,
     };
     cfg.credentials.push(cred);
@@ -233,6 +234,7 @@ function normalize(raw) {
     if (!c || typeof c !== 'object') continue;
     if (!providers.get(c.provider)) c.provider = providers.DEFAULT_PROVIDER_ID;
     if (typeof c.endpoint !== 'string') c.endpoint = '';
+    c.quotaBytes = normalizeQuotaBytes(c.quotaBytes); // R25：凭据级配额兜底（历史记录 = 0 = 无限制）
   }
   // 桶记录兜底：历史桶默认启用（enabled 向后兼容）；blockOverseasIP 默认关闭（按桶屏蔽海外 IP，向后兼容）
   for (const b of cfg.buckets) {
@@ -506,6 +508,28 @@ function activeCredential(cfg, bucket) {
 }
 
 /**
+ * R25：桶归属于哪把凭据 —— **按 API Key 聚合配额用量**的唯一定义点。
+ *
+ * 判据与「实际写入时用哪把密钥」**严格同源**（都走 {@link activeCredential}）：
+ *   ① 桶显式绑定 credentialId → 该凭据；
+ *   ② 未绑定 → 按 provider 落到同厂商的启用凭据（与上传时 `effectiveForBucket` 一致）；
+ *   ③ 无任何可用凭据 → 返回 ''（此时该桶本就无法写入，不归任何配额）。
+ *
+ * ⚠️ 为什么不能只看 `b.credentialId`：历史桶 / 未绑定桶在**上传时其实由某把启用密钥
+ * 服务**，若聚合时把它们排除，配额统计就会**低估**真实占用，闸门形同虚设 ——
+ * 「界面显示没超，实际早该拦」正是这类字段不一致的典型症状。
+ *
+ * @param {object} cfg 完整配置（来自 `load()`）
+ * @param {object} b   桶记录
+ * @returns {string} 凭据 id；无归属时为空串
+ */
+function credentialIdForBucket(cfg, b) {
+  if (!b || !cfg) return '';
+  const c = activeCredential(cfg, b);
+  return c ? c.id : '';
+}
+
+/**
  * 生效配置：扁平形状 { provider, secretId, secretKey, bucket, region, quotaBytes, domains }
  * 供 cos.js / 文件操作路由直接使用，保持与旧版一致。
  * 桶与密钥的服务商不一致时以桶为准（桶绑定密钥通常已保证一致），未绑定时用密钥的服务商。
@@ -607,6 +631,21 @@ function maskSecretId(sid) {
   return sid.length > 8 ? sid.slice(0, 4) + '****' + sid.slice(-4) : (sid ? '****' : '');
 }
 
+/**
+ * R25：凭据（API Key）级配额上限（字节）。
+ *
+ * `0` 表示**无限制** —— 与「桶配额」`quotaBytes` 同一约定（见 `bucketView`）。
+ * 语义上，凭据配额是该密钥下**所有桶占用之和**的上限；桶配额仍是单桶上限，
+ * 两者**并存且都在写入入口判定**（谁先命中谁拦），互不替代。
+ *
+ * 归一化统一走这里（`Number(...)` + 非正数一律落回 0），保证「界面上填 0」与
+ * 「历史记录缺字段」得到同一个数字，不会出现 `undefined` 参与算术得到 `NaN`。
+ */
+function normalizeQuotaBytes(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
 function credentialView(c) {
   return {
     id: c.id,
@@ -615,6 +654,7 @@ function credentialView(c) {
     endpoint: c.endpoint || '',
     secretIdMasked: maskSecretId(c.secretId),
     remark: c.remark || '',
+    quotaBytes: normalizeQuotaBytes(c.quotaBytes), // R25：凭据级配额（0 = 无限制）
     visibleToUsers: c.visibleToUsers !== false, // 对普通用户可见（默认 true，历史密钥向后兼容）
     enabled: c.enabled !== false, // 启用/停用（默认 true，历史密钥向后兼容）
     createdAt: c.createdAt || '',
@@ -664,7 +704,7 @@ function setCredentialsVisibility(visibleIds) {
   return { ok: true, visibleCount };
 }
 
-function addCredential({ provider, secretId, secretKey, remark, endpoint, visibleToUsers, enabled }) {
+function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaBytes, visibleToUsers, enabled }) {
   const cfg = requireStore();
   const now = new Date().toISOString();
   const pid = providers.get(provider) ? provider : providers.DEFAULT_PROVIDER_ID;
@@ -679,6 +719,7 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, visibl
     exist.provider = pid;
     exist.endpoint = ep;
     if (remark !== undefined) exist.remark = String(remark || '');
+    if (quotaBytes !== undefined) exist.quotaBytes = normalizeQuotaBytes(quotaBytes); // R25
     if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
     if (enabled !== undefined) exist.enabled = enabled !== false;
     // FUN-06：不再顺手改写全局 activeCredentialId。
@@ -694,6 +735,7 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, visibl
     secretKey,
     remark: String(remark || ''),
     endpoint: ep,
+    quotaBytes: normalizeQuotaBytes(quotaBytes), // R25：凭据级配额（0 = 无限制）
     visibleToUsers: visibleToUsers !== false, // 默认对普通用户可见
     enabled: enabled !== false, // 默认启用（历史密钥向后兼容）
     createdAt: now,
@@ -747,6 +789,8 @@ function updateCredential(id, patch) {
     c.endpoint = ep;
   }
   if (patch.remark !== undefined) c.remark = String(patch.remark || '');
+  // R25：凭据级配额（0 = 无限制）。与桶配额同款归一化，负数/非法值一律落回 0。
+  if (patch.quotaBytes !== undefined) c.quotaBytes = normalizeQuotaBytes(patch.quotaBytes);
   if (patch.visibleToUsers !== undefined) c.visibleToUsers = patch.visibleToUsers !== false;
   if (patch.enabled !== undefined) {
     c.enabled = patch.enabled !== false;
@@ -1783,10 +1827,10 @@ module.exports = {
   effective, effectiveForBucket, safeView, selfTest, isCorrupted,
   encrypt, decrypt, // 供 secure-store 复用同一主密钥与格式（S4）
   unwritableError, // 供 enc-store 等复用「备份 + 拒绝覆盖」语义（FUN-03 / FUN-04）
-  DEFAULT_CONFIG, DEFAULT_QUOTA,
+  DEFAULT_CONFIG, DEFAULT_QUOTA, normalizeQuotaBytes,
   listCredentials, listCredentialsFor, addCredential, removeCredential, setActiveCredential, updateCredentialRemark, updateCredential, setCredentialsVisibility,
   listProviders,
-  listBuckets, listBucketsFor, addBucket, updateBucket, removeBucket, setActiveBucket, setBucketsVisibility, bucketBlockOverseas,
+  listBuckets, listBucketsFor, addBucket, updateBucket, removeBucket, setActiveBucket, setBucketsVisibility, bucketBlockOverseas, credentialIdForBucket,
   getPrefs, setPrefs,
   getUploadExcludes, setUploadExcludes,
   getCaptcha, saveCaptcha,

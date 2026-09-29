@@ -1,6 +1,6 @@
 /** 应用入口 —— 全局状态、工具栏、状态栏、视图调度 */
 import { API } from './api.js';
-import { toast, fmtSize, fmtTime, openModal, escapeHtml, confirmDialog } from './util.js';
+import { toast, fmtSize, fmtTime, openModal, escapeHtml, confirmDialog, showQuotaDialog } from './util.js';
 import { explorer } from './explorer.js';
 import { tree } from './tree.js';
 import { ops } from './ops.js';
@@ -886,7 +886,9 @@ function openBucketDialog(existing) {
               checkBucketAcl(); // 新增桶后立即检测其权限状态
             }
           } catch (e) {
-            msg(e.message, 'bad');
+            // R25：超出 API Key 配额 → 弹专用对话框（含已用 / 上限 / 待写明细）；
+            // 其余错误仍就地显示在表单里（配额提示的措辞与出路与上传路径完全一致）
+            if (!showQuotaDialog(e)) msg(e.message, 'bad');
           }
         },
       },

@@ -2457,6 +2457,151 @@ const CASES = [
       testFile: 'invariants.test.js',
       minFail: 1,
     },
+
+    /* ==================== R25 · 负载均衡（按 API Key 的空间配额） ====================
+     *
+     * 本轮的判据全部集中在「谁被算进用量」与「每个写入入口都真的接了闸门」两件事上。
+     * 每条对照对应 `tests/audit25-regressions.test.js` 里**各自**的断言落点 ——
+     * 只有这样才能证明「某处闸门被摘掉」会真的变红，而不是被另一处的断言掩盖。
+     */
+    {
+      name: 'R25-01 · 用量聚合只看 credentialId（未绑定密钥的桶被漏算）',
+      file: 'server/bucket-stats.js',
+      anchor: 'const mine = (cfg.buckets || []).filter((b) => configStore.credentialIdForBucket(cfg, b) === credId);',
+      replacement: "const mine = (cfg.buckets || []).filter((b) => (b.credentialId || '') === credId);",
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-02 · 配额判定不再拒绝（闸门整条失效）',
+      file: 'server/bucket-stats.js',
+      anchor: 'if (usage.usedBytes + addBytes > usage.quotaBytes) {',
+      replacement: 'if (false) {',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-03 · 判定不再并入未取样增量（缓存期内可无限超额）',
+      file: 'server/bucket-stats.js',
+      anchor: 'const pending = Math.max(0, pendingUsageDelta(r.cfg));',
+      replacement: 'const pending = 0;',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-04 · 咽喉点不再把写入增量喂给配额记账',
+      file: 'server/routes/stats.js',
+      anchor: '  recordUsageDelta(cfg, delta);\n',
+      replacement: '',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-05【mkdir】· 新建文件夹不再过配额闸门',
+      file: 'server/routes/fs.js',
+      // 三处闸门（mkdir / rename / move）的 `await` 行**逐字相同**，仅靠注释行区分时，
+      // 注释被 `stripComments` 抹白成等长空格，注释长度一旦相同两条 anchor 就会互相命中
+      // （`String.replace` 只替换首处 → 变异打偏 → 假绿）。故 anchor 必须带上紧随其前的
+      // **真实代码行**（各不相同），唯一性才由代码而非注释长度决定。
+      anchor: '    const cfg = requireConfig();\n'
+        + '    // R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）\n'
+        + '    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
+      replacement: '    const cfg = requireConfig();\n'
+        + '    // R25：（变异）闸门已摘除',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-05【simple】· 直传不再过配额闸门',
+      file: 'server/routes/fs.js',
+      anchor: '    await assertCredentialQuota(cfg.credentialId, { addBytes: req.body.length });',
+      replacement: '    void 0;',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-05【init】· 分片上传初始化不再过配额闸门',
+      file: 'server/routes/fs.js',
+      anchor: '      await assertCredentialQuota(cfg.credentialId, { addBytes: Math.max(0, size - already) });',
+      replacement: '      void 0;',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-05【rename】· 重命名不再过配额闸门',
+      file: 'server/routes/fs.js',
+      anchor: '    if (newKey === key) return res.json({ ok: true, unchanged: true });\n\n'
+        + '    // R25：重命名是「复制到新键 + 删源键」，同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）\n'
+        + '    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
+      replacement: '    if (newKey === key) return res.json({ ok: true, unchanged: true });\n\n'
+        + '    // R25：（变异）闸门已摘除',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-05【move】· 移动不再过配额闸门',
+      file: 'server/routes/fs.js',
+      anchor: "    if (!paths.length) throw badRequest('未选择要移动的对象');\n"
+        + '    // R25：移动同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）\n'
+        + '    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
+      replacement: "    if (!paths.length) throw badRequest('未选择要移动的对象');\n"
+        + '    // R25：（变异）闸门已摘除',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-06 · 新建存储桶不再过配额闸门',
+      file: 'server/routes/buckets.js',
+      anchor: '      await assertCredentialQuota(targetCred, { addBytes: 0 });',
+      replacement: '      void 0;',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-07【WebDAV PUT·目录】· 不再过配额闸门',
+      file: 'server/webdav-server.js',
+      anchor: "      if (key.endsWith('/')) {\n"
+        + '        // R25：目录是 0 字节对象 → `addBytes=0`（仅「已超额」时拒绝）\n'
+        + '        await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
+      replacement: "      if (key.endsWith('/')) {",
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-07【WebDAV PUT·文件】· 不再过配额闸门',
+      file: 'server/webdav-server.js',
+      anchor: '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: putLen });',
+      replacement: '      void 0;',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-07【WebDAV MKCOL】· 不再过配额闸门',
+      file: 'server/webdav-server.js',
+      anchor: "      const dirKey = key.endsWith('/') ? key : key + '/';\n"
+        + '      // R25：新建集合是 0 字节对象 → `addBytes=0`\n'
+        + '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
+      replacement: "      const dirKey = key.endsWith('/') ? key : key + '/';",
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-07【WebDAV COPY·MOVE】· 不再过配额闸门',
+      file: 'server/webdav-server.js',
+      anchor: '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
+        + '      if (!srcIsDir) {',
+      replacement: '      if (!srcIsDir) {',
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R25-08 · 前端配额错误码与服务端不一致（弹窗永不触发）',
+      file: 'public/js/util.js',
+      anchor: "export const QUOTA_EXCEEDED_CODE = 'CREDENTIAL_QUOTA_EXCEEDED';",
+      replacement: "export const QUOTA_EXCEEDED_CODE = 'CREDENTIAL_QUOTA_EXCEEDED_TYPO';",
+      testFile: 'audit25-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

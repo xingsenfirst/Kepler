@@ -24,7 +24,7 @@ const { deleteMultipleConfirmed } = require('../cos'); // R10-03：批量删除�
  */
 const gateway = require('../fs-gateway');
 // R23-04：`apiHandler` 是「async 处理器 + 标准错误响应」的唯一实现点（见 _shared.js 的说明）
-const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey, apiHandler } = require('./_shared');
+const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey, apiHandler, assertCredentialQuota, errorBody } = require('./_shared');
 // R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
 const { adjustStorageCache } = require('./stats');
 const security = require('../security'); // SEC-09：直链签发需记录来源 IP
@@ -376,6 +376,8 @@ router.get('/fs/search', apiHandler(async (req, res) => {
 router.post('/fs/mkdir', async (req, res) => {
   try {
     const cfg = requireConfig();
+    // R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）
+    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
     const client = getClient(cfg);
     let key = normalizeKey(String((req.body || {}).path || ''));
     if (!key) throw badRequest('路径不能为空');
@@ -385,7 +387,7 @@ router.post('/fs/mkdir', async (req, res) => {
     statsStore.addLog({ action: 'fs.mkdir', detail: '创建文件夹 ' + key });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json(errorBody(err));
     statsStore.addLog({ action: 'fs.mkdir', detail: '创建文件夹失败: ' + err.message, level: 'error' });
   }
 });
@@ -404,6 +406,12 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
     // FUN-09：旧实现不传 gitignore 参数 —— ≤8MB 的文件走直传，.gitignore 排除规则
     // 在**最常用的那条路径上**被整体绕过（分片路径 /fs/upload/init 是传了的）。
     assertNotExcluded(key, String(req.query.gitignore || ''), String(req.query.gitignoreRel || ''));
+    /**
+     * R25：配额闸门 —— 在**加密与上传之前**判定，避免为一个注定被拒的文件做完整套加密。
+     * `addBytes` 传明文长度：这是调用方声明的"要占多少空间"，最贴近用户预期；
+     * 加密开销（魔数/IV/GCM tag）属实现细节，不计入 —— 否则「填 1GB 就该能传满 1GB」会落空。
+     */
+    await assertCredentialQuota(cfg.credentialId, { addBytes: req.body.length });
     let body = req.body;
     let encrypted = false;
     const enc = encStore.encryptBuffer(cfg.bucket, key, req.body);
@@ -426,7 +434,7 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
     statsStore.addLog({ action: 'fs.upload', detail: `上传 ${key}（${req.body.length} 字节，直传${encrypted ? `，已加密存储为 ${stored} 字节密文` : ''}）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json(errorBody(err));
     statsStore.addLog({ action: 'fs.upload', detail: '上传失败 ' + String(req.query.path || '') + ': ' + err.message, level: 'error' });
   }
 });
@@ -484,6 +492,17 @@ router.post('/fs/upload/init', async (req, res) => {
       } catch (e) {
         sess = null; // uploadId 已失效，重新创建
       }
+    }
+    /**
+     * R25：配额闸门 —— 放在**创建 uploadId 之前**，避免为一个注定被拒的任务在云端
+     * 留下持续计费的 UploadId。
+     *
+     * `addBytes` 只计**尚未落云**的字节：断点续传时已传分片已占用空间（且已计入
+     * `usedBytes`），全额再计一次会把「续传」误判为「又要传一整份」而无端拒绝。
+     */
+    {
+      const already = uploadedParts.reduce((s, x) => s + (Number(x.size) || 0), 0);
+      await assertCredentialQuota(cfg.credentialId, { addBytes: Math.max(0, size - already) });
     }
     if (!sess) {
       const init = await p(client, 'multipartInit', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
@@ -550,7 +569,7 @@ router.post('/fs/upload/init', async (req, res) => {
     if (uploadedParts.length) statsStore.addLog({ action: 'fs.upload', detail: `断点续传恢复 ${key}（已传 ${uploadedParts.length} 分片）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json(errorBody(err));
   }
 });
 
@@ -1109,6 +1128,9 @@ router.post('/fs/rename', async (req, res) => {
     const newKey = normalizeKey(parentOf(key) + newName + (isFolder ? '/' : ''));
     if (newKey === key) return res.json({ ok: true, unchanged: true });
 
+    // R25：重命名是「复制到新键 + 删源键」，同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）
+    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+
     let copied = 0;
     // FUN-14：无论文件还是文件夹，写目标前都先探测 —— 云端覆写不可撤销
     await assertNoConflict(client, cfg, newKey, newName);
@@ -1149,7 +1171,7 @@ router.post('/fs/rename', async (req, res) => {
     statsStore.addLog({ action: 'fs.rename', detail: `重命名 ${key} -> ${newKey}${isFolder ? `（共 ${copied} 个对象）` : ''}` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json(errorBody(err));
     statsStore.addLog({ action: 'fs.rename', detail: '重命名失败: ' + err.message, level: 'error' });
   }
 });
@@ -1163,6 +1185,8 @@ router.post('/fs/move', async (req, res) => {
     let targetPrefix = normalizeKey(String((req.body || {}).targetPrefix || ''));
     if (targetPrefix && !targetPrefix.endsWith('/')) targetPrefix += '/';
     if (!paths.length) throw badRequest('未选择要移动的对象');
+    // R25：移动同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）
+    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
     const keys = paths.map((raw) => normalizeKey(String(raw)));
     // 按下标回填、按入参顺序输出（目录串行 + 文件并发，两条路径不能打乱顺序）
     const results = new Array(keys.length).fill(null);
@@ -1243,7 +1267,7 @@ router.post('/fs/move', async (req, res) => {
     statsStore.addLog({ action: 'fs.move', detail: `移动 ${paths.length} 项到 ${targetPrefix || '/'}（成功 ${out.filter((r) => r.ok).length}）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json(errorBody(err));
     statsStore.addLog({ action: 'fs.move', detail: '移动失败: ' + err.message, level: 'error' });
   }
 });

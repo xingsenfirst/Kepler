@@ -32,6 +32,13 @@ async function request(method, path, body, { signal, noAuthRedirect } = {}) {
   if (!res.ok) {
     const err = new Error((data && data.error) || `请求失败（HTTP ${res.status}）`);
     err.status = res.status;
+    /**
+     * R25：配额类错误带**机器可读码 + 结构化明细**（`code` / `quota`）。
+     * 必须挂回错误对象 —— 只留文案的话，调用方无法把「超出 API Key 配额」与其它
+     * 403（如上传排除命中）区分开，只能对所有 403 弹同一条提示。
+     */
+    if (data && data.code) err.code = data.code;
+    if (data && data.quota) err.quota = data.quota;
     // 401 未登录 → 派发全局事件，由 main.js 统一跳回登录界面。
     // R8-12：服务端的 401 只有两种含义，这里都必须**真是**「没有有效会话」。
     // 「当前密码不正确」（webauthn 注册/关闭）已改为 403；登录类请求用 noAuthRedirect 排除。
@@ -62,7 +69,14 @@ export function xhrPut(url, blob, onProgress) {
     xhr.onload = () => {
       const d = xhr.response || {};
       if (xhr.status >= 200 && xhr.status < 300) resolve(d);
-      else { const err = new Error(d.error || `上传失败（HTTP ${xhr.status}）`); err.status = xhr.status; reject(err); }
+      else {
+        const err = new Error(d.error || `上传失败（HTTP ${xhr.status}）`);
+        err.status = xhr.status;
+        // R25：与 request() 同源 —— 直传（XHR）路径同样要能识别配额超限
+        if (d && d.code) err.code = d.code;
+        if (d && d.quota) err.quota = d.quota;
+        reject(err);
+      }
     };
     xhr.onerror = () => reject(new Error('网络错误，上传中断'));
     xhr.onabort = () => { const err = new Error('已中止'); err.aborted = true; reject(err); };
@@ -116,6 +130,9 @@ export const API = {
   deleteCredential: (id) => request('DELETE', `/api/credentials/${encodeURIComponent(id)}`),
   // 批量设置密钥对普通用户的可见性（仅管理员）
   saveCredentialVisibility: (visibleIds) => request('PUT', '/api/credentials/visibility', { visibleIds }),
+  // 负载均衡：按 API Key 的配额用量（仅管理员）
+  quotaUsage: () => request('GET', '/api/credentials/quota-usage'),
+  setCredentialQuota: (id, quotaBytes) => request('PUT', `/api/credentials/${encodeURIComponent(id)}`, { quotaBytes }),
 
   // 本地存储桶管理
   localBuckets: () => request('GET', '/api/buckets/local'),

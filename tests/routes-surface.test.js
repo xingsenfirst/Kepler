@@ -50,6 +50,8 @@ const EXPECTED = [
   'GET /credentials', 'POST /credentials', 'PUT /credentials/:id/active', 'PUT /credentials/visibility',
   'PUT /credentials/:id', 'DELETE /credentials/:id',
   'POST /config/verify',
+  // R25：只读的「按 API Key 的空间用量汇总」，管理员专属（对应系统设置页的负载均衡卡片）
+  'GET /credentials/quota-usage',
   // 注意：云端桶列表的 `GET /buckets` 已删除（死代码），唯一入口是 POST /config/verify
   'GET /buckets/local', 'POST /buckets/local', 'PUT /buckets/local/:id',
   'PUT /buckets/local/:id/enabled', 'PUT /buckets/local/:id/active', 'PUT /buckets/visibility',
@@ -129,6 +131,8 @@ test('敏感接口均挂载 requireAdmin', () => {
     'POST /config/verify',
     'POST /credentials', 'PUT /credentials/:id/active', 'PUT /credentials/visibility',
     'PUT /credentials/:id', 'DELETE /credentials/:id',
+    // R25：给出全部 API Key 的用量与上限，属账号资产信息 → 仅管理员
+    'GET /credentials/quota-usage',
     // 桶集合由管理员统一维护（普通用户不再自行添加：不知道桶名/地域，也无枚举权限）
     'POST /buckets/local',
     'PUT /buckets/local/:id/enabled', 'PUT /buckets/visibility', 'DELETE /buckets/local/:id',

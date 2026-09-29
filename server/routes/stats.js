@@ -5,7 +5,7 @@ const { express, configStore, statsStore } = require('./_context');
 const secureStore = require('../secure-store');
 const { LIMITS } = require('../limits');
 const { getClient, p, translateError, listAll } = require('../cos');
-const { requireConfig, requireAdmin, bucketCacheKey, asyncHandler } = require('./_shared');
+const { requireConfig, requireAdmin, bucketCacheKey, asyncHandler, recordUsageDelta } = require('./_shared');
 
 const router = express.Router();
 
@@ -52,6 +52,15 @@ function adjustStorageCache(delta, cfg) {
   if (!delta || !cfg) return;
   let key;
   try { key = bucketCacheKey(cfg); } catch (e) { return; }
+  /**
+   * R25：同一次增量**同时**喂给「按 API Key 的配额记账」（`bucket-stats.recordUsageDelta`）。
+   *
+   * 这里是全库写入/释放增量最集中的咽喉点（上传直传 / 分片合并 / 删除 / 清空桶都经此处），
+   * 因而也是「配额判定用数字」的唯一增量来源 —— 若另起一处记账，两边迟早漏一条路径
+   * （典型症状：某个入口的写入不计入配额，用户可借它无限绕开限制）。
+   * 记账是纯内存累加、不抛错；`adjustStorageCache` 本身仍保持「无缓存条目即静默空转」的语义。
+   */
+  recordUsageDelta(cfg, delta);
   const hit = storageCacheMap.get(key);
   if (!hit || !hit.data) return;
   hit.data.usedBytes = Math.max(0, (hit.data.usedBytes || 0) + delta);

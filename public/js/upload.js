@@ -1,6 +1,8 @@
 /** 上传管理器 —— 队列 / 分块并发 / 断点续传 / 暂停恢复取消 */
 import { API, xhrPut } from './api.js';
-import { fmtSize, toast, escapeHtml } from './util.js';
+// R25：`showQuotaDialog` 放在 util.js（纯展示助手）—— 若从 syssettings.js 取，
+// 会绕成 `upload → syssettings → main → upload` 的三方环。
+import { fmtSize, toast, escapeHtml, showQuotaDialog, QUOTA_EXCEEDED_CODE } from './util.js';
 import { createMatcher as createGitignoreMatcher } from './gitignore.js';
 import { App } from './main.js';
 
@@ -91,6 +93,7 @@ export const uploadMgr = {
       });
     }
     document.getElementById('upload-drawer').hidden = false;
+    quotaDialogShown = false; // R25：新一轮上传 = 重新给一次配额提示机会
     toast(`已加入 ${list.length} 个上传任务`, { type: 'info' });
     this.render();
     pump();
@@ -205,6 +208,15 @@ function readFileText(file) {
 
 /* ------------------------- 调度 ------------------------- */
 
+/**
+ * R25：配额超限对话框的「本轮只弹一次」闸门。
+ *
+ * 一次目录上传可能含上千个文件，它们在服务端都会被同一个超限判据拒绝 ——
+ * 若逐个弹窗，用户会被上千个一模一样的对话框淹没。这里每轮上传只弹一次，
+ * 并于**加入新任务时复位**（用户去扩容 / 清理后重新发起上传，需要能再次看到提示）。
+ */
+let quotaDialogShown = false;
+
 function pump() {
   const waiting = tasks.filter((t) => t.state === 'waiting');
   const running = tasks.filter((t) => t.state === 'uploading').length;
@@ -214,7 +226,13 @@ function pump() {
       if (!t.canceled && !t.paused) {
         t.state = 'failed';
         t.error = e.message || '上传失败';
-        toast(`上传失败：${t.key}（${t.error}）`, { type: 'error' });
+        // 配额超限：弹**对话框**（非 toast）并去重；其余错误仍走 toast
+        if (e && e.code === QUOTA_EXCEEDED_CODE) {
+          if (!quotaDialogShown) { quotaDialogShown = true; showQuotaDialog(e); }
+          t.error = '超出 API Key 空间上限';
+        } else {
+          toast(`上传失败：${t.key}（${t.error}）`, { type: 'error' });
+        }
       }
       uploadMgr.render();
       pump();
@@ -376,6 +394,7 @@ function reset() {
     }
   }
   tasks.length = 0;
+  quotaDialogShown = false; // R25：换账号后上一账号的「已弹过」状态不得沿用
   uploadMgr.render();
   // render() 在「上传面板未挂载」时会早退（找不到 #upload-list），此时计数会残留
   // 上一账号的值 → 这里再兜一次，保证状态栏与队列同步归零。

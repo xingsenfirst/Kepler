@@ -235,6 +235,23 @@
                 </ul>
               </div>
             </div>
+            <!-- 负载均衡（仅管理员）：按 API Key 设置空间上限 + 各桶占用（R25） -->
+            <div class="dash-card wide sysset-card" id="sysset-lb-card">
+              <h3 class="sysset-h3"><span class="sysset-tag lb">均衡</span>负载均衡 <span id="lb-summary" class="lk-count"></span>
+                <button id="btn-lb-refresh" class="mini-btn sysset-action">刷新</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：为每个 API Key（访问密钥）设置<b>可使用空间上限</b>，<b>填 0 表示无限制</b>。超出上限后，使用该密钥创建新的存储桶、或向该密钥下的存储桶上传文件，都会被服务端拒绝并弹窗告知。下方按密钥分组列出各存储桶的占用（按大小降序，默认折叠）。
+              </div>
+              <div id="lb-list" class="lb-list"></div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>配额统计的是该密钥下<b>全部存储桶占用之和</b>；桶自身的容量上限仍然同时生效，两者谁先命中谁拦。</li>
+                  <li>用量取自对象存储官方统计（缓存 15 分钟），并叠加本系统已记账的写入增量；点「刷新」会重新拉取。</li>
+                  <li>管理端的文件上传与「复制 / 移动」，以及 WebDAV 挂载的写入（PUT / COPY / MKCOL / MOVE）同样受此上限约束。</li>
+                  <li>本卡片仅管理员可见；普通用户看不到密钥清单与各桶占用。</li>
+                </ul>
+              </div>
+            </div>
             <!-- 你为什么要 F12 翻代码？你什么目的？ -->
             <div class="dash-card wide sysset-card" id="sysset-enc-card">
             <h3 class="sysset-h3"><span class="sysset-tag enc">加密</span>文件加密 <span id="enc-status" class="lk-count"></span>
@@ -477,7 +494,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.2.4</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.2.5</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

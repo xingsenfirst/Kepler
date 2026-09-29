@@ -19,6 +19,14 @@ const statsStore = require('./stats-store');
 const { getClient, p, normalizeKey, listAllExact, translateError } = require('./cos');
 const providers = require('./providers');
 const gateway = require('./fs-gateway');
+/**
+ * R25：按 API Key 的配额闸门 + 写入增量记账。
+ *
+ * 直接 require **根级模块**而不是 `routes/_shared` —— 依赖图是单向的
+ * `routes/* → routes/_context → webdav-server → fs-gateway → cos`，反向 require
+ * `routes/_shared` 会构成循环（见 `bucket-stats.js` 文件头）。
+ */
+const bucketStats = require('./bucket-stats');
 const ipGuard = require('./ip-guard');
 const { LIMITS } = require('./limits');
 const { getSelfSignedCert } = require('./local-cert');
@@ -739,10 +747,18 @@ function buildApp() {
       let key = reqPathToKey(req.path);
       if (!key) return res.status(409).type('text/plain').send('409 Conflict：无法上传到根路径');
       if (key.endsWith('/')) {
+        // R25：目录是 0 字节对象 → `addBytes=0`（仅「已超额」时拒绝）
+        await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
         try { await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key }, { noStat: true }); return res.status(405).end(); } catch (e) { /* 不存在则创建 */ }
         await p(cos, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key, Body: Buffer.alloc(0), ContentLength: 0 });
         return res.status(201).end();
       }
+      /**
+       * R25：配额闸门。`Content-Length` 可得时按「整份写入」预判（可在落盘前拦下），
+       * 分块传输（无 Content-Length）时退化为「仅已超额才拒绝」。
+       */
+      const putLen = Math.max(0, Number(req.headers['content-length']) || 0);
+      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: putLen });
       // 经网关写入：自动加密（mode!=='none'）+ 联动元数据 + 审计
       const r = await gateway.writeObject(
         cfg.bucket, key, req,
@@ -750,6 +766,8 @@ function buildApp() {
         'webdav.put',
         req.webdavUser ? `${req.webdavUser.username} 上传 ` : 'WebDAV 上传 '
       );
+      // 记账落盘后的**实际**字节数（加密后会与 Content-Length 不同）—— 供配额判定用
+      bucketStats.recordUsageDelta(cfg, r.bytesWritten);
       res.status(r.existed ? 204 : 201).end();
     } catch (e) {
       /**
@@ -777,6 +795,8 @@ function buildApp() {
       const key = reqPathToKey(req.path);
       if (!key) return res.status(409).end();
       const dirKey = key.endsWith('/') ? key : key + '/';
+      // R25：新建集合是 0 字节对象 → `addBytes=0`
+      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
       try {
         await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: dirKey }, { noStat: true });
         return res.status(405).type('text/plain').send('405 Method Not Allowed：集合已存在');
@@ -797,8 +817,12 @@ function buildApp() {
       const key = reqPathToKey(req.path);
       if (!key) return res.status(403).type('text/plain').send('403：禁止删除存储桶根');
       const userLabel = req.webdavUser ? `${req.webdavUser.username} 删除 ` : 'WebDAV 删除 ';
+      // R25：删除**不设配额闸门**（删除是在释放空间，拦下它只会让用户更出不去）；
+      // 只把释放的字节记账，让配额判定及时跟着回落。目录删除（deletePrefix）不返回
+      // 字节数，故不记账 —— 代价是额度数字偏保守（**偏严**方向，不会放行超额写入）。
       if (!key.endsWith('/')) {
-        await gateway.deleteObject(cfg.bucket, key, 'webdav.delete', userLabel);
+        const del = await gateway.deleteObject(cfg.bucket, key, 'webdav.delete', userLabel);
+        if (del && del.bytesFreed) bucketStats.recordUsageDelta(cfg, -del.bytesFreed);
       } else {
         // FUN-04 同型：删目录可能未删完（对象数超上限）。此时必须如实报错，
         // 绝不能返回 204 —— 否则客户端以为删除成功，残留对象继续占费且元数据已被清理。
@@ -870,6 +894,14 @@ function buildApp() {
       }
 
       const srcIsDir = srcKey.endsWith('/');
+      /**
+       * R25：COPY / MOVE 的配额闸门 —— `addBytes=0`（只拦「已超额」）。
+       *
+       * 为什么不传源对象大小：COPY 会新增一份占用，但它要么是文件（大小已知需先 HEAD，
+       * 平白多一次往返）、要么是目录（要全量列举才知道），且 WebDAV 客户端在超额时
+       * 拿到 507/403 都会重试。统一取「已超额即拒」，语义简单且判定成本为零。
+       */
+      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
       if (!srcIsDir) {
         // 文件
         // R10-11：判据统一走 destinationExists（与目录分支同源）

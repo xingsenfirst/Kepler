@@ -5,8 +5,31 @@
  * 供各领域子路由复用。**行为与原实现完全一致**，仅搬移位置。
  */
 const crypto = require('crypto');
-const { providers, security, configStore, statsStore, encStore, cos } = require('./_context');
-const { getClient, providerOf, p, translateError, listAll, badRequest } = require('../cos');
+const { providers, security, configStore, statsStore, encStore, cos, gitignore } = require('./_context');
+/**
+ * R25：`gitignore` 必须在**模块作用域**可见 —— `cachedGitignoreMatcher()` 里用了
+ * `gitignore.createMatcher()`，而此前唯一一处 `require('../gitignore')` 是
+ * `assertNotExcluded()` 内的**局部** const，对另一个函数不可见。
+ *
+ * 于是「上传排除 → .gitignore 排除」一旦开启且客户端带了 `.gitignore`，走到
+ * `cachedGitignoreMatcher()` 就抛 `ReferenceError: gitignore is not defined`；
+ * 因为没有测试真的**跑**这条路径（`audit3` 只做静态正则断言），该缺陷长期无人发现
+ * （eslint 的 `no-undef` 一直报，但 lint 未纳入门禁）。
+ * 现在统一由 `_context`（它本就导出 `gitignore`）提供，`gitignore.MAX_TEXT` 等
+ * 常量与 `createMatcher` 同源。
+ */
+const { p, translateError, badRequest } = require('../cos');
+/**
+ * R25：桶容量的「键 / 缓存 / 取值 / 客户端解析 / 并发映射」唯一定义点已下沉到
+ * `server/bucket-stats.js`（根级模块，不依赖 routes）。原因见该文件头：WebDAV 独立
+ * 实例也要判配额，而 `webdav-server → routes/_shared → _context → webdav-server`
+ * 会构成循环依赖。此处转出，既有调用方与 `shared.bucketStat` 等测试钩子无感。
+ */
+const {
+  bucketCacheKey, bucketSizeCache, BUCKET_STAT_CACHE_MS, getBucketStatViaApi, bucketStat,
+  resolveBucketClient, mapLimit,
+  QUOTA_EXCEEDED_CODE, assertCredentialQuota, credentialUsage, recordUsageDelta,
+} = require('../bucket-stats');
 
 exports = module.exports = {};
 
@@ -333,15 +356,15 @@ function requireLocalBucket(id) {
 }
 
 // 为指定桶解析客户端（桶可能未关联可用密钥）
+// R25：「解析」的唯一实现点是 `bucket-stats.resolveBucketClient`（返回 null 的宽容语义，
+// 供按 API Key 的用量统计跳过个别缺配置的桶）；这里只在其上加一层「失败即抛 428」。
 function bucketClient(b) {
-  const cfg = configStore.effectiveForBucket(b.bucket, b.region);
-  const provider = (cfg && cfg.provider) || providers.DEFAULT_PROVIDER_ID;
-  const needRegion = (providers.get(provider) || {}).regionRequired !== false;
-  if (!cfg || !cfg.secretId || !cfg.secretKey || (needRegion && !cfg.region)) {
+  const r = resolveBucketClient(b);
+  if (!r) {
     const e = new Error('该存储桶没有可用的访问密钥或地域信息，请先在“系统设置”中配置密钥');
     e.status = 428; throw e;
   }
-  return { cfg, cos: getClient(cfg) };
+  return r;
 }
 
 // 安全确认：用户必须手动输入完整桶名且完全一致
@@ -350,89 +373,9 @@ function requireNameConfirm(body, bucket) {
   if (v !== bucket) throw badRequest('确认失败：输入的名称与存储桶完整名称不一致，操作已取消');
 }
 
-/**
- * 桶相关缓存的唯一键：多云下不同厂商/不同密钥可能绑定**同名桶**，
- * 若仅以桶名作键会互相覆盖（A 厂商的容量显示成 B 厂商的数字）。故并入 provider 与凭据。
- */
-function bucketCacheKey(cfg) {
-  return [providerOf(cfg), cfg.secretId || '', cfg.bucket || '', cfg.region || ''].join('|');
-}
+/* 桶容量键 / 缓存 / 取值 / prune —— 自 R25 起唯一定义在 `server/bucket-stats.js`（本文件顶部已转出） */
 
-// 桶容量缓存（与原实现共用同一份状态）
-const bucketSizeCache = new Map(); // cacheKey -> { t, sizeBytes, objectCount, estimated }
-const BUCKET_STAT_CACHE_MS = 15 * 60 * 1000;
-/** FUN-12：缓存条目上限。密钥轮换 / 多桶会持续产生新 key，无上限即缓慢泄漏 */
-const BUCKET_STAT_CACHE_MAX = 200;
-
-/**
- * 写入前顺带清掉过期项；仍超限则淘汰最早的（Map 保持插入顺序）。
- * 旧实现只判 TTL 从不删除 —— 条目只增不减，长时间运行就是一条单调上升的内存曲线。
- */
-function pruneBucketSizeCache() {
-  const now = Date.now();
-  for (const [k, v] of bucketSizeCache) {
-    if (now - v.t > BUCKET_STAT_CACHE_MS) bucketSizeCache.delete(k);
-  }
-  while (bucketSizeCache.size >= BUCKET_STAT_CACHE_MAX) {
-    const oldest = bucketSizeCache.keys().next();
-    if (oldest.done) break;
-    bucketSizeCache.delete(oldest.value);
-  }
-}
-
-/** 调用腾讯云 COS ?stats 接口获取官方容量；返回 { sizeBytes, objectCount } 或 null（失败/不支持） */
-async function getBucketStatViaApi(client, cfg) {
-  if (!providers.isCos(providerOf(cfg.provider))) return null;
-  try {
-    const data = await p(client, 'request', { Method: 'GET', Bucket: cfg.bucket, Region: cfg.region, action: 'stats' }, { noStat: true });
-    const body = data && (data.Body || data.body);
-    if (typeof body === 'string') {
-      const sizeM = body.match(/<Size>([^<]+)<\/Size>/);
-      const objM = body.match(/<ObjectNumber>([^<]+)<\/ObjectNumber>/);
-      if (sizeM || objM) return { sizeBytes: sizeM ? Number(sizeM[1]) : 0, objectCount: objM ? Number(objM[1]) : 0 };
-    } else if (body && typeof body === 'object') {
-      return { sizeBytes: Number(body.Size) || 0, objectCount: Number(body.ObjectNumber) || 0 };
-    }
-    return null;
-  } catch (e) {
-    return null; // 失败由调用方回退
-  }
-}
-
-async function bucketStat(client, cfg) {
-  const key = bucketCacheKey(cfg);
-  const c = bucketSizeCache.get(key);
-  if (c && Date.now() - c.t < BUCKET_STAT_CACHE_MS) return c;
-  pruneBucketSizeCache(); // FUN-12：写之前清理，避免条目无限堆积
-
-  // P3：优先官方 ?stats 接口（单次 API 调用，无分页扫全桶）
-  const official = await getBucketStatViaApi(client, cfg);
-  if (official) {
-    const out = {
-      sizeBytes: official.sizeBytes,
-      objectCount: official.objectCount,
-      estimated: false,
-      source: 'GetBucketStat',
-      t: Date.now(),
-    };
-    bucketSizeCache.set(key, out);
-    return out;
-  }
-
-  // 回退：分页列出对象累计（最多扫描 5000 个，超出为估算值）
-  const items = await listAll(client, cfg, '', { cap: 5001 });
-  const out = {
-    sizeBytes: items.reduce((s, x) => s + (x.size || 0), 0),
-    objectCount: items.length,
-    estimated: items.length >= 5001,
-    source: 'ListScan',
-    t: Date.now(),
-  };
-  bucketSizeCache.set(key, out);
-  return out;
-}
-
-/* ---------------- 分片列举短缓存（PERF-01） ---------------- */
+/* -------------------------------- 分片列举短缓存（PERF-01） ---------------- */
 
 /**
  * 分片列表是**整桶翻页扫描**：`/buckets/stats` 对 N 个桶各扫一遍、
@@ -543,22 +486,7 @@ async function listFragmentsNoCache(client, cfg, { noStat = false } = {}) {
   }));
 }
 
-/** 带并发上限的并行映射（P3：多桶统计并行，但限制并发避免触发 COS 限流） */
-async function mapLimit(items, limit, fn) {
-  const out = new Array(items.length);
-  let cursor = 0;
-  const workers = [];
-  for (let w = 0; w < Math.min(limit, items.length); w++) {
-    workers.push((async () => {
-      while (cursor < items.length) {
-        const idx = cursor++;
-        out[idx] = await fn(items[idx], idx);
-      }
-    })());
-  }
-  await Promise.all(workers);
-  return out;
-}
+/* `mapLimit` 自 R25 起唯一定义在 `server/bucket-stats.js`（本文件顶部已转出） */
 
 /* ============================ 上传排除 ============================ */
 
@@ -574,7 +502,6 @@ function checkBasenameExcluded(key) {
 
 /** 服务端兜底：校验上传 key 是否被排除规则命中（命中抛出 403） */
 function assertNotExcluded(key, gitignoreText, gitignoreRel) {
-  const gitignore = require('../gitignore');
   const hit = checkBasenameExcluded(key);
   if (hit) {
     const e = new Error(`文件 ${hit} 已被系统设置中的「上传排除」规则过滤，已跳过`);
@@ -655,6 +582,25 @@ function sendError(res, e, fallbackStatus = 500) {
   return err;
 }
 
+/**
+ * R25：统一错误响应体（**配额类错误带结构化明细**）。
+ *
+ * 在既有 `{ error: message }` 之上，把配额错误的机器可读码与明细一并下发
+ * （`code` / `quota`）。前端 `api.js` 会把这些字段挂回抛出的错误对象，据此弹
+ * 「超出配额」对话框 —— 只下发文案的话，前端无法把「配额超限」与其它 403
+ * （如上传排除命中）区分开，只能对所有 403 一律弹同一个提示。
+ *
+ * 与 `apiHandler` 的关系：`apiHandler` 是「翻译 + 落地」的唯一实现点，但它固定下发
+ * `{ error }`；配额闸门所在的少数路由在其 catch 里改用本函数**构造响应体**
+ * （响应仍由路由自身 `res.status(...).json(...)` 落地），两者语义一致、互不冲突。
+ */
+function errorBody(err) {
+  const out = { error: (err && err.message) ? err.message : String((err && err.toString()) || '') };
+  if (err && err.code) out.code = err.code;
+  if (err && err.quota) out.quota = err.quota;
+  return out;
+}
+
 Object.assign(module.exports, {
   typeOf, baseName, parentOf,
   roleOf, bucketsFor, credentialsFor,
@@ -667,5 +613,7 @@ Object.assign(module.exports, {
   listFragments, listFragmentsNoCache, invalidateFragmentCache, mapLimit,
   FRAGMENT_CACHE_MAX, DEFAULT_FRAGMENT_TTL_MS, sweepFragmentCache,
   checkBasenameExcluded, assertNotExcluded,
-  sendError,
+  sendError, errorBody,
+  // R25：按 API Key 的配额（闸门 + 明细）
+  QUOTA_EXCEEDED_CODE, assertCredentialQuota, credentialUsage, recordUsageDelta,
 });

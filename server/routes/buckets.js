@@ -11,6 +11,7 @@ const { getClient, p, translateError, listAll, badRequest } = require('../cos');
 const {
   requireAdmin, roleOf, bucketsFor, requireConfig, requireLocalBucket,
   bucketClient, requireNameConfirm, bucketStat, listFragments, listFragmentsNoCache, mapLimit,
+  assertCredentialQuota, errorBody,
 } = require('./_shared');
 // R23-03：前缀递归删除的唯一实现点在 `fs-gateway.js`（本文件原先自带一份同构实现）
 const gateway = require('../fs-gateway');
@@ -111,6 +112,20 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
     // 此时要求云端可达只会让「离线改个备注」也无故失败。
     let warning = '';
     if (!exists) {
+      /**
+       * R25：新建桶前先过「按 API Key 的配额」闸门。
+       *
+       * `addBytes=0` —— 建桶本身不占空间，只有**已经超出上限**时才拒绝，
+       * 与需求文案「超出大小后…创建新的存储桶即弹窗告知」一致。
+       * 归属密钥优先取入参 `credentialId`；未指定时按 provider 推导（与 `addBucket`
+       * 实际绑定的那把密钥同源，见 `config-store.credentialIdForBucket`）。
+       */
+      const full = configStore.load() || { credentials: [], buckets: [] };
+      const targetCred = b.credentialId
+        ? String(b.credentialId)
+        : configStore.credentialIdForBucket(full, { provider, credentialId: '', bucket, region });
+      await assertCredentialQuota(targetCred, { addBytes: 0 });
+
       const probe = await probeBucket(bucket, region, credOverride);
       if (!probe.ok) return res.status(400).json({ error: '无法访问该存储桶：' + probe.message + '。请检查桶名、地域与所选密钥是否正确' });
       if (probe.warning) warning = probe.warning;
@@ -131,7 +146,7 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
     statsStore.addLog({ action: 'config.save', detail: '添加存储桶 ' + bucket, level: 'info' });
     res.json(Object.assign({ ok: true, bucket: saved, warning: warning || undefined }, configStore.listBuckets()));
   } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
+    res.status(e.status || 500).json(errorBody(e)); // R25：配额类错误需带 code/quota 明细
   }
 });
 
@@ -337,6 +352,7 @@ router.get('/buckets/stats', async (req, res) => {
         provider: b.provider || providers.DEFAULT_PROVIDER_ID,
         providerName: providers.nameOf(b.provider),
         quotaBytes: b.quotaBytes || 0,
+        credentialId: b.credentialId || '', // R25：负载均衡卡片据此把桶归到 API Key 下
         enabled: b.enabled !== false,
         blockOverseasIP: b.blockOverseasIP === true,
         active: b.id === activeBucketId,

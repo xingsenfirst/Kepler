@@ -4,8 +4,10 @@
  */
 const { express, providers, configStore, statsStore } = require('./_context');
 const { createClient, p, translateError } = require('../cos');
-const { requireAdmin, roleOf, credentialsFor, validateCredentialFormat } = require('./_shared');
+const { requireAdmin, roleOf, credentialsFor, validateCredentialFormat, asyncHandler, mapLimit } = require('./_shared');
 const { assertSafeEndpoint } = require('../endpoint-guard');
+// R25：按 API Key 的配额用量（负载均衡卡片）与写入闸门同源
+const bucketStats = require('../bucket-stats');
 
 const router = express.Router();
 
@@ -86,8 +88,15 @@ router.post('/credentials', requireAdmin, (req, res) => {
   const fmtErr = validateCredentialFormat(b.provider, secretId);
   if (fmtErr) return res.status(400).json({ error: fmtErr });
   if (!secretKey) return res.status(400).json({ error: '请填写 SecretKey' });
+  // R25：凭据级配额（0 = 无限制）——与 PUT /credentials/:id 同款校验
+  let quotaBytes;
+  if (b.quotaBytes !== undefined) {
+    const q = Number(b.quotaBytes);
+    if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
+    quotaBytes = Math.floor(q);
+  }
   try {
-    const cred = configStore.addCredential({ provider: b.provider, secretId, secretKey, remark: b.remark, endpoint: b.endpoint, visibleToUsers: b.visibleToUsers, enabled: b.enabled });
+    const cred = configStore.addCredential({ provider: b.provider, secretId, secretKey, remark: b.remark, endpoint: b.endpoint, quotaBytes, visibleToUsers: b.visibleToUsers, enabled: b.enabled });
     // FUN-06：同上，新增密钥由本管理员接口显式设为当前（存储层不再自动改写）
     configStore.setActiveCredential(cred.id);
     statsStore.addLog({ action: 'config.save', detail: '保存访问密钥 ' + cred.secretIdMasked, level: 'info' });
@@ -132,10 +141,18 @@ router.put('/credentials/visibility', requireAdmin, (req, res) => {
   }
 });
 
-// 修改密钥（备注 / 可见性 / 启停，仅管理员）——停用时自动设为不可见
+// 修改密钥（备注 / 可见性 / 启停 / 配额，仅管理员）——停用时自动设为不可见
 router.put('/credentials/:id', requireAdmin, (req, res) => {
   try {
-    if (!configStore.updateCredential(req.params.id, (req.body || {}))) {
+    const b = req.body || {};
+    // R25：凭据级配额（0 = 无限制）。与桶配额**同款前置校验**（负数/非法值一律 400），
+    // 否则「界面填 -1」会被归一化成 0（= 无限制），用户以为设了限制其实完全放开。
+    if (b.quotaBytes !== undefined) {
+      const q = Number(b.quotaBytes);
+      if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
+      b.quotaBytes = Math.floor(q);
+    }
+    if (!configStore.updateCredential(req.params.id, b)) {
       return res.status(404).json({ error: '密钥不存在' });
     }
     res.json(Object.assign({ ok: true }, configStore.listCredentials()));
@@ -154,6 +171,46 @@ router.delete('/credentials/:id', requireAdmin, (req, res) => {
     res.status(e.status || 500).json({ error: e.message });
   }
 });
+
+/* ============================ 负载均衡（按 API Key 的配额用量，R25） ============================ */
+
+/**
+ * 按 API Key 汇总「配额上限 / 已用 / 各桶占用」——**仅管理员**。
+ *
+ * 为什么仅管理员：响应里含**全部**密钥（含未对普通用户可见的）与其下全部桶名，
+ * 是账号资产清单。与 `GET /config`（`safeView` 收窄）口径一致，普通用户不得枚举。
+ *
+ * 用量数字与写入闸门**同源**（都走 `bucketStats.credentialUsage`）：
+ * 卡片上看到的就是闸门实际用来判定的数字，不会出现「界面显示没超、上传却被拦」。
+ * `usedBytes` 已包含尚未被新鲜取样吸收的写入增量（见 `bucket-stats.bucketPendingDelta`）。
+ */
+router.get('/credentials/quota-usage', requireAdmin, asyncHandler(async (req, res) => {
+  const cfg = configStore.load() || { credentials: [], buckets: [] };
+  // 展示字段（掩码 / 厂商名 / 启停 / 可见性）复用既有安全视图，避免这里另写一份掩码逻辑
+  const views = new Map((configStore.listCredentials().credentials || []).map((c) => [c.id, c]));
+  const credentials = await mapLimit(cfg.credentials || [], 4, async (cred) => {
+    const usage = await bucketStats.credentialUsage(cred.id);
+    const view = views.get(cred.id) || { id: cred.id };
+    return {
+      id: view.id,
+      provider: view.provider || cred.provider,
+      providerName: view.providerName || '',
+      secretIdMasked: view.secretIdMasked || '',
+      remark: view.remark || '',
+      enabled: view.enabled !== false,
+      visibleToUsers: view.visibleToUsers !== false,
+      quotaBytes: usage.quotaBytes, // 0 = 无限制
+      unlimited: usage.unlimited,
+      usedBytes: usage.usedBytes,
+      outstandingBytes: usage.outstandingBytes,
+      // exceeded：已用（不含本次待写）是否已越过上限 —— 与闸门 addBytes=0 的判定一致
+      exceeded: !usage.unlimited && usage.usedBytes > usage.quotaBytes,
+      bucketCount: usage.buckets.length,
+      buckets: usage.buckets, // 已按 sizeBytes 降序
+    };
+  });
+  res.json({ credentials });
+}));
 
 /* ============================ 连接验证 ============================ */
 

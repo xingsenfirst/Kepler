@@ -222,11 +222,28 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /**
  * CSRF 校验：安全方法直接放行；其余方法要求 X-Requested-With: XMLHttpRequest。
  * 前端 api.js / xhrPut 已统一携带该头。
+ *
+ * R24-06：在此之上补一层**同源校验**。原判据是**单点** —— 它依赖「浏览器不让跨站
+ * 请求伪造自定义头」这一事实；一旦将来引入 CORS、或反代 / 插件替请求补上该头，
+ * 这道防线就**静默消失**（且没有任何症状）。因此只要请求带了 `Origin`（其次
+ * `Referer`），就要求其主机与**本次请求的 Host**一致；两者都缺失时放行 ——
+ * curl / wget 之类直连客户端本就不带这两个头，不在「浏览器跨站」的威胁面内，
+ * 收紧只会误伤它们。
+ *
+ * 与请求自身 Host 比对（而不是与配置域名比对）有两个好处：不依赖站点是否配置了
+ * 域名（局域网 / Docker 直接访问照样成立），也不会因反代隐藏端口而误判。
+ * `Origin: null`（沙箱 iframe / 某些重定向）不是合法 URL → 直接拒绝。
  */
 function csrfGuard(req) {
   if (SAFE_METHODS.has(req.method)) return true;
   const h = String(req.get('x-requested-with') || '');
-  return h.toLowerCase() === 'xmlhttprequest';
+  if (h.toLowerCase() !== 'xmlhttprequest') return false;
+  const src = String(req.get('origin') || req.get('referer') || '').trim();
+  if (!src) return true;
+  let from = '';
+  try { from = new URL(src).host; } catch (e) { return false; }
+  const want = normalizeHost(String(req.get('host') || ''));
+  return normalizeHost(from) !== '' && normalizeHost(from) === want;
 }
 
 /* ============================ 速率限制 ============================ */
@@ -477,7 +494,7 @@ module.exports = {
   // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
   normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
   isIpLiteral, hasForwardedHeader,
-  httpsRedirectHost, isBindAllHost,
+  httpsRedirectHost, isBindAllHost, configuredSiteHost,
   csrfGuard, SAFE_METHODS,
   createLimiter, limitMiddleware,
   createFailLock,

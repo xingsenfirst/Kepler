@@ -7,12 +7,15 @@
  */
 // R7-03：shareStore 一并从 _context 取（删对象/删桶都要同步标记分享链接）
 const { express, providers, configStore, statsStore, encStore, ipGuard, shareStore } = require('./_context');
-const { getClient, p, translateError, listAll, listAllInfo, LIMITS, badRequest } = require('../cos');
-const { deleteMultipleConfirmed } = require('../cos'); // R10-03：批量删除的白名单判据（共用）
+const { getClient, p, translateError, listAll, badRequest } = require('../cos');
 const {
   requireAdmin, roleOf, bucketsFor, requireConfig, requireLocalBucket,
   bucketClient, requireNameConfirm, bucketStat, listFragments, listFragmentsNoCache, mapLimit,
 } = require('./_shared');
+// R23-03：前缀递归删除的唯一实现点在 `fs-gateway.js`（本文件原先自带一份同构实现）
+const gateway = require('../fs-gateway');
+// R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
+const { adjustStorageCache } = require('./stats');
 
 const router = express.Router();
 
@@ -371,7 +374,7 @@ router.post('/buckets/local/:id/clear', requireAdmin, async (req, res) => {
     const { cfg, cos: client } = bucketClient(b);
     // FUN-04：清空必须等到「云端确实删完」才清元数据 —— 旧实现先忽略截断、
     // 再无条件 removeBucketMeta()，会让残留对象的密文永久不可解。
-    const r = await trackedDeletePrefix(client, cfg, '', (deletedKeys) => {
+    const r = await gateway.deletePrefixAll(client, cfg, '', (deletedKeys) => {
       encStore.removeMetaBatch(cfg.bucket, deletedKeys);
       // R7-03：桶内对象已确认删除 → 指向它们的分享链接同步标记「文件已删除」。
       // 漏了这一处，清空桶后管理页仍显示链接「有效」、分享页仍给下载按钮。
@@ -499,53 +502,10 @@ router.post('/buckets/local/:id/destroy', requireAdmin, async (req, res) => {
 
 /* ============================ 内部工具 ============================ */
 
-// 递归删除前缀下全部对象（分批 1000），流式循环直到列完（FUN-04）
-//  — 与 fs 模块共享同一实现思路；此处保持独立以避免循环依赖
-//  — 必须返回 truncated：达到上限而截断时，**不得**据此清理加密元数据，
-//    否则残留对象的密文将永久不可解（旧实现的 cap:100000 静默截断正源于此）。
-async function trackedDeletePrefix(client, cfg, key, onDeleted) {
-  let deleted = 0;
-  let bytes = 0;
-  let rounds = 0;
-  let truncated = true;
-  // R11-01：同 routes/fs.js —— 「整批 0 成功即停下」必须置位外层变量，
-  // 内层 break 只跳 for，truncated=true 反而让外层 while 继续（详见 fs.js 的说明）
-  let stalled = false;
-  const MAX_ROUNDS = 1000;
-  while (truncated && !stalled && rounds < MAX_ROUNDS) {
-    const info = await listAllInfo(client, cfg, key, { cap: LIMITS.DELETE });
-    truncated = info.truncated;
-    if (!info.items.length) break;
-    for (let i = 0; i < info.items.length; i += 1000) {
-      const batch = info.items.slice(i, i + 1000);
-      const sizeOf = new Map(batch.map((k) => [k.key, Number(k.size || 0)]));
-      /**
-       * R10-03：与 `routes/fs.js` 共用同一套**白名单**判据（清空桶是"整桶"操作，
-       * 覆盖面比删单个文件更大 —— 单个 key 被对象锁拒绝时，旧实现仍会清掉它的
-       * 解密凭据并标掉分享链接，两件都不可逆）。
-       */
-      const res = await deleteMultipleConfirmed(client, cfg, batch.map((k) => k.key));
-      deleted += res.okKeys.length;
-      bytes += res.okKeys.reduce((s, k) => s + (sizeOf.get(k) || 0), 0);
-      if (onDeleted && res.okKeys.length) onDeleted(res.okKeys);
-      // 一个都没删掉 = 卡住（桶策略 Deny / 合规保留）→ 置位 stalled 让外层停下（R11-01）
-      if (!res.okKeys.length) {
-        stalled = true;
-        truncated = true;
-        break;
-      }
-    }
-    rounds += 1;
-  }
-  return { count: deleted, bytes, truncated, rounds, stalled };
-}
-
-// 用量缓存增量修正（懒加载 metrics 模块，避免与 stats 路由产生循环依赖）
-function adjustStorageCache(delta, cfg) {
-  try {
-    require('./stats').adjustStorageCache(delta, cfg);
-  } catch (e) { /* 缓存修正失败不影响主流程 */ }
-}
+// R23-03：`trackedDeletePrefix`（前缀递归删除）与 `adjustStorageCache`（用量缓存修正）
+// 两份本地实现已删除 —— 前者收敛到唯一实现点 `gateway.deletePrefixAll()`
+// （见 fs-gateway.js），后者直接用 `./stats` 的实现（顶层 import）。
+// 护栏：tests/invariants.test.js 的 CANONICAL_IMPLS 登记表。
 
 module.exports = router;
 // 测试钩子：FUN-08 的存在性探测是纯云端交互，只有把它暴露出来才能在

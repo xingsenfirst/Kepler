@@ -105,6 +105,77 @@ function asyncHandler(fn) {
   };
 }
 
+/**
+ * R23-04：**路由层「async 处理器 + 标准错误响应」的唯一实现点**。
+ *
+ * 背景：`asyncHandler` 只解决了「抛错不会让请求永久挂起」，它把错误交给
+ * `server/index.js` 的全局错误中间件，而那里直接用 `err.message` —— **不跑
+ * `translateError()`**。于是每个路由自己写一份
+ *
+ * ```js
+ * } catch (e) {
+ *   const err = e.status ? e : translateError(e);
+ *   res.status(err.status || 500).json({ error: err.message });
+ * }
+ * ```
+ *
+ * 全库 11 份逐字重复（另有 8 份在这两行之后追加一条 `statsStore.addLog`）。
+ * 两份东西**不能**简单换成 `asyncHandler`：
+ *
+ *  ① `translateError()`（`server/cos.js`）把对象存储 / 网络的原始错误翻译成面向
+ *     用户的分类文案；绕过它，用户看到的是 SDK 的英文原文；
+ *  ② **R11-04 纪律**：上游 401 必须映射为 502。前端 `api.js` 见到 401 就强制登出，
+ *     云端 401（密钥被拒）一旦透传，用户会被踢出登录并陷入「重新登录 → 再被踢」死循环。
+ *
+ * 因此把「翻译 + 401→502 + 落地」收进这一处，与全局错误中间件（只做兜底、不翻译）
+ * 各司其职：路由里能落地的错误一律在这里落地，落到 `next(e)` 的只剩无法再回写的场景。
+ *
+ * 用法（只包住 handlers 列表的**最后一个**函数）：
+ *
+ *   router.get('/x', requireAdmin, apiHandler(async (req, res) => { ... }));
+ *
+ * 副作用（日志 / 审计）用第二参 `onError` 保留 —— 原 catch 里除响应之外的语句必须
+ * 原样搬进去，**不许因为「收敛错误响应」而丢掉任何一条日志**：
+ *
+ *   router.post('/x', apiHandler(async (req, res) => { ... }, {
+ *     onError: (err) => statsStore.addLog({ action: 'x', level: 'error', detail: err.message }),
+ *   }));
+ *
+ * `onError` 只做副作用，**不得**写响应（响应由本函数统一落地）；它自己抛错会被吞掉，
+ * 以免「记日志失败」掩盖真实错误。
+ *
+ * 同步 URL 层中间件（`requireAdmin` 等）**不要**包 —— 它们本就该调用 `next`。
+ * 包装后的函数仍是 `(req, res, next)` 三参签名（Express 只按 `length` 区分错误中间件）。
+ *
+ * 为什么放在 `_shared.js`（而不是 `cos.js`）：本文件**早已** require `../cos`
+ * （见文件头 `translateError` 的解构），加入本函数不新增任何依赖边；而 `cos.js`
+ * 不 require 任何 routes（反向由 `routes.js` 单向发起），故不存在循环 require。
+ *
+ * @param {(req, res, next) => any} fn 处理器（通常是 `async` 函数）
+ * @param {{onError?: (err: Error, req: object, res: object) => void}} [opts]
+ *        `onError` 收到的是**已翻译**的错误（与落地响应里的同一个对象）
+ * @returns {(req, res, next) => Promise<any>}
+ */
+function apiHandler(fn, opts) {
+  const onError = opts && typeof opts.onError === 'function' ? opts.onError : null;
+  return function wrapped(req, res, next) {
+    return Promise.resolve(fn(req, res, next)).catch((e) => {
+      // 与各路由原实现逐字同源的语义：业务错误（带 status）原样用，其余走翻译层
+      const err = e && e.status ? e : translateError(e);
+      if (onError) {
+        try { onError(err, req, res); } catch (_) { /* 副作用自身失败不得改写原始错误 */ }
+      }
+      /**
+       * 响应头已发出：再写就是 `ERR_HTTP_HEADERS_SENT`（在 catch 里抛错 = 请求永久挂起），
+       * 因此交给全局错误中间件收尾（它会销毁套接字）。这条分支比旧的 `res.status(...)`
+       * 更安全，且只在真正的流式/半写场景里生效。
+       */
+      if (res.headersSent) return next(e);
+      return res.status(err.status || 500).json({ error: err.message });
+    });
+  };
+}
+
 /* ============================ 配置前置条件 ============================ */
 
 /** 获取配置（未配置时抛出 428） */
@@ -211,11 +282,44 @@ function webauthnContext(req) {
   const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
   // 重建 host 串：IPv6 已带方括号，直接拼端口即可
   const hostWithPort = port ? rpId + ':' + port : rpId;
+  /**
+   * R24-02：**部署模式下 rpId 必须属于本站**（配置的主 / 备域名，或本机 HOST），
+   * 回环主机名单独放行。旧实现无条件按请求 Host 推导 rpId / origin ——
+   * WebAuthn 的核心属性是「凭据绑定**固定**的 RP」：服务端一旦接受任意 Host 作为
+   * rpId，把域名解析到同一 IP 的钓鱼站就能完整代理「注册 + 登录」两步（服务端会以
+   * `attacker.com` 作为 rpId 签发挑战并接受断言），防钓鱼属性被整条抵消。
+   *
+   * 判据复用 `isOwnSiteHost`（与支付站点地址、HTTPS 跳转目标**同一处**判据）。
+   * 不可信时**直接抛错**（fail-closed），而不是退回按 Host 推导 —— 后者等于没修。
+   *
+   * 为什么放行回环：`Host: 127.0.0.1` 只可能来自访问本机的浏览器（远端攻击者无法让
+   * 受害者的浏览器把远端站点写成回环地址），且 WebAuthn 依赖「回环属安全上下文」这
+   * 一例外；本机（非部署）模式因此完全不受影响。
+   */
+  if (security.IS_DEPLOY && !security.isOwnSiteHost(rpId, []) && !isLoopbackHostname(rpId)) {
+    const e = new Error('当前访问地址不是本站域名，Windows Hello 仅能在本站域名下使用；'
+      + '请改用配置的站点域名访问，或用密码登录');
+    e.status = 403;
+    e.webauthnUntrusted = true;
+    throw e;
+  }
   return {
     rpId,
     rpName: '对象存储管理系统',
     origin: proto + '://' + hostWithPort,
   };
+}
+
+/**
+ * 回环主机名（含 `localhost` 与其子域）。
+ *
+ * R24-02 用它把「本机访问」从「外站 Host」里摘出来：回环地址不可能被远端攻击者
+ * 写进受害者浏览器的 Host 头，故不构成钓鱼面。
+ */
+function isLoopbackHostname(h) {
+  const s = String(h || '').trim().toLowerCase();
+  return s === 'localhost' || s.endsWith('.localhost')
+    || s === '127.0.0.1' || s === '::1' || s === '[::1]';
 }
 
 /* ============================ 本地桶解析 / 统计 ============================ */
@@ -538,6 +642,11 @@ function cachedGitignoreMatcher(text) {
 /**
  * 标准错误响应：把 throw 出来的错误翻译为 { status, message } 后回写。
  * 保留各路由原有的 e.status 优先（业务错误）→ translateError 兜底（SDK 错误）语义。
+ *
+ * R23-04：**新代码不要再用它** —— 路由层的唯一实现点是 {@link apiHandler}
+ * （把包装、翻译、落地、可选 onError 副作用放在一处）。本函数保留给
+ * `webauthn.js` / `users.js` 那几处「catch 里只调它一行」的既有形态，
+ * 二者语义同源（区别仅在 `headersSent` 时它是 `res.destroy()`、apiHandler 是 `next(e)`）。
  */
 function sendError(res, e, fallbackStatus = 500) {
   const err = e && e.status ? e : translateError(e);
@@ -550,7 +659,7 @@ Object.assign(module.exports, {
   typeOf, baseName, parentOf,
   roleOf, bucketsFor, credentialsFor,
   requireAdmin, requireConfig, validateCredentialFormat,
-  asyncHandler,
+  asyncHandler, apiHandler,
   sessionCookie, clearCookie,
   webauthnContext, splitHostPort,
   requireLocalBucket, bucketClient, requireNameConfirm,

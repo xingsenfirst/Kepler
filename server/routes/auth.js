@@ -142,6 +142,25 @@ router.post('/auth/login/webauthn', (req, res) => {
     if (!pre) return;
 
     /**
+     * R24-02：**在与用户名无关的位置先判宿主机是否可信**。
+     *
+     * 若把这个判断放到 `findUserRaw` / `isWebauthnEnabled` 之后，「用户存在**且**启用了
+     * Windows Hello」会回 403、其余用户名回 401 —— 等于给这个匿名可达的端点又开一个
+     * 用户名 oracle（R21-05 / R22-01 刚把三条分支收敛成同形，不能从旁边再漏一条）。
+     * 因此在这里一次性拦下，三支的 401 同形语义保持不变。
+     */
+    let ctx;
+    try {
+      ctx = webauthnContext(req);
+    } catch (e) {
+      statsStore.addLog({
+        action: 'auth.fail', level: 'warn',
+        detail: `Windows Hello 拒绝：${e.message}（Host 不属本站，已按 fail-closed 处理）`,
+      });
+      return res.status(e.status || 403).json({ error: e.message });
+    }
+
+    /**
      * R21-05：三条「进不去」的分支必须**完全同形**（同状态码 + 同文案 + 同计数）。
      *
      * 旧实现里「用户不存在」回 `401 Windows Hello 验证失败，请重试`，而
@@ -166,7 +185,7 @@ router.post('/auth/login/webauthn', (req, res) => {
     if (!configStore.isWebauthnEnabled(raw)) return authFail('该账户未启用 Windows Hello');
 
     const cred = configStore.getWebauthn(raw);
-    const ctx = webauthnContext(req);
+    // R24-02：`ctx` 已在入口处解析（那时与用户名无关），此处直接复用 —— 不要再解析一次
 
     const r = webauthn.verifyAuthentication({
       clientDataJSON: b.clientDataJSON,

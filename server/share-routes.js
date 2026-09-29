@@ -724,22 +724,52 @@ router.get('/s/:id', async (req, res) => {
 /**
  * 站点对外地址 —— 支付网关回调（notify_url）与支付完成回跳（return_url）的目标。
  *
- * 优先取管理员在支付设置里填的「站点对外地址」；未填时按当前请求的 Host 兜底。
- * 本机 127.0.0.1 收不到公网回调，因此生产环境**必须**显式配置，
+ * 优先取管理员在支付设置里填的「站点对外地址」（配置值也必须属本站，R17-03）。
+ * **未配置时不再信任任意请求 `Host`**（R24-01）：改为按「请求 Host 属本站 → 配置的
+ * 主 / 备域名 → 本机 `HOST`（非通配）」的**可信**阶梯取值，全部落空则返回空串，
+ * 由调用方拒绝下单并提示去配置站点地址。
+ * 本机 `127.0.0.1` 收不到公网回调，因此生产环境**必须**显式配置，
  * 否则支付网关无法通知我们（页面轮询仍可用，但关掉浏览器的支付就会挂起）。
  */
 function siteUrlFor(req) {
   let base = '';
   try { base = String((configStore.getPayment().siteUrl || '')).trim(); } catch (e) { base = ''; }
   // R17-03：`PUT /payment/site-url` 已校验「必须属本站」，但配置可能是旧版本写入、
-  // 或管理员直接改写了配置文件。这里再兜一次：地址不属本站时退回按请求 Host 推断，
-  // 宁可回落到本次访问的主机，也不把付款人 302 到外站。
+  // 或管理员直接改写了配置文件。这里再兜一次：地址不属本站时退回可信来源。
   if (base && !security.isOwnSiteHost(base, [])) base = '';
-  if (!base) {
-    const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
-    base = proto + '://' + (req.headers.host || '127.0.0.1');
+  if (base) return base.replace(/\/+$/, '');
+
+  const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
+  const host = String(req.headers.host || '');
+  /**
+   * R24-01：**兜底路径不得信任任意请求 Host**。
+   *
+   * 旧实现在未配置站点地址时直接 `base = proto + '://' + req.headers.host`，于是
+   * 任意持有付费链接的人都能用自定义 `Host` 让 `notify_url` / `return_url` 指向
+   * 自己的域 —— 支付宝的**异步通知**（带签名与订单信息）会被引到攻击者那里。
+   *
+   * 判据顺序与 HTTPS 跳转（`httpsRedirectHost`）**刻意不同**：那里优先本机 `HOST`
+   * （为了在本机也能跳转），而回调地址必须优先**配置的站点域名**（公网可达），
+   * 本机 `HOST` 只作本地自测的兜底。
+   *
+   * 阶梯（每一级都是**请求方无法左右**的可信来源）：
+   *   ① 请求 Host 属本站（域名直连 / 本机访问）→ 用它；
+   *   ② 配置的主 / 备站点域名 → 用它；
+   *   ③ 本机 `HOST`（非通配绑定）→ 用它（本地自测；公网回调本就不可达）；
+   *   ④ 都没有 → 返回空串，由调用方**拒绝下单**并提示去配置站点地址。
+   */
+  if (host && security.isOwnSiteHost(host, [])) return (proto + '://' + host).replace(/\/+$/, '');
+  const dom = security.configuredSiteHost();
+  if (dom) return (proto + '://' + dom).replace(/\/+$/, '');
+  const local = security.DEPLOY_HOST;
+  if (local && !security.isBindAllHost(local)) {
+    // R24-01：本机 `HOST` 只有主机名，本地自测（http）必须补回监听端口，
+    // 否则回调地址会缺 `:3000` 而不可达。https 时（部署模式经反代）对外端口由反代
+    // 决定、与应用监听端口无关，因此不加。
+    const p = proto === 'http' ? (Number(process.env.PORT) || 3000) : 0;
+    return (proto + '://' + local + (p ? ':' + p : '')).replace(/\/+$/, '');
   }
-  return base.replace(/\/+$/, '');
+  return '';
 }
 
 /** 订单标题（各网关对长度有要求，统一截断） */
@@ -810,6 +840,20 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
 
   const cfg = (configStore.getPayment().platforms || {})[chargePlatform] || {};
   const base = siteUrlFor(req);
+  /**
+   * R24-01：拿不到**可信**的对外地址时拒绝下单 —— 既不能用任意 Host 拼回调地址
+   * （回调劫持），也不该拿一个网关不可达的地址去下单（用户付了钱却收不到通知，
+   * 只能靠页面轮询推进）。这里如实标记失败并给出可执行的出路。
+   */
+  if (!base) {
+    paymentOrders.markFailed(order.id, '站点对外地址未配置且当前访问地址不可信');
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `分享链接 ${l.id} 订单 ${order.id} 拒绝下单：站点对外地址未配置、且请求 Host 不属本站（R24-01）`,
+    });
+    return payPage(res, l, ps, available,
+      '无法确定本站对外地址：请管理员在「系统设置 → 支付设置」中填写站点对外地址后再试');
+  }
   const charge = await paymentGateway.createCharge(chargePlatform, cfg, {
     order,
     subject: chargeSubject(l),
@@ -1398,3 +1442,6 @@ router.get('/s/:id/dl', async (req, res) => {
 });
 
 module.exports = router;
+// 测试钩子（R24-01）：站点对外地址的选取阶梯是纯函数，导出以便在不起服务的前提下
+// 断言「未配置站点地址时不得信任任意请求 Host」这条纪律（与 buckets 的 __probeBucket 同例）。
+module.exports.__siteUrlFor = siteUrlFor;

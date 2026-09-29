@@ -259,3 +259,95 @@ test('服务级 API（getService）显式传空桶时不带上默认桶', async 
     await fake.close();
   }
 });
+
+/* ============================ R23-01：分片上传 ETag ============================ */
+
+test('R23-01 multipartUpload 响应体为空时，ETag 必须从响应头取（否则合并必 InvalidPart）', async () => {
+  // S3 协议：UploadPart 成功响应 = 200 + 空 body，ETag 只在 ETag 响应头（带引号）。
+  // 旧实现只解析响应体 → 恒为空串 → complete 提交 <ETag></ETag> → InvalidPart，
+  // 五家 S3 兼容厂商（OSS/OBS/七牛/又拍/AWS）的 >8MB 文件在最后一步必失败。
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { ETag: '"abc123def"' });
+    res.end();
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.multipartUpload({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'big.bin',
+        UploadId: 'up-1', PartNumber: 1, Body: Buffer.alloc(1024), ContentLength: 1024,
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"abc123def"', 'ETag 应取自响应头（下游 routes/fs.js 会去引号）');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 multipartComplete 提交的 XML 必须带上真实 ETag（与上传侧取值一致）', async () => {
+  const bodies = [];
+  const fake = await startFakeS3((req, res, body) => {
+    if (req.method === 'POST' && /uploadId=/.test(req.url)) {
+      bodies.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/xml' });
+      res.end('<CompleteMultipartUploadResult><Location>http://x/big.bin</Location><Bucket>test-bucket</Bucket>'
+        + '<Key>big.bin</Key><ETag>"final"</ETag></CompleteMultipartUploadResult>');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    await new Promise((resolve, reject) => {
+      client.multipartComplete({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'big.bin',
+        UploadId: 'up-1',
+        Parts: [{ PartNumber: 1, ETag: 'abc123def' }], // 与 routes/fs.js 存入会话时的形态一致（已去引号）
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    const xml = bodies[0].toString('utf8');
+    assert(/<Part><PartNumber>1<\/PartNumber><ETag>abc123def<\/ETag><\/Part>/.test(xml),
+      `complete 应提交真实 ETag，实际 XML：${xml}`);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 multipartUpload 无响应头 ETag 时回退到响应体解析（兼容个别实现/测试桩）', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<UploadPartResult><ETag>"from-body"</ETag></UploadPartResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.multipartUpload({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'k',
+        UploadId: 'u', PartNumber: 1, Body: Buffer.alloc(1), ContentLength: 1,
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"from-body"', '无响应头 ETag 时应回退到响应体解析');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 putObject 响应体为空时，ETag 取响应头且 headers 回传真实头', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { ETag: '"put-etag-42"', 'x-amz-version-id': 'v1' });
+    res.end();
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.putObject({ Bucket: 'test-bucket', Region: 'us-east-1', Key: 'f.txt', Body: Buffer.from('x') },
+        (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"put-etag-42"', 'putObject 的 ETag 应取自响应头');
+    assertEqual(d.headers.etag, '"put-etag-42"', 'headers 应回传真实响应头（不再恒为 {}）');
+    assertEqual(d.headers['x-amz-version-id'], 'v1', 'headers 应保留额外响应头');
+  } finally {
+    await fake.close();
+  }
+});

@@ -487,70 +487,66 @@ async function deleteObject(bucket, key, auditAction, auditPrefix) {
 }
 
 /**
- * 前缀递归删除（目录删除）并清理加密元数据（FUN-04 同型修复）
+ * R23-03：前缀递归删除的**唯一实现点**（此前是三份同构实现）。
  *
- * ⚠️ 这是全项目**第三份**前缀删除实现（另两份在 `routes/fs.js` 与 `routes/buckets.js`）。
- * 上一轮修 FUN-04 时按「模块」推进，只改了前两份，本份漏改 —— 于是 WebDAV 删目录
- * 仍保留着原始缺陷：
+ * ⚠️ 历史：这曾是全项目**第三份**前缀删除实现（另两份在 `routes/fs.js` 与
+ * `routes/buckets.js`）。修 FUN-04 时按「模块」推进、只改了前两份，本份漏改 ——
+ * 于是 WebDAV 删目录仍保留原始缺陷：`listAll` 单次调用、不检查 `truncated`，
+ * 随后**无条件**清空整个前缀的加密元数据 → 超出上限的残留对象**密文永久不可解**
+ * （本项目最不可逆的一类数据丢失）。此后的 R10-03（白名单判据）与 R11-01
+ * （「整批 0 成功即停」）又各自在三份拷贝里**重复修了三遍** —— 这正是
+ * 「同一逻辑多份实现，必然改一半」的标本。R23-03 把循环本体收敛到本函数，
+ * 三条入口（`/fs` 目录删除、清空桶、WebDAV 目录删除）共用；
+ * `tests/invariants.test.js` 的 CANONICAL_IMPLS 登记表负责保证不再出现第二份定义、
+ * 且三个入口都真的调用它。
  *
- *   - `listAll` 单次调用、不检查 `truncated`，达到上限即静默返回部分结果；
- *   - 随后**无条件** `removeMetaPrefix()` 清理整个前缀的加密元数据。
+ * 契约（对三条入口一致）：
+ *   1. 用 `listAllInfo` 显式判定 `truncated`，循环删除直到列空或达轮次上限；
+ *   2. **仅当云端确认删除成功**（白名单 `deleteMultipleConfirmed`）才回调 `onDeleted`
+ *      —— 元数据清理与分享链接标记都挂在这个回调上，绝不按前缀；
+ *   3. 「整批 0 成功即停下」必须置位**外层**变量 `stalled`：内层 `break` 只跳 `for`，
+ *      而 `truncated=true` 恰是外层 `while` 的继续条件 → 一次失败被放大成
+ *      MAX_ROUNDS=1000 次全量列举 + 批量删除。
  *
- * 后果：目录下对象数超过上限时，只删掉前 N 个，其余残留对象的**加密元数据已被清空**
- * → 密文永久不可解，且持续占用容量。这是本项目最不可逆的一类数据丢失。
- *
- * 修复：与 `routes/fs.js` 的 `deletePrefix` 收敛为同一套契约 ——
- *   1. 用 `listAllInfo` 显式判定 `truncated`，循环删除直到清空或达到轮次上限；
- *   2. **仅当云端删除确实成功后**才按批清理元数据（不是先清元数据再删）；
- *   3. 仍被截断时如实返回 `truncated=true`，由调用方决定是否告警。
- *
- * @returns {{ deleted:number, metaCleaned:number, truncated:boolean, rounds:number }}
+ * @param {object} client
+ * @param {object} cfg
+ * @param {string} key 前缀（目录）；是否补尾斜杠由调用方决定
+ * @param {(deletedKeys: string[]) => void} [onDeleted] 每批**确认删除**后回调（收 key 数组）
+ * @param {{cap?:number, noStat?:boolean, skipPrefixSelf?:boolean}} [opts]
+ * @returns {Promise<{count:number, bytes:number, truncated:boolean, rounds:number, stalled:boolean}>}
  */
-async function deletePrefix(bucket, prefix, auditAction, auditPrefix) {
-  const pre = normalizeKey(prefix).replace(/\/+$/, '') + '/';
-  const { cfg, cos } = requireCfgCos();
-
+async function deletePrefixAll(client, cfg, key, onDeleted, opts = {}) {
+  const listOpts = {
+    cap: opts.cap || LIMITS.DELETE,
+    noStat: !!opts.noStat,
+    skipPrefixSelf: !!opts.skipPrefixSelf,
+  };
   let deleted = 0;
-  let metaCleaned = 0;
-  let truncated = true;
+  let bytes = 0;
   let rounds = 0;
-  /**
-   * R11-01：与 `routes/fs.js` / `routes/buckets.js` 的 deletePrefix 同构 ——
-   * 「整批 0 成功即停下」必须置位外层变量。旧实现只有内层 `break`（只跳 for），
-   * `truncated=true` 恰是外层 `while` 的继续条件 → 一次失败被放大成
-   * MAX_ROUNDS=1000 次全量列举 + 批量删除。
-   */
+  let truncated = true;
   let stalled = false;
-  // 防御上限：正常桶数十轮内必清空；越界说明服务端 marker 未推进，必须停下
+  // 防御上限：正常桶在数十轮内必清空；越界说明服务端翻页异常（marker 未推进），
+  // 此时必须停下并返回 truncated=true，而不是继续空转。
   const MAX_ROUNDS = 1000;
-
   while (truncated && !stalled && rounds < MAX_ROUNDS) {
-    // 内部维护调用：不计按桶请求统计，跳过目录标记自身
-    const info = await listAllInfo(cos, cfg, pre, {
-      cap: LIMITS.DELETE, noStat: true, skipPrefixSelf: true,
-    });
+    const info = await listAllInfo(client, cfg, key, listOpts);
     truncated = info.truncated;
     if (!info.items.length) break;
-
     for (let i = 0; i < info.items.length; i += 1000) {
       const batch = info.items.slice(i, i + 1000);
-      const keys = batch.map((k) => k.key);
+      const sizeOf = new Map(batch.map((k) => [k.key, Number(k.size || 0)]));
       /**
-       * R10-03：与 `routes/fs.js` 共用同一套**白名单**判据。
-       *
-       * 旧实现丢弃返回值、按整批成功处理 → S3 兼容厂商上单个 key 被拒时，
-       * 仍会对**依然存在**的对象清掉解密凭据（永久不可解）并标掉分享链接
-       * （已分发的 URL 永久失效）。
+       * R10-03：白名单判据（`deleteMultipleConfirmed` 是判据的唯一实现点）。
+       * 旧实现丢弃返回值、按整批成功处理 → S3 兼容厂商在 200 响应体的 `<Error>` 里
+       * 报告的单个失败被当成成功，于是对**依然存在**的对象清掉解密凭据（永久不可解）
+       * 并标掉分享链接（已分发 URL 永久失效）。
        */
-      const res = await deleteMultipleConfirmed(cos, cfg, keys);
+      const res = await deleteMultipleConfirmed(client, cfg, batch.map((k) => k.key));
       deleted += res.okKeys.length;
-      // 仅当云端删除确实成功后才清理元数据 —— 「密文不可解」的最后一道防线
-      if (res.okKeys.length) {
-        metaCleaned += encStore.removeMetaBatch(cfg.bucket, res.okKeys);
-        // R7-03：只认**本批确认删除**的 key，绝不按前缀
-        shareStore.markMissingByKeys(cfg.bucket, res.okKeys);
-      }
-      // 一个都没删掉 = 卡住 → 置位 stalled 让外层 while 也停下（R11-01）
+      bytes += res.okKeys.reduce((s, k) => s + (sizeOf.get(k) || 0), 0);
+      if (onDeleted && res.okKeys.length) onDeleted(res.okKeys);
+      // 一批里一个都没删掉 = 卡住（权限 / 对象锁）→ 置位 stalled 让外层 while 也停下
       if (!res.okKeys.length) {
         stalled = true;
         truncated = true;
@@ -559,6 +555,29 @@ async function deletePrefix(bucket, prefix, auditAction, auditPrefix) {
     }
     rounds += 1;
   }
+  return { count: deleted, bytes, truncated, rounds, stalled };
+}
+
+/**
+ * 网关层的「删目录」入口（WebDAV 调用）：解析当前桶 + 落副作用 + 审计。
+ * 循环本体已收敛到 {@link deletePrefixAll}（R23-03），此处只保留网关特有的部分。
+ */
+async function deletePrefix(bucket, prefix, auditAction, auditPrefix) {
+  const pre = normalizeKey(prefix).replace(/\/+$/, '') + '/';
+  const { cfg, cos } = requireCfgCos();
+
+  let metaCleaned = 0;
+  const onDeleted = (keys) => {
+    // 仅当云端删除确实成功后才清理元数据 —— 「密文不可解」的最后一道防线
+    metaCleaned += encStore.removeMetaBatch(cfg.bucket, keys);
+    // R7-03：只认**本批确认删除**的 key，绝不按前缀
+    shareStore.markMissingByKeys(cfg.bucket, keys);
+  };
+
+  // 内部维护调用：不计按桶请求统计，跳过目录标记自身（R23-03：循环本体的唯一实现点）
+  const r = await deletePrefixAll(cos, cfg, pre, onDeleted, { noStat: true, skipPrefixSelf: true });
+  const { truncated, rounds, stalled } = r;
+  const deleted = r.count;
 
   // 目录标记对象：在全部子对象删除成功后再删，避免中途失败留下"空壳目录"
   // （截断时不删，因为目录尚未清空）
@@ -1037,6 +1056,8 @@ module.exports = {
   // 生命周期
   deleteObject,
   deletePrefix,
+  // R23-03：前缀递归删除的唯一实现点（fs / buckets / WebDAV 三条入口共用）
+  deletePrefixAll,
   copyObject,
   moveObject,
   movePrefix,

@@ -115,7 +115,15 @@ async function runCase({ name, file, anchor, replacement, mutations, testFile, m
   console.log('  [mutate] 已退回旧实现，跑 ' + testFile + ' …');
 
   const out = await runTestFile(testFile);
-  const m = /^# fail (\d+)/m.exec(out);
+  /**
+   * 失败数解析必须同时认两种 reporter 格式：
+   *  - TAP（Node 18/20 在**非 TTY**（管道）下的默认）：`# fail 3`
+   *  - spec（Node ≥ 22 起成为默认）：`ℹ fail 3`
+   * 只认前者时，在 Node 22+ 上每条对照都会解析成 `fail=-1` 而被判失败 ——
+   * 实测本机 Node 24 下 `--only=R14-08`（既有条目）同样报 -1，**与变异的正确性无关**。
+   * 护栏静默失效比护栏缺失更危险，故此处显式兼容。
+   */
+  const m = /^(?:#|ℹ)\s*fail\s+(\d+)/m.exec(out);
   const failCount = m ? Number(m[1]) : -1;
   restore();
 
@@ -172,9 +180,11 @@ const CASES = [
       // R11-18：原 anchor 是「同批确认删除的 key 一并标记…」+ `markMissingByKeys(cfg.bucket, keys)`，
       // R10-03 把该行改成按白名单 `res.okKeys` 标记后，锚点再也不存在 —— 这条等于没登记。
       // 重新指向当前代码（缩进也变了）：仍守同一条纪律（删目录必须标记分享链接）。
+      // R23-03：循环收敛到 `deletePrefixAll` 后，标记动作移进网关的 `onDeleted` 回调，
+      // 参数名由 `res.okKeys` 变为 `keys`（同一判据），锚点随之更新。
       name: 'R7-03 · WebDAV 删目录不再标记分享链接',
       file: 'server/fs-gateway.js',
-      anchor: '        // R7-03：只认**本批确认删除**的 key，绝不按前缀\n        shareStore.markMissingByKeys(cfg.bucket, res.okKeys);',
+      anchor: '    // R7-03：只认**本批确认删除**的 key，绝不按前缀\n    shareStore.markMissingByKeys(cfg.bucket, keys);',
       replacement: '',
       testFile: 'audit7-regressions.test.js',
       minFail: 1,
@@ -686,8 +696,10 @@ const CASES = [
     {
       // 变异只撤掉外层 while 对 stalled 的引用（内层仍置位）—— 正是 R11-01 的旧实现：
       // `break` 只跳内层 for，循环照样跑满 MAX_ROUNDS=1000。
-      name: 'R11-01 · deletePrefix 的「整批 0 成功即停下」退回到只 break 内层 for（跑满 1000 轮）',
-      file: 'server/routes/fs.js',
+      // R23-03：循环本体已从 `routes/fs.js` 收敛到 `fs-gateway.deletePrefixAll()`
+      // （三份同构实现合一），锚点随之改指唯一实现点 —— 判据与纪律不变。
+      name: 'R11-01 · deletePrefixAll 的「整批 0 成功即停下」退回到只 break 内层 for（跑满 1000 轮）',
+      file: 'server/fs-gateway.js',
       anchor: '  while (truncated && !stalled && rounds < MAX_ROUNDS) {',
       replacement: '  while (truncated && rounds < MAX_ROUNDS) {',
       testFile: 'audit11-regressions.test.js',
@@ -2288,6 +2300,161 @@ const CASES = [
         + ' */\n'
         + 'function httpsRedirectHost(rawHost) {',
       testFile: 'audit22-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R23-01：UploadPart 的 ETag 退回「只从响应体解析」。
+       * S3 的 UploadPart 成功响应**体为空**、ETag 只在 `ETag` 响应头，故空串会被存进
+       * 会话、合并时提交 `<ETag></ETag>` → 云端 InvalidPart：五家 S3 兼容厂商（OSS /
+       * OBS / 七牛 / 又拍 / AWS）所有 >8MB 文件在最后一步必失败。
+       */
+      name: 'R23-01 · 分片上传 ETag 退回「只解析响应体」（S3 兼容厂商大文件合并必失败）',
+      file: 'server/s3-client.js',
+      anchor: '      // R23-01：必须取 raw 响应 —— ETag 只在响应头（S3 的 UploadPart 响应体为空）\n'
+        + '      const { res, body } = await this._send({\n'
+        + "        method: 'PUT', bucket, key: params.Key || '',\n"
+        + '        query: { partNumber: String(partNumber), uploadId: params.UploadId },\n'
+        + '        body: params.Body, contentLength: params.ContentLength,\n'
+        + "        streamBody: params.Body && typeof params.Body.pipe === 'function',\n"
+        + '      }, { raw: true });\n'
+        + '      return { ETag: etagOf(res, body) };',
+      replacement: '      const body = await this._send({\n'
+        + "        method: 'PUT', bucket, key: params.Key || '',\n"
+        + '        query: { partNumber: String(partNumber), uploadId: params.UploadId },\n'
+        + '        body: params.Body, contentLength: params.ContentLength,\n'
+        + "        streamBody: params.Body && typeof params.Body.pipe === 'function',\n"
+        + '      });\n'
+        + "      return { ETag: tag(body, 'ETag') };",
+      testFile: 's3-client.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R23-02：落盘失败补偿退回「同步 try/catch + 先清 dirty」。
+       * 默认写入器是异步的（`writeJsonAsync`），同步 catch 既抓不到拒绝、也读不到
+       * `resolve(false)`；dirty 已清零 → 变更静默丢失且后续 flush / 退出同步写全部跳过。
+       */
+      name: 'R23-02 · 去抖落盘失败补偿退回「同步 try/catch」（写失败静默丢变更）',
+      file: 'server/coalesce.js',
+      anchor: '    let ret;\n'
+        + '    try {\n'
+        + '      ret = write(file, snap);\n'
+        + '    } catch (e) {\n'
+        + '      markWriteFailed(e); // 同步写入器抛错（如 corrupt 文件拒绝写，或注入的同步假写入器）\n'
+        + '      return;\n'
+        + '    }\n'
+        + '    if (ret && typeof ret.then === \'function\') {\n'
+        + '      ret.then((ok) => {\n'
+        + '        // 注入的假写入器若 resolve(undefined) 视为成功；只有显式 false / 拒绝算失败。\n'
+        + "        if (ok === false) markWriteFailed(new Error('写入器返回失败（false）'));\n"
+        + '        else lastError = null;\n'
+        + '      }, (e) => markWriteFailed(e));\n'
+        + '    } else {\n'
+        + '      lastError = null;\n'
+        + '    }',
+      replacement: '    try {\n'
+        + '      write(file, snap);\n'
+        + '    } catch (e) {\n'
+        + '      console.error(`[coalesce] 排队落盘失败 ${path.basename(file)}: ${(e && e.message) || e}`);\n'
+        + '    }',
+      testFile: 'audit14-perf.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * R23-04：把 `/fs/search` 从 `apiHandler(...)` 包装退回**未包装的裸 async**。
+       * 两步变异（同时改开头与结尾，保证仍是**语法合法**的代码 —— 只删 `try {` 会留下
+       * 孤儿 catch、让子进程直接崩在解析阶段，那是「变异不等价」的假红，正是本项目
+       * 反复强调要避免的形态）。
+       *
+       * 退回后该处理器既无包装、也无自带 try/catch → Express 4 不捕获它的 rejection，
+       * 抛错即请求永久挂起（既不 500 也不结束）。静态护栏必须报红。
+       */
+      name: 'R23-04 · 路由处理器退回「未包装的裸 async」（Express 4 下抛错即请求永久挂起）',
+      file: 'server/routes/fs.js',
+      mutations: [
+        {
+          anchor: "router.get('/fs/search', apiHandler(async (req, res) => {",
+          replacement: "router.get('/fs/search', async (req, res) => {",
+        },
+        {
+          anchor: '      hint: !exhausted ? `该目录下还有未扫描的对象（本轮已扫描 ${scanned} 个），可继续搜索。` : \'\',\n    });\n}));',
+          replacement: '      hint: !exhausted ? `该目录下还有未扫描的对象（本轮已扫描 ${scanned} 个），可继续搜索。` : \'\',\n    });\n});',
+        },
+      ],
+      testFile: 'invariants.test.js',
+      minFail: 1,
+    },
+    /* ======================= 第 24 轮（P2 安全加固批次） ======================= */
+    {
+      /**
+       * R24-01：站点对外地址的兜底退回「直接信任请求 Host」。
+       * 这是回调劫持的原始形态：付费链接的任意访问者带自定义 Host 即可让
+       * `notify_url` / `return_url` 指向自己的域。
+       */
+      name: 'R24-01 · 支付回调地址退回「直接信任请求 Host」（异步通知被劫持）',
+      file: 'server/share-routes.js',
+      anchor: "  if (host && security.isOwnSiteHost(host, [])) return (proto + '://' + host).replace(/\\/+$/, '');",
+      replacement: "  if (host) return (proto + '://' + host).replace(/\\/+$/, '');",
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R24-02：WebAuthn 的 rpId 退回「无条件按请求 Host 推导」。
+       * 把域名解析到同一 IP 的钓鱼站于是能完整代理两步登录，防钓鱼属性被抵消。
+       */
+      name: 'R24-02 · WebAuthn rpId 退回「按请求 Host 推导」（钓鱼站可代理两步登录）',
+      file: 'server/routes/_shared.js',
+      anchor: '  if (security.IS_DEPLOY && !security.isOwnSiteHost(rpId, []) && !isLoopbackHostname(rpId)) {',
+      replacement: '  if (false && security.IS_DEPLOY && !security.isOwnSiteHost(rpId, []) && !isLoopbackHostname(rpId)) {',
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R24-03：解密侧退回「只用密文流里的 IV」而不与元数据比对。
+       * 重排等长分段时每段自洽、GCM 认证全部通过 → 静默产出被重排的明文。
+       */
+      name: 'R24-03 · 分段 IV 退回「不与元数据比对」（重排 / 拼接密文静默通过）',
+      file: 'server/enc-store.js',
+      anchor: "            const wantIv = segs[si] && segs[si].iv ? String(segs[si].iv).toLowerCase() : '';",
+      replacement: "            const wantIv = ''; // 退回：只认密文流里的 IV，不与元数据比对",
+      testFile: 'crypto-storage.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R24-06：CSRF 退回「只认自定义头」的单点判据。
+       * 该判据依赖「浏览器不让跨站请求伪造自定义头」—— 一旦引入 CORS 或反代补头，
+       * 防线静默消失且没有任何症状。
+       */
+      name: 'R24-06 · CSRF 退回「只认 X-Requested-With」单点判据（跨站来源不再校验）',
+      file: 'server/security.js',
+      anchor: '  let from = \'\';\n'
+        + '  try { from = new URL(src).host; } catch (e) { return false; }\n'
+        + '  const want = normalizeHost(String(req.get(\'host\') || \'\'));\n'
+        + '  return normalizeHost(from) !== \'\' && normalizeHost(from) === want;',
+      replacement: '  return true; // 退回：只认自定义头，不校验来源',
+      testFile: 'audit17-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R23-04（棘轮）：在路由里**多复制一份**内联错误响应。
+       *
+       * 本轮的棘轮护栏（`invariants.test.js` 的 `INLINE_ERROR_COPY_MAX`）只许减不许增，
+       * 这条对照把总数从冻结点推高 1 —— 若棘轮失效（判据被改坏 / 上限被悄悄上调），
+       * 这里就撤不红。注入的行是**静态注入**（该文件在 `invariants.test.js` 里只被当作
+       * 文本读取、从不执行），因此无需保证运行时可达。
+       */
+      name: 'R23-04（棘轮）· 路由内联错误响应副本数增加 1（收敛点形同虚设）',
+      file: 'server/routes/fs.js',
+      anchor: '    res.json(payload);\n}));\n',
+      replacement: '    const err = e.status ? e : translateError(e); // 棘轮反例：多复制一份\n'
+        + '    res.json(payload);\n}));\n',
+      testFile: 'invariants.test.js',
       minFail: 1,
     },
   ];

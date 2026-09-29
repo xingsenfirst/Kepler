@@ -158,7 +158,15 @@ function writeJson(file, obj) {
 /* 按文件维度的串行写队列：保证异步写入顺序，避免并发覆盖 */
 const queues = new Map();
 
-/** 异步写入（加密 + 串行）；用于较高频数据，避免阻塞事件循环（P1） */
+/**
+ * 异步写入（加密 + 串行）；用于较高频数据，避免阻塞事件循环（P1）。
+ *
+ * 返回 `Promise<boolean>`：`true` = 成功落盘，`false` = 失败（错误同时记入
+ * 模块级 `lastWriteError`、经 `/api/health` 暴露）。**不 reject**——直连调用方
+ * （enc-store / share-store / upload-sessions）以 fire-and-forget 方式调用，
+ * 改为 reject 会制造 unhandledRejection；需要失败补偿的调用方（如 coalesce
+ * 的去抖写）据此布尔值重试。
+ */
 function writeJsonAsync(file, obj) {
   assertWritable(file);
   const prev = queues.get(file) || Promise.resolve();
@@ -185,10 +193,12 @@ function writeJsonAsync(file, obj) {
        */
       return atomic.writeAtomic(file, serialize(obj));
     })
-    .then(() => { lastWriteError = null; })
+    .then(() => { lastWriteError = null; return true; })
     .catch((e) => {
       lastWriteError = { file, message: e.message, at: new Date().toISOString() };
       console.error(`[secure-store] 异步写入失败 ${path.basename(file)}: ${e.message}`);
+      // R23-02：不再吞成 undefined —— 交出可判定的失败信号。函数仍不 reject（理由见上）。
+      return false;
     });
   queues.set(file, next);
   return next;

@@ -23,7 +23,10 @@ const { deleteMultipleConfirmed } = require('../cos'); // R10-03：批量删除�
  * `gateway.rollbackCopies()`。
  */
 const gateway = require('../fs-gateway');
-const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey } = require('./_shared');
+// R23-04：`apiHandler` 是「async 处理器 + 标准错误响应」的唯一实现点（见 _shared.js 的说明）
+const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey, apiHandler } = require('./_shared');
+// R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
+const { adjustStorageCache } = require('./stats');
 const security = require('../security'); // SEC-09：直链签发需记录来源 IP
 const listCache = require('../list-cache'); // 目录列举短缓存（写操作由 cos.p 统一失效）
 const candidates = require('../search-candidates'); // 搜索候选集（带 TTL，写操作由 cos.p 统一失效）
@@ -57,8 +60,8 @@ const COPY_SIMPLE_LIMIT = LIMITS.COPY_SIMPLE_LIMIT;
 /* ============================ 列表 / 属性 / 搜索 ============================ */
 
 // 目录/对象列表（分页）
-router.get('/fs/list', async (req, res) => {
-  try {
+// R23-04：错误响应交给唯一实现点 apiHandler（翻译 + 上游 401→502 都在那里）
+router.get('/fs/list', apiHandler(async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
     const prefix = normalizeKey(String(req.query.prefix || ''));
@@ -109,11 +112,7 @@ router.get('/fs/list', async (req, res) => {
     };
     listCache.set(cacheKey, payload);
     res.json(payload);
-  } catch (e) {
-    const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
-  }
-});
+}));
 
 // 属性面板：文件 → 名称/创建时间/大小；文件夹 → 名称/创建时间/对象总数
 router.get('/fs/stat', async (req, res) => {
@@ -196,8 +195,8 @@ router.get('/fs/stat', async (req, res) => {
 });
 
 // 搜索（服务端过滤，支持名称/类型/日期/大小多条件；超量时返回游标供前端续扫）
-router.get('/fs/search', async (req, res) => {
-  try {
+// R23-04：错误响应交给唯一实现点 apiHandler
+router.get('/fs/search', apiHandler(async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
     const prefix = normalizeKey(String(req.query.prefix || ''));
@@ -371,11 +370,7 @@ router.get('/fs/search', async (req, res) => {
       truncated: !exhausted,
       hint: !exhausted ? `该目录下还有未扫描的对象（本轮已扫描 ${scanned} 个），可继续搜索。` : '',
     });
-  } catch (e) {
-    const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
-  }
-});
+}));
 
 // 新建文件夹（0 字节对象，Key 以 / 结尾）
 router.post('/fs/mkdir', async (req, res) => {
@@ -931,76 +926,13 @@ router.get('/fs/presign', async (req, res) => {
 /* ============================ 删除 / 重命名 / 移动 ============================ */
 
 /**
- * 删除文件夹：流式「列举一页 → 删一页」直到列完（FUN-04）
- *
- * 旧实现一次性 `listAll(cap: 100000)`：达到上限即返回，**调用方不检查是否被截断**，
- * 直接累加 `deleted` 并宣布成功；紧随其后的 `removeMetaPrefix()` 却会清理
- * 该前缀下**全部**加密元数据。于是超过 10 万对象的桶会留下：
- *   ① 云端残留对象（不可见但持续产生费用，且让「彻底删除桶」被 409 拒绝）
- *   ② 其加密元数据已被清空 → **残留密文永久无法解密**（不可逆数据损失）
- *
- * 修复要点：
- *  1. 用 {@link listAllInfo} 的 `truncated` 显式判断是否列完，循环直到列空为止（内存恒定）；
- *  2. 元数据只清理 **本批确认删除成功的 key**（逐批回调），不再按前缀无条件清空；
- *  3. 返回值携带 `truncated` / `rounds`，让上层能如实呈现「部分完成」而不是假装成功。
- *
- * @param {object} client
- * @param {object} cfg
- * @param {string} key 前缀（目录）
- * @param {(deletedKeys: string[]) => void} [onDeleted] 每批删除成功后回调（用于清理元数据）
- * @returns {Promise<{count:number, bytes:number, truncated:boolean, rounds:number}>}
+ * R23-03：本文件原先自带一份 `deletePrefix`（与 `routes/buckets.js` 的
+ * `trackedDeletePrefix`、`fs-gateway.js` 的同名函数**三份同构**，靠人工对齐）。
+ * 循环本体已收敛到唯一实现点 `gateway.deletePrefixAll()`，三条入口共用；
+ * 下面调用点仍传 `(client, cfg, key, onDeleted)`，返回契约
+ * `{ count, bytes, truncated, rounds, stalled }` 与收敛前一致。
+ * 护栏：`tests/invariants.test.js` 的 CANONICAL_IMPLS 登记表（无第二份定义 + 逐入口接线）。
  */
-async function deletePrefix(client, cfg, key, onDeleted) {
-  let deleted = 0;
-  let bytes = 0;
-  let rounds = 0;
-  let truncated = true;
-  /**
-   * R11-01：「整批 0 成功即停下」必须落在**外层**变量上。
-   *
-   * 旧实现只有内层的 `break` + `truncated = true` —— break 只跳出内层 `for`，
-   * 而 `truncated` 恰是外层 `while` 的继续条件，于是「停下」变成了「再跑一轮」：
-   * 桶策略含 `Deny s3:DeleteObject` / 对象锁时 `okKeys` 恒为空，循环跑满
-   * `MAX_ROUNDS=1000`，一次失败被放大成上千次全量列举 + 批量删除（期间该桶的
-   * 列举配额被吃满、真实产生计费请求，最终仍只回一句「请再次执行删除」）。
-   * 注释声称的「立刻停下」从未发生 —— 注释说明意图，代码决定事实。
-   */
-  let stalled = false;
-  // 防御上限：正常桶在数十轮内必清空；越界说明服务端翻页异常（marker 未推进），
-  // 此时必须停下并返回 truncated=true，而不是继续空转。
-  const MAX_ROUNDS = 1000;
-  while (truncated && !stalled && rounds < MAX_ROUNDS) {
-    const info = await listAllInfo(client, cfg, key, { cap: LIMITS.DELETE });
-    truncated = info.truncated;
-    if (!info.items.length) break;
-    for (let i = 0; i < info.items.length; i += 1000) {
-      const batch = info.items.slice(i, i + 1000);
-      const sizeOf = new Map(batch.map((k) => [k.key, Number(k.size || 0)]));
-      /**
-       * R10-03：与 `/fs/delete` 的文件分支共用同一套**白名单**判据。
-       *
-       * 旧实现丢弃 `deleteMultipleObject` 的返回值、无条件 `deleted += batch.length`
-       * 并把整批 key 交给 `onDeleted` → 云端（S3 兼容厂商）在 200 响应体的 `<Error>`
-       * 里报告的单个失败被当成成功，于是对**仍然存在**的对象清掉解密凭据
-       * （永久不可解）并把分享链接标成已删除（已分发 URL 永久失效）。
-       */
-      const res = await deleteMultipleConfirmed(client, cfg, batch.map((k) => k.key));
-      deleted += res.okKeys.length;
-      bytes += res.okKeys.reduce((s, k) => s + (sizeOf.get(k) || 0), 0);
-      // 仅当云端删除确实成功后才清理元数据 —— 这是「密文不可解」的最后一道防线
-      if (onDeleted && res.okKeys.length) onDeleted(res.okKeys);
-      // 一批里**一个都没删掉** = 卡住了（权限 / 对象锁）→ 置位 stalled 让外层
-      // while 也停下，并如实报 truncated（见函数头的 R11-01 说明）
-      if (!res.okKeys.length) {
-        stalled = true;
-        truncated = true;
-        break;
-      }
-    }
-    rounds += 1;
-  }
-  return { count: deleted, bytes, truncated, rounds, stalled };
-}
 
 /**
  * FUN-14：目标存在性检查 —— **云端覆写不可撤销**，写入目标前必须先探测。
@@ -1194,7 +1126,7 @@ router.post('/fs/rename', async (req, res) => {
       // rename 的目标已由 assertNoConflict 确认为空，这里传的是全部源相对键。
       encStore.migratePrefix(cfg.bucket, key, newKey, { overwriteRelKeys: new Set(relKeys) });
       // 源对象被删 → 指向它们的分享链接同步标记「文件已删除」（重命名后旧链接本就失效）
-      const rm = await deletePrefix(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
+      const rm = await gateway.deletePrefixAll(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
       if (rm.truncated) {
         // 源数据未删干净 —— 此时已复制出完整副本，源残留属重复占用，必须如实暴露
         const err = new Error(`重命名后清理源目录未完成（已删 ${rm.count} 个对象后仍被截断），请重试或手工清理 ${key}`);
@@ -1279,7 +1211,7 @@ router.post('/fs/move', async (req, res) => {
           // 元数据迁移必须在删除源之前完成，否则中途失败会让密文失去元数据
           // R10-04：只清理"本次确实被覆盖写入"的目标条目（见 migratePrefix 的说明）
           encStore.migratePrefix(cfg.bucket, key, newKey, { overwriteRelKeys: new Set(relKeys) });
-          const rm = await deletePrefix(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
+          const rm = await gateway.deletePrefixAll(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
           if (rm.truncated) {
             const err = new Error(`移动后清理源目录未完成（已删 ${rm.count} 个对象后仍被截断），请重试或手工清理 ${key}`);
             err.status = 500;
@@ -1339,7 +1271,7 @@ router.post('/fs/delete', async (req, res) => {
       try {
         // FUN-04：元数据只针对「云端确认删除成功」的 key 清理，
         // 绝不在删除可能被截断的前提下按前缀清空（否则残留密文永久不可解）
-        const r = await deletePrefix(client, cfg, key, (deletedKeys) => {
+        const r = await gateway.deletePrefixAll(client, cfg, key, (deletedKeys) => {
           encStore.removeMetaBatch(cfg.bucket, deletedKeys);
           // 指向这些对象的分享链接一并标记为「文件已删除」—— 只认本批确认删除的 key
           shareStore.markMissingByKeys(cfg.bucket, deletedKeys);
@@ -1504,11 +1436,8 @@ function getClientForSession(sess) {
   return getClient(configForSession(sess));
 }
 
-// 用量缓存增量修正（懒加载 metrics 模块，避免循环依赖）
-function adjustStorageCache(delta, cfg) {
-  try {
-    require('./stats').adjustStorageCache(delta, cfg);
-  } catch (e) { /* 忽略 */ }
-}
+// R23-03：`.adjustStorageCache` 的唯一实现点在 `./stats`，此处不再叠一层懒加载包装
+// （`stats.js` 只依赖 `_context` / `_shared` / `cos` / `store`，不反向依赖任何路由，
+//  原先注释所称的「循环依赖」并不成立）。顶层 import 见文件头。
 
 module.exports = router;

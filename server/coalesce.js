@@ -73,6 +73,8 @@ function debouncedPersist(file, getSnapshot, opt = {}) {
   let timer = null;
   /** 是否有尚未落盘的变更。**不能**用「快照非 null」代替 —— 快照为 null 是「不写」而非「没变更」 */
   let dirty = false;
+  /** 最近一次写失败（含异步拒绝 / 写入器显式返回 false）；null = 无。供 lastError() 观测。 */
+  let lastError = null;
 
   function cancelTimer() {
     if (timer) { clearTimeout(timer); timer = null; }
@@ -90,16 +92,44 @@ function debouncedPersist(file, getSnapshot, opt = {}) {
     return snap === undefined ? null : snap;
   }
 
-  /** 异步落盘（不阻塞调用方） */
+  /** 落盘失败的处理：置回 dirty + 留痕（让下一次 flush / 退出同步写有机会重试）。 */
+  function markWriteFailed(e) {
+    dirty = true;
+    lastError = e;
+    console.error(`[coalesce] 落盘失败（已置回待写，等待重试）${path.basename(file)}: ${(e && e.message) || e}`);
+  }
+
+  /** 落盘（不阻塞调用方；失败可判定并会置回 dirty）。 */
   function writeNow() {
     if (!dirty) return;
     dirty = false;
     const snap = take();
     if (snap === null) return;
+    /**
+     * R23-02：`write` 的默认实现是**异步**的（`secureStore.writeJsonAsync` 返回
+     * `Promise<boolean>`），旧的同步 try/catch 既抓不到 Promise 拒绝、也读不到
+     * 「吞错 + resolve(false)」的失败信号 —— 结果写失败（ENOSPC / 权限）时 dirty
+     * 已被清零，后续 flush() 与退出同步落盘都因 `if (!dirty) return` 直接跳过，
+     * 最后一次状态变更被静默丢弃（支付订单的 `paid` 退回 `pending`）。
+     * 现在把「失败」显式还原成「未落盘」：置回 dirty，让下一次 schedule / flush /
+     * 退出同步写重试。置回是幂等且安全的：期间若有更新的变更，dirty 本来就是
+     * true，重取快照写的就是最新全量状态。
+     */
+    let ret;
     try {
-      write(file, snap);
+      ret = write(file, snap);
     } catch (e) {
-      console.error(`[coalesce] 排队落盘失败 ${path.basename(file)}: ${(e && e.message) || e}`);
+      markWriteFailed(e); // 同步写入器抛错（如 corrupt 文件拒绝写，或注入的同步假写入器）
+      return;
+    }
+    if (ret && typeof ret.then === 'function') {
+      ret.then((ok) => {
+        // 注入的假写入器若 resolve(undefined) 视为成功；只有显式 false / 拒绝算失败。
+        if (ok === false) markWriteFailed(new Error('写入器返回失败（false）'));
+        else lastError = null;
+      }, (e) => markWriteFailed(e));
+    } else {
+      lastError = null;
     }
   }
 
@@ -135,7 +165,7 @@ function debouncedPersist(file, getSnapshot, opt = {}) {
   function flush() { cancelTimer(); writeNow(); }
 
   instances.add({ dataDir, exitFlush: writeNowSync });
-  return { file, schedule, flush, pending: () => dirty };
+  return { file, schedule, flush, pending: () => dirty, lastError: () => lastError };
 }
 
 /**

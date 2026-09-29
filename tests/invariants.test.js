@@ -958,6 +958,21 @@ const CANONICAL_IMPLS = [
     /** 三处复制入口：routes/fs.js、fs-gateway.movePrefix、WebDAV 目录 COPY（逐文件校验） */
     callers: ['server/routes/fs.js', 'server/fs-gateway.js', 'server/webdav-server.js'],
   },
+  {
+    /**
+     * R23-03：前缀递归删除曾是**三份同构实现**（routes/fs.js 的 `deletePrefix`、
+     * routes/buckets.js 的 `trackedDeletePrefix`、fs-gateway 的 `deletePrefix`），
+     * 于是 R10-03（白名单判据）与 R11-01（整批 0 成功即停）两条修复各自在三个
+     * 拷贝里重复修了三遍 —— 「同一逻辑多份实现必然改一半」的标本。
+     * 现已收敛到 fs-gateway 的这一处，三条入口共用。
+     */
+    name: 'deletePrefixAll',
+    file: 'server/fs-gateway.js',
+    /** canonical 必须仍含「卡住即停」的外层判据（退化成内层 break 会跑满 MAX_ROUNDS=1000） */
+    mustContain: /stalled/,
+    why: '「递归删除前缀」的唯一实现点（三条入口：/fs 目录删除、清空桶、WebDAV 目录删除）',
+    callers: ['server/fs-gateway.js', 'server/routes/fs.js', 'server/routes/buckets.js'],
+  },
 ];
 
 /** @param {Array<{rel:string,src:string}>} files */
@@ -1743,9 +1758,11 @@ const GLOBAL_CHECKS = [
       { rel: 'server/config-store.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/upload-sessions.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       // 定义 + 自身的 `movePrefix` 那一处接线
-      { rel: 'server/fs-gateway.js', src: 'async function rollbackCopies(cos, cfg, keys) { await deleteMultipleConfirmed(cos, cfg, keys); }\nawait rollbackCopies(cos, cfg, fresh);\n' },
-      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\n' },
+      { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(cos, cfg, pre, onDeleted, {});\n'
+        + 'async function rollbackCopies(cos, cfg, keys) { await deleteMultipleConfirmed(cos, cfg, keys); }\nawait rollbackCopies(cos, cfg, fresh);\n' },
+      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
       { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(cos, cfg, created);\n' },
+      { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
       { rel: 'server/secure-store.js', src: 'function exitPathWritable(dir) { return true; }\n' },
@@ -1762,9 +1779,11 @@ const GLOBAL_CHECKS = [
       { rel: 'server/config-store.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/enc-store.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/upload-sessions.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
-      { rel: 'server/fs-gateway.js', src: 'const rollbackCopies = async (cos, cfg, keys) => { await deleteMultipleConfirmed(cos, cfg, keys); };\nrollbackCopies(cos, cfg, fresh);\n' },
-      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\n' },
+      { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(cos, cfg, pre, onDeleted, {});\n'
+        + 'const rollbackCopies = async (cos, cfg, keys) => { await deleteMultipleConfirmed(cos, cfg, keys); };\nrollbackCopies(cos, cfg, fresh);\n' },
+      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
       { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(cos, cfg, created);\n' },
+      { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
       // 箭头函数 + 判据已消失 → 必须抓到
@@ -1786,9 +1805,11 @@ const GLOBAL_CHECKS = [
       { rel: 'server/config-store.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/enc-store.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/upload-sessions.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
-      { rel: 'server/fs-gateway.js', src: 'function rollbackCopies(cos, cfg, keys) { return deleteMultipleConfirmed(cos, cfg, keys); }\nrollbackCopies(cos, cfg, fresh);\n' },
-      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\n' },
+      { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(cos, cfg, pre, onDeleted, {});\n'
+        + 'function rollbackCopies(cos, cfg, keys) { return deleteMultipleConfirmed(cos, cfg, keys); }\nrollbackCopies(cos, cfg, fresh);\n' },
+      { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
       { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(cos, cfg, created);\n' },
+      { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
       { rel: 'server/secure-store.js', src: 'function exitPathWritable(dir) { return fs.existsSync(dir); }\n' },
@@ -1833,6 +1854,71 @@ GLOBAL_CHECKS.push({
   name: '验证码脚本源必须被 CSP 允许（R14-02）',
   fn: () => captchaCspViolations(MAIN_OK, CSP_OK),
   bad: () => captchaCspViolations(MAIN_BAD, CSP_OK),
+});
+
+/* ---------- R23-04：路由处理器不得「裸奔」 ---------- */
+
+/**
+ * `_shared.apiHandler` 是「async 处理器 + 标准错误响应」的唯一实现点（R23-04），
+ * 但本检查**不强制**全部改用它：迁移是渐进的，且历史 catch 块里有大量额外副作用
+ * （`statsStore.addLog`）。这里守的是真正的隐患 ——
+ *
+ * **Express 4 不捕获 async handler 的 rejection**：一个既没有 `apiHandler` /
+ * `asyncHandler` 包装、也没有自带 `try/catch` 的 async 路由一旦抛错，请求既不 500
+ * 也不结束（客户端一直转圈），比 500 难排查得多（`unhandledRejection` 只打印、
+ * 不产生任何响应）。
+ *
+ * 判据：只看路由文件（`server/routes/*.js` 与 `server/*-routes.js`，如 `share-routes.js`）
+ * 里的 `router.<method>(…)` 注册，取出它的**实参文本**
+ * （按配平括号截取）→ 若含裸 `async (`（前缀不是 `apiHandler(` / `asyncHandler(`），
+ * 则同一段实参里必须出现 `try {`；同步处理器不受约束。
+ *
+ * 样例自测用 `sample-*` 作为 rel，故此处显式放行该前缀 —— 否则样例会被路径过滤
+ * 提前 return，让自测「0 命中」而变成假绿。
+ */
+function bareAsyncRouteViolations(text, rel) {
+  const r = String(rel || '');
+  const isRouteFile = /(^|\/)routes?\/[^/]*\.js$/.test(r)
+    || /(^|\/)[a-z-]*routes?\.js$/.test(r)
+    || /^sample-/.test(r);
+  if (!isRouteFile) return [];
+  const out = [];
+  const t = stripComments(text);
+  const re = /router\.(get|post|put|delete|patch|head|all)\s*\(/g;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const open = t.indexOf('(', m.index);
+    const close = matchParen(t, open);
+    if (close < 0) continue;
+    const args = t.slice(open + 1, close);
+    if (!/\basync\s*\(\s*req\b/.test(args)) continue;                              // 同步处理器不受约束
+    if (/apiHandler\s*\(\s*async|asyncHandler\s*\(\s*async/.test(args)) continue;  // 已包装
+    if (!/try\s*\{/.test(args)) {
+      out.push(`${r}:${lineAt(t, m.index)} —— ${String(m[1]).toUpperCase()} 处理器是**裸 async 且无 try/catch**：`
+        + 'Express 4 不会捕获它的 rejection，抛错即请求永久挂起（既不 500 也不结束）→ '
+        + '请用 `apiHandler(async (req, res) => { … })` 包装（异常副作用写进 `onError`）');
+    }
+  }
+  return out;
+}
+
+CHECKS.push({
+  name: 'R23-04 路由处理器不得裸奔（必须包装或自带 try/catch）',
+  fn: bareAsyncRouteViolations,
+  bad: [
+    // 裸 async + 无 try：抛错即永久挂起
+    "router.get('/x', async (req, res) => {\n  res.json({ ok: true });\n});\n",
+    // 带中间件的同型写法（历史代码里最常见的形态）
+    "router.post('/y', requireAdmin, async (req, res) => {\n  await p(c, 'putObject', {});\n  res.json({});\n});\n",
+  ],
+  good: [
+    "router.get('/x', apiHandler(async (req, res) => {\n  res.json({ ok: true });\n}));\n",
+    "router.post('/y', requireAdmin, apiHandler(async (req, res) => {\n  await p(c, 'putObject', {});\n  res.json({});\n}));\n",
+    // 沿用自有 try/catch 的历史形态（迁移期间的合法状态）
+    "router.get('/z', async (req, res) => {\n  try {\n    res.json({});\n  } catch (e) {\n    res.status(500).json({ error: e.message });\n  }\n});\n",
+    // 同步处理器：本检查不管
+    "router.get('/sync', (req, res) => {\n  res.json({ ok: true });\n});\n",
+  ],
 });
 
 /* ---------- R14-13 / R14-04 / R14-05 / R14-06 / R14-07 ---------- */
@@ -2077,6 +2163,72 @@ test('缓存键含全部区分维度：listCache.keyOf 的首参必须是 bucket
   for (const f of serverFiles) hits.push(...cacheKeyViolations(f.src, f.rel));
   assertEqual(hits.length, 0,
     `命中 ${hits.length} 处（canonical：_shared.bucketCacheKey）：\n  ${hits.join('\n  ')}`);
+});
+
+test('路由处理器不得裸奔：async 处理器必须有包装或自带 try/catch（R23-04）', () => {
+  const hits = [];
+  for (const f of serverFiles) hits.push(...bareAsyncRouteViolations(f.src, f.rel));
+  assertEqual(hits.length, 0,
+    `命中 ${hits.length} 处（canonical：_shared.apiHandler）：\n  ${hits.join('\n  ')}`);
+  // 下界自检：扫描范围必须真的覆盖到路由注册，否则「命中归零」也只是扫了个空
+  const routes = serverFiles.reduce((n, f) => n
+    + (stripComments(f.src).match(/router\.(get|post|put|delete|patch|head|all)\s*\(/g) || []).length, 0);
+  assert(routes >= 50,
+    `扫描范围自检：应至少扫到 50 个 router.<method>( 注册，实际 ${routes} 个 —— `
+    + '低于下界说明本检查的扫描口径已失效（须修护栏，而不是让它静默失去覆盖）');
+});
+
+/* ---------- R23-04 棘轮：路由内联错误响应副本数不得增加 ---------- */
+
+/**
+ * `_shared.apiHandler` 是路由层「async 处理器 + 标准错误响应」的唯一实现点（R23-04），
+ * 但全量迁移是**渐进**的（历史 `catch` 里夹带 `statsStore.addLog` 等副作用，不能一次换完）。
+ * 因此本检查只做**棘轮**：把「内联两行副本」的现有总数冻结成上限，**只许减、不许增**。
+ *
+ * 为什么必须机器挡住增量：本项目反复出现「同一逻辑多份实现 → 必然改一半」的漏网之鱼
+ * （`deletePrefix` 三份同构各自修三遍即标本）。只把 `apiHandler` 写进注释、靠自觉，
+ * 则下一个人顺手复制的第 N+1 份仍然能通过全部检查 —— 于是收敛点永远追不上复制速度。
+ *
+ * 判据（作用在**剥注释后**的源码）：变量自身 `.status` 三目 + `translateError(同变量)`，
+ * 例 `const err = e.status ? e : translateError(e);`。带反引号的注释样例不会误命中。
+ */
+const INLINE_ERROR_COPY_PATTERN = /\b(\w+)\.status\s*\?\s*\1\s*:\s*translateError\(\1\)/g;
+/** 冻结上限（R24 批次实测基数 25）。迁移掉一处即可**下调**；新增副本时必须先迁移，不得上调。 */
+const INLINE_ERROR_COPY_MAX = 25;
+
+/** @returns {{total:number, per:string[]}} 全库内联副本总数与逐文件分布 */
+function inlineErrorCopyCount(files) {
+  const per = [];
+  let total = 0;
+  for (const f of files) {
+    const n = (stripComments(f.src).match(INLINE_ERROR_COPY_PATTERN) || []).length;
+    if (n) { per.push(`${f.rel}×${n}`); total += n; }
+  }
+  return { total, per };
+}
+
+test('R23-04 棘轮：路由内联错误响应副本数不得增加（新代码请用 apiHandler）', () => {
+  // 判据自测：正样例必须命中、注释里的同形字样必须放过（否则「命中归零」无从察觉）
+  assertEqual((stripComments("const err = e.status ? e : translateError(e);\n")
+    .match(INLINE_ERROR_COPY_PATTERN) || []).length, 1,
+    '判据失效：正样例未被命中');
+  assertEqual((stripComments('// const err = e.status ? e : translateError(e);\n')
+    .match(INLINE_ERROR_COPY_PATTERN) || []).length, 0,
+    '判据失效：注释里的同形字样被误命中（剥注释未生效）');
+
+  const { total, per } = inlineErrorCopyCount(serverFiles);
+  /**
+   * 下界是「判据存活」下界（只用于发现判据失效 / 扫了个空），**不是**覆盖率下界 ——
+   * 迁移会**主动**降低总数，故不能设得太高。若将来把 25 处全部迁完，应连同本检查
+   * 一起**退役**（那时下界必然失守，这本身就是一个「该删掉本护栏」的信号）。
+   */
+  assert(total >= 5,
+    `扫描范围自检：应至少命中 5 处内联副本，实际 ${total} —— `
+    + '低于下界说明本检查的判据已失效（须修护栏本身，而不是让它静默失去覆盖）');
+  assert(total <= INLINE_ERROR_COPY_MAX,
+    `内联错误响应副本由上限 ${INLINE_ERROR_COPY_MAX} 增至 ${total}（分布：${per.join(' ')}）。\n`
+    + '新代码请改用 `_shared.apiHandler(async (req, res) => { … })`（异常副作用写进 `onError`），'
+    + '不要复制第 N+1 份两行 catch；若确实迁移掉了一处，请同步**下调** `INLINE_ERROR_COPY_MAX`');
 });
 
 test('上游状态码不占本地 401/403 语义', () => {

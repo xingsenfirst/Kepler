@@ -68,6 +68,68 @@ test('enc-store crypto 模式：加密后可完整解密还原', async () => {
   }
 });
 
+test('R24-03 · 密文分段被重排 / 拼接必须报错（IV 与 TAG 逐段比对本地元数据）', async () => {
+  const restore = protectData(['enc-meta.json', 'enc-settings.json', 'enc.key']);
+  try {
+    const encStore = require(path.join(ROOT, 'server', 'enc-store.js'));
+    encStore._resetForTest && encStore._resetForTest();
+    encStore.updateSettings({ mode: 'crypto', password: '' });
+
+    // 必须造**两段**密文：单段对象无法暴露「按位置比对」这条判据
+    const p1 = Buffer.from('第一段明文：AAA');
+    const p2 = Buffer.from('第二段明文：BBB');
+    const sess = {
+      id: 'r24-03', bucket: 'test-bucket', key: 'multi/seg.bin',
+      size: p1.length + p2.length, chunkSize: p1.length,
+      enc: { mode: 'crypto', parts: {} },
+      parts: { 1: 'etag-1', 2: 'etag-2' },
+    };
+    const c1 = encStore.encryptPart(sess, 1, p1); // 首段：magic + IV|CT|TAG
+    const c2 = encStore.encryptPart(sess, 2, p2); // 后续段：IV|CT|TAG
+    const meta = encStore.buildFinalMeta(sess);
+    assert(meta && meta.crypto && meta.crypto.segments.length === 2,
+      '前置：应构造出两段 crypto 元数据');
+
+    const decryptAll = (bytes, m) => new Promise((resolve, reject) => {
+      const chunks = [];
+      const t = encStore.decryptTransform(m);
+      t.on('data', (c) => chunks.push(c));
+      t.on('end', () => resolve(Buffer.concat(chunks)));
+      t.on('error', reject);
+      t.end(bytes);
+    });
+    const expectReject = async (bytes, m, re, msg) => {
+      let err = null;
+      try { await decryptAll(bytes, m); } catch (e) { err = e; }
+      if (!err) throw new Error('断言失败：' + msg + '（实际未报错）');
+      if (!re.test(String(err.message))) {
+        throw new Error('断言失败：' + msg + `（错误文案不符：${err.message}）`);
+      }
+    };
+
+    // ① 正对照：未篡改的两段密文必须完整还原 —— 新判据不得误伤正常数据
+    const ok = await decryptAll(Buffer.concat([c1, c2]), meta);
+    assertEqual(ok.toString('utf8'), p1.toString('utf8') + p2.toString('utf8'),
+      '正对照：合法两段密文必须完整解出（按位置比对不得误伤）');
+
+    // ② 重排分段：保持魔数头在最前，交换两段密文本体 —— 云端可写者最容易做的一步。
+    //    旧实现下每段 IV|CT|TAG 自洽、GCM 认证各自通过 → 静默产出被重排的明文。
+    const MAGIC_LEN = 10; // 'COSCENC01'
+    const reordered = Buffer.concat([c1.slice(0, MAGIC_LEN), c2, c1.slice(MAGIC_LEN)]);
+    await expectReject(reordered, meta, /IV 与本地元数据不一致/,
+      '重排等长分段必须被检出（这是 R24-03 的核心现场：逐段自洽但整体被重排）');
+
+    // ③ 段序与元数据不一致（等价于「第 i 段读到了邻段的 IV」这一检出条件）
+    const swapped = JSON.parse(JSON.stringify(meta));
+    swapped.crypto.segments.reverse();
+    await expectReject(Buffer.concat([c1, c2]), swapped,
+      /IV 与本地元数据不一致|认证标签与本地元数据不一致/,
+      '段序与元数据不一致时必须报错');
+  } finally {
+    restore();
+  }
+});
+
 test('XOR 字对齐优化与逐字节异或结果完全等价', () => {
   // 复刻 enc-store 的 xor 实现，对多种长度/offset 做等价性验证
   function xorBytewise(buf, ks) {

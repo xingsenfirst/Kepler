@@ -314,6 +314,101 @@ test('R17-03 · 站点地址的「是不是本站」判据与 HTTPS 跳转同源
   const shareSrc = stripLineComments(read(SHARE_ROUTES));
   assert.match(shareSrc, /if \(base && !security\.isOwnSiteHost\(base, \[\]\)\) base = '';/,
     'siteUrlFor 必须对配置值再兜一次 —— 否则旧配置会把付款人 302 到外站');
+
+  /* ---------- R24-01：兜底路径同样不得信任任意请求 Host ---------- */
+  assert.match(shareSrc, /security\.isOwnSiteHost\(host, \[\]\)/,
+    'siteUrlFor 的 Host 兜底路径必须过 isOwnSiteHost —— 否则任意 Host 都能变成回调地址');
+  assert.match(shareSrc, /security\.configuredSiteHost\(\)/,
+    'Host 不可信时必须退到配置的站点域名（回调地址要公网可达，故优先于本机 HOST）');
+  assert.doesNotMatch(shareSrc, /base = proto \+ ':\/\/' \+ \(req\.headers\.host \|\|/,
+    '不得再直接信任 req.headers.host 拼回调地址（R24-01 的旧实现形态）');
+});
+
+test('R24-01 · 外站 Host 不得成为支付回调地址（否则异步通知被劫持）', () => {
+  const siteUrlFor = require(SHARE_ROUTES).__siteUrlFor;
+  assert.strictEqual(typeof siteUrlFor, 'function',
+    '必须导出测试钩子 __siteUrlFor（否则这条纪律只能靠读源码，无法行为断言）');
+
+  // 本环境：HOST=pan.example.com（非通配）+ TRUST_PROXY=1 → 属本站的 Host 按 https 采信
+  assert.strictEqual(siteUrlFor({ secure: true, headers: { host: 'pan.example.com' } }),
+    'https://pan.example.com', '属本站的 Host 照旧可用（正常部署不受影响）');
+
+  // 外站 Host：绝不能被用作回调地址 —— 只能退到配置域名 / 本机 HOST 这类可信来源
+  for (const evil of ['evil.example', 'pan.example.com.evil.example', 'attacker.test:8443']) {
+    const got = siteUrlFor({ secure: true, headers: { host: evil } });
+    assert.ok(!got.includes('evil') && !got.includes('attacker'),
+      `外站 Host「${evil}」不得出现在回调地址里（实际 ${JSON.stringify(got)}）—— `
+      + '否则付费链接的任意访问者可用自定义 Host 把支付宝异步通知引到自己的域');
+  }
+
+  // 本机 HOST 是最后一级兜底（本地自测可用；公网回调本就不可达），且同样与请求 Host 无关
+  const fallback = siteUrlFor({ secure: true, headers: { host: 'evil.example' } });
+  assert.strictEqual(fallback, 'https://pan.example.com',
+    '无配置域名时应退到本机 HOST，而不是请求 Host');
+});
+
+test('R24-06 · CSRF 必须在「自定义头」之外补一层同源校验', () => {
+  const { csrfGuard } = security;
+  const mk = (method, headers) => ({
+    method,
+    get: (k) => headers[String(k).toLowerCase()],
+  });
+
+  // 原有判据保持不变
+  assert.strictEqual(csrfGuard(mk('GET', {})), true, '安全方法必须直接放行');
+  assert.strictEqual(csrfGuard(mk('POST', {})), false, '非安全方法缺自定义头必须拒绝');
+  assert.strictEqual(csrfGuard(mk('POST', { 'x-requested-with': 'XMLHttpRequest' })), true,
+    '带自定义头、且无来源头时必须放行（curl / wget 直连客户端不带 Origin/Referer）');
+
+  // R24-06：带了来源头就必须同源（与**本次请求的 Host**比对）
+  assert.strictEqual(csrfGuard(mk('POST', {
+    'x-requested-with': 'XMLHttpRequest',
+    host: 'pan.example.com:3443',
+    origin: 'https://pan.example.com',
+  })), true, '同源（端口差异不该误判，反代可能隐藏端口）必须放行');
+
+  assert.strictEqual(csrfGuard(mk('POST', {
+    'x-requested-with': 'XMLHttpRequest',
+    host: 'pan.example.com',
+    origin: 'https://evil.example',
+  })), false,
+  '跨站来源必须拒绝 —— 否则「自定义头」这一单点一旦失效（引入 CORS / 反代补头）就毫无症状');
+
+  assert.strictEqual(csrfGuard(mk('POST', {
+    'x-requested-with': 'XMLHttpRequest',
+    host: 'pan.example.com',
+    origin: 'null',
+  })), false, 'Origin: null（沙箱 iframe）不是合法来源，必须拒绝');
+
+  assert.strictEqual(csrfGuard(mk('POST', {
+    'x-requested-with': 'XMLHttpRequest',
+    host: 'pan.example.com',
+    referer: 'https://evil.example/page',
+  })), false, '没有 Origin 时 Referer 必须作为次选来源同样校验');
+});
+
+test('R24-02 · 部署模式下 rpId 必须属本站（外站 Host 不得签发挑战）', () => {
+  // 本文件是**部署模式**（HOST=pan.example.com，非回环）→ 走的正是要守的那条分支。
+  // 非部署（本机）模式不变，仍是 localhost / 127.0.0.1 由浏览器直接提供 Host。
+  const { webauthnContext } = require(ROUTES_SHARED);
+
+  const ok = webauthnContext({ secure: true, headers: { host: 'pan.example.com' } });
+  assert.strictEqual(ok.rpId, 'pan.example.com', '本站域名的 rpId 必须照旧可用（正常部署不受影响）');
+  assert.strictEqual(ok.origin, 'https://pan.example.com', 'origin 必须与访问地址一致');
+
+  // 外站 Host → fail-closed 抛错，而不是「退回按 Host 推导」（后者等于没修）
+  for (const evil of ['evil.example', 'pan.example.com.evil.example', 'storage.example.com']) {
+    assert.throws(() => webauthnContext({ secure: true, headers: { host: evil } }),
+      (e) => e && e.status === 403 && e.webauthnUntrusted === true,
+      `外站 Host「${evil}」必须被拒绝 —— 否则把域名解析到同一 IP 的钓鱼站可用它作为 `
+      + 'rpId 完整代理「注册 + 登录」两步，WebAuthn「凭据绑定固定 RP」的防钓鱼属性被抵消');
+  }
+
+  // 回环放行：`Host: 127.0.0.1` 只可能来自访问本机的浏览器（远端攻击者无法把远端站点
+  // 写成回环地址），且 WebAuthn 依赖「回环属安全上下文」这一例外
+  const loop = webauthnContext({ secure: true, headers: { host: '127.0.0.1:3000' } });
+  assert.strictEqual(loop.rpId, '127.0.0.1', '回环访问必须仍可用（本机自测 / 本地部署）');
+  assert.strictEqual(loop.origin, 'https://127.0.0.1:3000', '回环 origin 必须保留端口');
 });
 
 /* ==================================================================== */

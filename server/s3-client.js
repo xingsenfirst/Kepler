@@ -178,6 +178,28 @@ function tag(text, name) {
   return m ? m[1] : '';
 }
 
+/**
+ * R23-01：ETag 取值 —— **响应头优先，响应体兜底**。
+ *
+ * S3 协议规定 `UploadPart` / `PutObject` 成功时响应**体为空**、ETag 只在 `ETag`
+ * 响应头里。旧实现只做 `tag(body, 'ETag')`（体解析），在阿里云 OSS / 华为云 OBS /
+ * 七牛 / 又拍云 / AWS S3 上恒得空串：
+ *   - 分片路径：空 ETag 存进会话（`routes/fs.js`），合并时提交 `<ETag></ETag>`
+ *     → 云端 `InvalidPart`，**所有 >8MB 文件在最后合并一步必然失败**；
+ *   - 直传路径：返回的 ETag 也恒为空（当前调用方未使用，但同样是错值）。
+ * 腾讯云走原生 SDK、不经此处，故「只测腾讯云」时从不暴露。
+ *
+ * 保留体解析兜底：个别实现 / 测试桩会把 ETag 放进 XML。
+ * 不做去引号处理——下游（`routes/fs.js`、`multipartComplete`）已有 `.replace(/"/g,'')`。
+ */
+function etagOf(res, body) {
+  const fromHeader = res && res.headers && typeof res.headers.get === 'function'
+    ? res.headers.get('etag')
+    : '';
+  if (fromHeader) return String(fromHeader).trim();
+  return tag(body, 'ETag');
+}
+
 /** 取出所有同名标签块（用于 Contents / CommonPrefixes 等重复节点） */
 function tagAll(text, name) {
   // 要求标签名后紧跟 '>' 或空白：避免 <Bucket> 误匹配 <Buckets> 这类同前缀容器标签
@@ -593,14 +615,15 @@ class S3Client {
         }
       }
       const isStream = params.Body && typeof params.Body.pipe === 'function';
-      const body = await this._send({
+      // R23-01：同一类缺陷 —— PutObject 响应体为空、ETag 只在头；顺带把真实响应头回传。
+      const { res, body } = await this._send({
         method: 'PUT', bucket, key: params.Key || '', headers, body: params.Body,
         streamBody: isStream, contentLength: params.ContentLength,
-      });
+      }, { raw: true });
       return {
-        ETag: tag(body, 'ETag'),
+        ETag: etagOf(res, body),
         Location: tag(body, 'Location'),
-        headers: {},
+        headers: headerObject(res.headers),
       };
     });
   }
@@ -756,13 +779,14 @@ class S3Client {
     return this._do(cb, async () => {
       const { bucket } = this._ctx(params);
       const partNumber = Number(params.PartNumber) || 1;
-      const body = await this._send({
+      // R23-01：必须取 raw 响应 —— ETag 只在响应头（S3 的 UploadPart 响应体为空）
+      const { res, body } = await this._send({
         method: 'PUT', bucket, key: params.Key || '',
         query: { partNumber: String(partNumber), uploadId: params.UploadId },
         body: params.Body, contentLength: params.ContentLength,
         streamBody: params.Body && typeof params.Body.pipe === 'function',
-      });
-      return { ETag: tag(body, 'ETag') };
+      }, { raw: true });
+      return { ETag: etagOf(res, body) };
     });
   }
 

@@ -144,6 +144,58 @@ function diagramDataFiles(doc) {
 const codeFiles = codeDataFiles();
 const docRefs = docDataRefs(readDoc(DOC));
 
+/* ============================ R23-05：树里登记的文件必须存在 ============================ */
+
+/**
+ * **R23-05：目录结构代码块里登记的「仓库文件」→ 相对仓库根的路径（值 = 出现行号）。**
+ *
+ * 起因：本块曾列出 `.github/workflows/ci.yml` 并配了说明文字，而仓库里根本没有
+ * `.github` 目录。既有 docs-sync 校验了模块清单 / TOC / 环境变量表，**唯独不校验
+ * 「文档提到的仓库文件是否存在」** —— 于是这条声明可以长期漂移而不报红，而读者会按
+ * 文档去等一个永远不会出现的红灯。这里把「树里写了的文件必须真的在」变成断言。
+ *
+ * 口径：
+ *  - 只认**带扩展名的文件**（目录、根标记 `main/`、`data/` 运行期子树一律跳过）；
+ *  - 同一行用 `·` 并列多个文件时逐个校验；
+ *  - `#` 之后是说明文字，不参与解析；
+ *  - 路径按缩进还原父目录（每 4 个字符一级：`│   ` 或四个空格）。
+ */
+function treeRepoFiles(block) {
+  const out = new Map();
+  /** depth → 该层目录的相对路径 */
+  const stack = {};
+  block.split('\n').forEach((raw, i) => {
+    const m = /^([│\s]*)[├└]──\s*(.+?)\s*$/.exec(raw);
+    if (!m) return;
+    const depth = Math.floor(m[1].replace(/\t/g, '    ').length / 4) + 1;
+    const body = m[2].split('#')[0].trim();
+    if (!body) return;
+    for (const token of body.split('·').map((s) => s.trim()).filter(Boolean)) {
+      const isDir = token.endsWith('/');
+      const clean = token.replace(/\/+$/, '');
+      if (!clean) continue;
+      const parent = depth > 1 ? (stack[depth - 1] || '') : '';
+      const full = parent ? `${parent}/${clean}` : clean;
+      if (isDir) { stack[depth] = full; continue; }
+      if (full.startsWith('data/')) continue;        // 运行期目录，不入库（另有 data/ 清单断言守着）
+      if (!/\.[A-Za-z0-9]+$/.test(full)) continue;   // 只认带扩展名的文件
+      if (!out.has(full)) out.set(full, []);
+      out.get(full).push(i + 1);
+    }
+  });
+  return out;
+}
+
+/**
+ * R23-05 豁免清单：目录结构里**有意**列出、但仓库中尚不存在的条目。
+ *
+ * 目前为空 —— 唯一的预留项（CI 工作流）已改为在正文如实说明「当前不提供」，
+ * 并从树里移除（把不存在的东西列进目录树，本身就是误导）。
+ * 登记时请在同行注释里写明「为什么可以先写、何时必须闭合」。
+ */
+const TREE_EXEMPT = new Set([]);
+
+
 /* ============================ 审计编号台账 ============================ */
 
 const AUDIT_LEDGER_SECTION = '六、审计发现台账（合并存档）';
@@ -342,6 +394,21 @@ test('分层图与目录结构的 data 文件清单一致', () => {
   assertEqual(onlyTree.length, 0,
     `分层图缺少：${onlyTree.join(', ')}（确要改成摘要时，请一并调整本断言，不要让它静默失去覆盖）`);
   assertEqual(onlyDiagram.length, 0, `分层图多出：${onlyDiagram.join(', ')}`);
+});
+
+test('目录结构里列出的仓库文件必须真实存在（R23-05）', () => {
+  const listed = treeRepoFiles(structureBlock(readDoc(DOC)));
+  assert(listed.size >= 30,
+    `目录结构解析到 ${listed.size} 个文件 —— 少于 30 说明本护栏的解析口径已经失效`
+    + '（须修护栏本身，而不是让它静默失去覆盖）');
+  const missing = [...listed.keys()]
+    .filter((rel) => !TREE_EXEMPT.has(rel))
+    .filter((rel) => !fs.existsSync(path.join(ROOT, rel)));
+  const detail = missing.map((rel) => `${rel}（${DOC}:${listed.get(rel).join(',')}）`).join('；');
+  assertEqual(missing.length, 0,
+    `目录结构里列出、但仓库中并不存在的文件：${detail}。`
+    + '确为「文档先于实现」的预留项时，请登记进 `TREE_EXEMPT` 并写明理由；'
+    + '否则请删除该条目或让文件真正落地 —— 这正是一处曾长期漂移的声明（ci.yml）留下的教训');
 });
 
 test('样例自测：审计编号提取可用，且不误吞 S3 / P256 这类普通词（含反例）', () => {

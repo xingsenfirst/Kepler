@@ -190,6 +190,45 @@ test('去抖合并写：快照返回 null 表示「本次不写」，debounceMs=
   assertEqual(m, 1, 'PAYMENT_WRITE_DEBOUNCE_MS=0 这类逃生阀必须退回「立即写」');
 });
 
+test('R23-02 写失败（写入器 resolve(false)）必须置回 dirty，flush 重试成功后清痕', async () => {
+  const writes = [];
+  let failNext = true;
+  const w = coalesce.debouncedPersist(path.join(TMP, 'coalesce-failretry.json'), () => ({ v: 1 }), {
+    debounceMs: 0, // 立即写，便于同步断言
+    write: (_f, snap) => {
+      if (failNext) return Promise.resolve(false); // 模拟 writeJsonAsync 吞错 + resolve(false)
+      writes.push(snap.v);
+      return Promise.resolve(); // 兼容注入假写入器 resolve(undefined)
+    },
+    writeSync: () => {},
+  });
+
+  w.schedule();
+  await sleep(0); // 让失败检测的微任务先跑
+  assertEqual(w.pending(), true,
+    '异步写失败后必须置回 dirty —— 否则后续 flush/退出同步写会因 !dirty 直接跳过，变更被静默丢弃');
+  assert(w.lastError(), '失败应留痕（lastError 非空）');
+
+  failNext = false;
+  w.flush(); // 重试
+  await sleep(0);
+  assertEqual(w.pending(), false, '重试成功后 dirty 应恢复为 false');
+  assertEqual(writes.length, 1, '重试确实落了一次盘');
+  assertEqual(w.lastError(), null, '成功后错误标记应清空');
+});
+
+test('R23-02 写失败（Promise 拒绝）必须被收口 + 置回 dirty（不再退化成 unhandledRejection）', async () => {
+  const w = coalesce.debouncedPersist(path.join(TMP, 'coalesce-reject.json'), () => ({ v: 2 }), {
+    debounceMs: 0,
+    write: () => Promise.reject(new Error('ENOSPC')),
+    writeSync: () => {},
+  });
+  w.schedule();
+  await sleep(0);
+  assertEqual(w.pending(), true, 'Promise 拒绝同样必须置回 dirty（旧的同步 try/catch 抓不到它）');
+  assert(w.lastError(), '拒绝应留痕');
+});
+
 test('退出收口：目录不存在时只写不建（不复活被清理的 data/），存在时同步落盘一次', () => {
   const ghostDir = path.join(TMP, 'ghost-dir-not-exist');
   let ghost = 0;

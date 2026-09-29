@@ -8,7 +8,8 @@
  *
  * 覆盖的编号：
  *   R10-02 /fs/move 移动文件夹必须保留目录层级（否则密文永久不可解）
- *   R10-03 deletePrefix 三处入口共用白名单判据（"既不确认也不报错"按未删处理）
+ *   R10-03 deletePrefix 三处入口共用白名单判据（"既不确认也不报错"按未删处理；
+ *          R23-03 后三份实现已收敛为 `gateway.deletePrefixAll()` 一份，判据不变）
  *   R10-04 migratePrefix 只清理「本次确实被覆盖」的目标条目（目录 MOVE 是 merge 语义）
  *   R10-05 init 的 simple/multipart 分界必须感知加密模式（消除 5–8MB 死路）
  *   R10-06 WebDAV MOVE 删源必须标记分享链接

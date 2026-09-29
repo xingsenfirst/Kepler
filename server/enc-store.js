@@ -253,8 +253,10 @@ function persistMeta() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   const seq = ++metaSeq;
   // 异步串行写入：元数据变更较频繁，避免阻塞事件循环（P1）
+  // R23-02：写失败（writeJsonAsync 现 resolve(false)）时**不得**标记已落盘 ——
+  // 否则 metaDirty() 变 false、flushMeta() 跳过同步落盘，解密唯一凭据会永久丢失。
   secureStore.writeJsonAsync(META_FILE, loadMeta())
-    .then(() => { if (seq > metaSavedSeq) metaSavedSeq = seq; }, () => {});
+    .then((ok) => { if (ok !== false && seq > metaSavedSeq) metaSavedSeq = seq; });
 }
 
 /** 是否存在尚未落盘的元数据变更 */
@@ -1035,6 +1037,26 @@ function decryptTransform(meta) {
           } else if (phase === 'iv') {
             const t = take(IV_LEN);
             if (!t) break;
+            /**
+             * R24-03：**分段的 IV 必须与本地元数据逐段一致**。
+             *
+             * 元数据（`data/enc-meta.json`）是解密的唯一凭据，也是攻击者改不到的本地
+             * 事实 —— 云端只有密文。旧实现只从密文流里取 IV / TAG 而**从不比对**，
+             * 于是能写云端对象的人可以：① 在同一文件内重排等长分段（multipart 的分片
+             * 常态即等长，只有末片不同）；② 把另一个密文对象的分段拼接进来（`ctLen`
+             * 对齐时）。两种情况下每段 `<IV|CT|TAG>` 自洽，逐段 GCM 认证**全部通过**，
+             * 于是**静默产出被重排 / 拼接的「合法」明文** —— 这与本函数「任何篡改都会
+             * 报错，不会输出损坏明文」的承诺直接矛盾。
+             *
+             * 按位置比对 IV 与 TAG 同时钉住「顺序」与「内容」：重排会让第 i 段读到邻段
+             * 的 IV，拼接会让它读到别的对象的 IV —— 两者都在此立即失败。
+             * （历史元数据若缺少 iv/tag 则跳过比对，保持向后兼容。）
+             */
+            const wantIv = segs[si] && segs[si].iv ? String(segs[si].iv).toLowerCase() : '';
+            if (wantIv && wantIv !== t.toString('hex')) {
+              return cb(new Error(`密文分段的 IV 与本地元数据不一致（第 ${si + 1} 段）：`
+                + '该对象可能被重排 / 拼接或已损坏'));
+            }
             decipher = crypto.createDecipheriv('aes-256-gcm', mk, t);
             ctLeft = segs[si].ctLen;
             phase = 'ct'; progressed = true;
@@ -1050,6 +1072,12 @@ function decryptTransform(meta) {
           } else if (phase === 'tag') {
             const t = take(TAG_LEN);
             if (!t) break;
+            // R24-03：认证标签同样必须与元数据一致（理由见上面 `phase === 'iv'` 的说明）
+            const wantTag = segs[si] && segs[si].tag ? String(segs[si].tag).toLowerCase() : '';
+            if (wantTag && wantTag !== t.toString('hex')) {
+              return cb(new Error(`密文分段的认证标签与本地元数据不一致（第 ${si + 1} 段）：`
+                + '该对象可能被重排 / 拼接或已损坏'));
+            }
             decipher.setAuthTag(t);
             this.push(decipher.final()); // 认证失败在此抛出
             si++;

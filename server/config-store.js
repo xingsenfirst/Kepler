@@ -704,20 +704,67 @@ function setCredentialsVisibility(visibleIds) {
   return { ok: true, visibleCount };
 }
 
+/**
+ * 要求用户提供端点的厂商（MinIO 的访问地址 / R2 的账户 ID）缺失端点时必须**当场拒绝**。
+ *
+ * 为什么不在连接时才报：`cos.js` 到那时才抛错，而那时这条密钥**已经落库**了 ——
+ * 用户看到的是一条「配置看着齐全、每次操作用它都失败」的记录，且失败文案是
+ * 「网络连接异常」（端点被拼成一个不存在的域名），完全指不到「少填了账户 ID」。
+ * 把判定放在唯一的写入点上，问题就停在表单里。
+ */
+function assertEndpointProvided(pid, endpoint) {
+  if (endpoint || !providers.endpointRequired(pid)) return;
+  const meta = providers.resolve(pid);
+  const err = new Error(`${meta.name} 需要填写「${meta.endpointLabel || '服务端点'}」`);
+  err.status = 400;
+  throw err;
+}
+
 function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaBytes, visibleToUsers, enabled }) {
   const cfg = requireStore();
   const now = new Date().toISOString();
   const pid = providers.get(provider) ? provider : providers.DEFAULT_PROVIDER_ID;
-  const ep = typeof endpoint === 'string' ? endpoint.trim() : '';
+  /**
+   * 只有「入参 provider 是已注册厂商」才算**显式指定**（与 `addBucket` 的 SEC-01 同款
+   * 判据）。区分它的必要性：同 SecretId 的重存会走到下面的更新分支，若在那里无条件
+   * 写 provider，一次「只改备注」的保存就会把该密钥回落到默认厂商（腾讯云）——
+   * 于是 R2 这类**端点由厂商模板推导**的记录会被按腾讯云的规则重算，端点被写坏。
+   */
+  const explicitProvider = providers.get(provider) ? provider : '';
+  // 同 SecretId 视为更新（便于重新保存同一密钥）
+  const exist = cfg.credentials.find((c) => c.secretId === secretId);
+  /**
+   * 端点按厂商规则组装（唯一实现点 `providers.composeEndpoint`）。
+   *
+   * 界面上「服务端点」这一栏对不同厂商含义不同：Cloudflare R2 填的是**账户 ID**、
+   * MinIO 填的是**完整访问地址**、其余厂商填的是自定义端点。组装必须在**校验之前**
+   * 完成 —— 否则 R2 的账户 ID 会被 `assertSafeEndpoint()` 当成一个非法 URL 拒掉。
+   *
+   * ⚠️ 组装必须按「这条记录**最终生效**的厂商」来做，而不是入参里的那个：
+   * 重新保存一条 R2 密钥时调用方往往**不带** provider（`PUT /config` 的扁平入参就是
+   * 这样），此时用默认厂商（腾讯云）去组装只会原样透传账户 ID `1a2b…`，
+   * 紧接着的 `assertSafeEndpoint()` 便以「服务端点格式不正确」**拒掉整次保存** ——
+   * 一条完全正确的密钥，仅仅因为调用方没重复声明厂商就存不回去。
+   * 取值顺序与更新分支最终写入的 `exist.provider` 严格一致：显式厂商 → 既有厂商 → 默认。
+   */
+  const epProvider = explicitProvider || (exist && exist.provider) || pid;
+  const ep = providers.composeEndpoint(epProvider, endpoint);
   // SEC-03：写入前校验自定义端点（禁云元数据/回环/私网，非回环强制 https），
   // 避免把危险端点持久化后由后续任意请求触发。
   if (ep) assertSafeEndpoint(ep);
-  // 同 SecretId 视为更新（便于重新保存同一密钥）
-  const exist = cfg.credentials.find((c) => c.secretId === secretId);
   if (exist) {
     exist.secretKey = secretKey || exist.secretKey;
-    exist.provider = pid;
-    exist.endpoint = ep;
+    if (explicitProvider) exist.provider = pid;
+    // 端点**仅在显式提交时**改写（与 remark / quotaBytes 同款「未传即保持」约定）。
+    // 历史实现无条件 `exist.endpoint = ep`，于是在未传 endpoint 的调用方
+    // （如 `PUT /config` 的旧版扁平入参）手里，一次保存就会把已有自定义端点清空。
+    if (endpoint !== undefined) {
+      // ⚠️ 顺序：**先校验、后落值**。反过来的话，一次被拒绝的更新已经在内存里把
+      // `c.endpoint` 改成了非法值（`persist` 虽未执行，但这份 cfg 对象继续被同批请求
+      // 读用），表现为「明明报了错，密钥却真的坏了」。
+      assertEndpointProvided(exist.provider, ep);
+      exist.endpoint = ep;
+    }
     if (remark !== undefined) exist.remark = String(remark || '');
     if (quotaBytes !== undefined) exist.quotaBytes = normalizeQuotaBytes(quotaBytes); // R25
     if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
@@ -728,6 +775,8 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaB
     persist(cfg);
     return credentialView(exist);
   }
+  // 新增记录：该厂商要求用户提供端点时必须当场给到（见 assertEndpointProvided 说明）
+  assertEndpointProvided(pid, ep);
   const cred = {
     id: newId(),
     provider: pid,
@@ -783,11 +832,23 @@ function updateCredential(id, patch) {
   const c = cfg.credentials.find((x) => x.id === id);
   if (!c) return false;
   if (patch.provider !== undefined && providers.get(patch.provider)) c.provider = patch.provider;
+  /**
+   * 厂商与端点两者**任一被改动**都要先算出「改完之后的状态」再校验，最后才落值：
+   *  - 只改 `provider`（换成 MinIO）而端点仍是旧厂商的空值 → 会得到一条
+   *    「落库成功但永远连不上」的密钥，所以判据必须覆盖这两种改动的组合；
+   *  - **先校验后落值**：反过来的话，一次被拒绝的更新已经在内存里留下了脏值。
+   */
+  let nextEndpoint = c.endpoint;
   if (patch.endpoint !== undefined) {
-    const ep = String(patch.endpoint || '').trim();
-    if (ep) assertSafeEndpoint(ep); // SEC-03：同 addCredential
-    c.endpoint = ep;
+    // 同 addCredential：端点必须先按厂商规则组装（R2 的账户 ID → 完整端点），
+    // 再送安全校验 —— 顺序反了会把合法的账户 ID 当成非法 URL 拒掉。
+    nextEndpoint = providers.composeEndpoint(c.provider, patch.endpoint);
+    if (nextEndpoint) assertSafeEndpoint(nextEndpoint); // SEC-03：同 addCredential
   }
+  if (patch.provider !== undefined || patch.endpoint !== undefined) {
+    assertEndpointProvided(c.provider, nextEndpoint);
+  }
+  if (patch.endpoint !== undefined) c.endpoint = nextEndpoint;
   if (patch.remark !== undefined) c.remark = String(patch.remark || '');
   // R25：凭据级配额（0 = 无限制）。与桶配额同款归一化，负数/非法值一律落回 0。
   if (patch.quotaBytes !== undefined) c.quotaBytes = normalizeQuotaBytes(patch.quotaBytes);

@@ -777,7 +777,7 @@ function openBucketDialog(existing) {
     </div>`}
     <div class="form-row">
       <div class="form-item">
-        <label>地域（Region）<span class="req">*</span></label>
+        <label>地域（Region）<span class="req" id="bk-region-req">*</span></label>
         <input type="text" id="bk-region" placeholder="例如 ap-guangzhou" value="${isEdit ? escapeHtml(existing.region) : ''}">
         <div class="hint" id="bk-region-hint"></div>
       </div>
@@ -805,27 +805,34 @@ function openBucketDialog(existing) {
   // 密钥切换：地域提示与占位符随所选密钥的服务商变化
   const credSel = wrap.querySelector('#bk-cred');
   const regionHint = wrap.querySelector('#bk-region-hint');
+  const regionReq = wrap.querySelector('#bk-region-req');
+  /**
+   * 当前应当生效的服务商 id。
+   *
+   * 取值顺序与存储桶**服务端**的绑定解析一致（`addBucket` 的 SEC-01 判据）：
+   * 编辑时以该桶自身声明的 provider 为准 → 表单里选中的密钥所属厂商
+   * → 全局当前活跃服务商 → 默认厂商。
+   * 区域栏的「必填」判据与提示文案都以此为准，否则会出现
+   * 「界面按腾讯云要求必填、服务端按 MinIO 允许留空」的口径分叉。
+   */
+  function effectiveProviderId() {
+    if (existing && existing.provider) return existing.provider;
+    const picked = credSel ? usableCreds.find((c) => c.id === credSel.value) : null;
+    return (picked && picked.provider)
+      || (App.state.config && App.state.config.provider)
+      || 'tencent';
+  }
+  const regionInputEl = wrap.querySelector('#bk-region');
   function syncCredentialHints() {
-    if (!credSel) return;
-    const id = credSel.value;
-    const cred = usableCreds.find((c) => c.id === id);
-    const pid = (cred && cred.provider) || (App.state.config && App.state.config.provider) || 'tencent';
-    const prov = providerMeta(pid);
-    if (regionHint) {
-      regionHint.textContent = prov.regionHint || '';
-      const regionInput = wrap.querySelector('#bk-region');
-      if (regionInput) regionInput.placeholder = prov.regionPlaceholder || '请输入地域';
-    }
+    const prov = providerMeta(effectiveProviderId());
+    // 地域是否必填由厂商元数据决定（又拍云 / GCS / R2 / MinIO 允许留空，
+    // 服务端会补上厂商默认地域）。这里同步星号与文案，避免「留空就一定拦」。
+    if (regionReq) regionReq.hidden = prov.regionRequired === false;
+    if (regionHint) regionHint.textContent = prov.regionHint || '';
+    if (regionInputEl) regionInputEl.placeholder = prov.regionPlaceholder || '请输入地域';
   }
   if (credSel) credSel.onchange = syncCredentialHints;
-
-  // 初始（编辑无选择器时）：按当前生效服务商
-  if (regionHint) {
-    const pid = (App.state.config && App.state.config.provider) || 'tencent';
-    const prov = providerMeta(pid);
-    regionHint.textContent = prov.regionHint || '';
-    wrap.querySelector('#bk-region').placeholder = prov.regionPlaceholder || '请输入地域';
-  }
+  syncCredentialHints();
 
   const loadBtn = wrap.querySelector('#bk-load-cloud');
   if (loadBtn) {
@@ -871,7 +878,11 @@ function openBucketDialog(existing) {
               await API.updateBucket(existing.id, { region, remark, quotaBytes: Math.round(quotaGB * 1024 ** 3), visibleToUsers });
             } else {
               const bucket = wrap.querySelector('#bk-name').value.trim();
-              if (!bucket || !region) return msg('请填写存储桶名称与地域', 'bad');
+              if (!bucket) return msg('请填写存储桶名称', 'bad');
+              // 地域是否必填按**服务商**判定（又拍云 / GCS / R2 / MinIO 允许留空，
+              // 服务端会补厂商默认地域）；与服务端 POST /buckets/local 的闸门同源。
+              const needRegion = providerMeta(effectiveProviderId()).regionRequired !== false;
+              if (needRegion && !region) return msg('请填写地域（Region）', 'bad');
               // 绑定用户选择的密钥（未选择时留空，回退为使用当前密钥）
               const credId = credSel ? credSel.value : '';
               await API.addBucket({ bucket, region, remark, quotaBytes: Math.round(quotaGB * 1024 ** 3), visibleToUsers, credentialId: credId || undefined });

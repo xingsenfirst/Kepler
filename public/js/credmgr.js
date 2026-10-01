@@ -139,6 +139,11 @@ function renderAddForm(box) {
       <div class="form-item"><label>备注名（可选）</label>
         <input type="text" id="cred-remark" placeholder="例如：主账号 / 子账号-只读" autocomplete="off" spellcheck="false"></div>
     </div>
+    <div class="form-item" id="cred-endpoint-item" hidden>
+      <label id="cred-endpoint-label">服务端点<span class="req">*</span></label>
+      <input type="text" id="cred-endpoint" autocomplete="off" spellcheck="false">
+      <div class="hint" id="cred-endpoint-hint"></div>
+    </div>
     <div class="form-item">
       <label class="check-line"><input type="checkbox" id="cred-visible" checked>  对普通用户可见</label>
       <div class="hint">取消勾选后，该密钥仅管理员可见并使用；普通用户登录后无法看到或选择此密钥。</div>
@@ -157,7 +162,17 @@ function renderAddForm(box) {
     m.className = 'form-msg show ' + cls;
   };
 
-  /** 切换服务商后，同步密钥字段名、占位符与说明文案 */
+  /**
+   * 切换服务商后，同步密钥字段名、占位符与说明文案
+   *
+   * 「服务端点」这一栏**由厂商元数据驱动**，而不是恒显或恒隐：
+   *  - `endpointMode='required'`（MinIO）→ 用户必须填写完整访问地址；
+   *  - `endpointMode='template'`（Cloudflare R2）→ 用户填的是**账户 ID**，
+   *    由服务端 `providers.composeEndpoint()` 拼成完整端点（前端只负责把原值送上去，
+   *    绝不在这里拼 URL —— 拼装是唯一实现点，前端再拼一份就会与该实现分叉）；
+   *  - 其余厂商端点由地域推导，**不渲染该栏**（隐藏时一并清空，避免残留值被提交）。
+   * 标签文案里的「账户 ID / 服务端点」差异同样取自元数据（同源于服务端 registry）。
+   */
   function syncProviderLabels() {
     const meta = providerMeta(pickedProvider);
     wrap.querySelector('#cred-sid-label').innerHTML = `${escapeHtml(meta.idLabel)}<span class="req">*</span>`;
@@ -165,6 +180,25 @@ function renderAddForm(box) {
     wrap.querySelector('#cred-sid').placeholder = meta.idPlaceholder;
     wrap.querySelector('#cred-skey').placeholder = `请输入 ${meta.keyLabel}`;
     wrap.querySelector('#cred-provider-hint').textContent = meta.hint;
+
+    const epItem = wrap.querySelector('#cred-endpoint-item');
+    const epInput = wrap.querySelector('#cred-endpoint');
+    const mode = meta.endpointMode || '';
+    epItem.hidden = !mode;
+    epInput.value = '';
+    if (mode) {
+      wrap.querySelector('#cred-endpoint-label').innerHTML =
+        `${escapeHtml(meta.endpointLabel || '服务端点')}<span class="req">*</span>`;
+      epInput.placeholder = meta.endpointPlaceholder || '';
+      wrap.querySelector('#cred-endpoint-hint').textContent = meta.endpointHint || '';
+    }
+  }
+
+  /** 读取当前应当提交的服务端点：该栏未渲染时提交 undefined（服务端按「未传即保持」处理） */
+  function readEndpoint() {
+    const meta = providerMeta(pickedProvider);
+    if (!meta.endpointMode) return undefined;
+    return wrap.querySelector('#cred-endpoint').value.trim();
   }
 
   wrap.querySelectorAll('input[name="cred-provider"]').forEach((radio) => {
@@ -176,9 +210,11 @@ function renderAddForm(box) {
     const sid = wrap.querySelector('#cred-sid').value.trim();
     const skey = wrap.querySelector('#cred-skey').value.trim();
     if (!sid || !skey) return msg('请先填写访问密钥', 'bad');
+    const endpoint = readEndpoint();
+    if (endpoint === '') return msg('请填写服务端点', 'bad');
     msg('正在验证…', 'info');
     try {
-      const r = await API.verifyConfig({ provider: pickedProvider, secretId: sid, secretKey: skey });
+      const r = await API.verifyConfig({ provider: pickedProvider, secretId: sid, secretKey: skey, endpoint });
       msg(r.ok ? '✓ ' + r.message : '✗ ' + r.error, r.ok ? 'ok' : 'bad');
     } catch (e) { msg(e.message, 'bad'); }
   };
@@ -188,8 +224,10 @@ function renderAddForm(box) {
     const remark = wrap.querySelector('#cred-remark').value.trim();
     const visibleToUsers = wrap.querySelector('#cred-visible').checked;
     if (!sid || !skey) return msg('请填写访问密钥', 'bad');
+    const endpoint = readEndpoint();
+    if (endpoint === '') return msg('请填写服务端点', 'bad');
     try {
-      await API.addCredential({ provider: pickedProvider, secretId: sid, secretKey: skey, remark, visibleToUsers });
+      await API.addCredential({ provider: pickedProvider, secretId: sid, secretKey: skey, remark, visibleToUsers, endpoint });
       msg('✓ 密钥已加密保存并启用', 'ok');
       refresh();
     } catch (e) { msg(e.message, 'bad'); }

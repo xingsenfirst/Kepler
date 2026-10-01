@@ -5,7 +5,18 @@
  *          's3'   → 使用 AWS Signature V4 + S3 兼容 REST 协议
  *  - endpoint: S3 兼容厂商的默认服务端点（可被密钥记录中的自定义 endpoint 覆盖）
  *  - regionRequired: 是否必须填写地域
- *  - regionPlaceholder / regionHint: 管理界面提示文案
+ *  - defaultRegion: 厂商要求「填了等价于没填」的固定地域值（如 R2 / GCS 的 auto）。
+ *      仅作**界面提示**，不参与任何判定 —— 真正的地域解析在 {@link regionFor}。
+ *  - forcePathStyle: 是否强制路径风格（`https://host/bucket/key`）。
+ *      自建对象存储（MinIO 等）多以 IP / 无 DNS 泛解析的域名暴露，
+ *      默认的虚拟主机风格会拼出 `bucket.<host>` 而无法解析 —— 必须走路径风格。
+ *  - endpointMode: 服务端点这一栏在密钥表单里的**输入形态**，同时也是
+ *      {@link composeEndpoint} 的分支依据：
+ *        'derived' —— 由地域自动推导，无需用户填写（无此字段时不渲染该栏）；
+ *        'required' —— 用户必须直接填写完整端点（自建部署，如 MinIO）；
+ *        'template' —— 用户填写的是**端点前缀**，与本厂商的 endpointTemplate
+ *                      一起拼成完整端点（如 Cloudflare R2 的账户 ID）。
+ *  - endpointLabel / endpointPlaceholder / endpointHint: 端点输入栏的文案
  *  - credentialLabel: 密钥字段在各厂商控制台中的习惯叫法
  *
  * 未在此登记或 kind 为 'planned' 的厂商，仅用于界面展示与文案统一，
@@ -84,6 +95,88 @@ const PROVIDERS = [
     credentialLabel: { id: 'Access Key ID', key: 'Secret Access Key', idPlaceholder: 'AKIAxxxxxxxxxxxxxxxx' },
   },
   {
+    id: 'gcs',
+    name: 'Google Cloud',
+    shortName: 'GCS',
+    kind: 's3',
+    // 地域固定为 auto（Google 的 S3 互操作层要求一个地域值，但它不参与寻址），
+    // 因此端点不需要地域模板。
+    endpoint: 'https://storage.googleapis.com',
+    defaultRegion: 'auto',
+    regionRequired: false,
+    regionPlaceholder: '例如 auto（可留空）',
+    regionHint: 'Google Cloud Storage 的 S3 互操作接口固定使用 auto，通常无需修改',
+    credentialLabel: {
+      id: 'Access Key ID（HMAC）',
+      key: 'Secret（HMAC）',
+      idPlaceholder: 'GOOGxxxxxxxxxxxxxxxx',
+    },
+    // 使用 S3 互操作层需要先创建 **HMAC 密钥**（Cloud Storage → 设置 → 互操作性），
+    // 与常规的「服务账号 JSON」不是一回事；且 Cloud Storage 的桶名**全球唯一**。
+  },
+  {
+    id: 'r2',
+    name: 'Cloudflare',
+    shortName: 'R2',
+    kind: 's3',
+    // R2 的端点形如 https://<账户 ID>.r2.cloudflarestorage.com —— 唯一带**变量前缀**
+    // 的一家。这里把已确定的域名部分写进 endpointTemplate，占位符保留在主机名最前，
+    // 由 composeEndpoint() 把用户填写的账户 ID 拼进去（见该函数说明）。
+    endpointTemplate: '{region}.r2.cloudflarestorage.com',
+    defaultRegion: 'auto',
+    regionRequired: false,
+    regionPlaceholder: '例如 auto（可留空）',
+    regionHint: 'Cloudflare R2 不区分地域，固定使用 auto，通常无需修改',
+    endpointMode: 'template',
+    endpointLabel: '账户 ID（Account ID）',
+    endpointPlaceholder: '例如 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d',
+    endpointHint: '在 Cloudflare 控制台右侧栏可看到账户 ID；系统会据此拼出 https://<账户 ID>.r2.cloudflarestorage.com',
+    credentialLabel: {
+      id: 'Access Key ID',
+      key: 'Secret Access Key',
+      idPlaceholder: '请输入 R2 的 Access Key ID',
+    },
+  },
+  {
+    id: 'minio',
+    name: 'MinIO',
+    shortName: 'MinIO',
+    kind: 's3',
+    // 自建部署没有可推导的默认端点，必须由用户填写。
+    endpoint: '',
+    regionRequired: false,
+    defaultRegion: 'us-east-1',
+    regionPlaceholder: '例如 us-east-1（默认）',
+    regionHint: 'MinIO 默认地域为 us-east-1；若服务端未另行配置，保持默认即可',
+    forcePathStyle: true,
+    endpointMode: 'required',
+    endpointLabel: '服务端点',
+    endpointPlaceholder: '例如 https://minio.example.com:9000',
+    endpointHint: 'MinIO 为自建部署，请填写其访问地址（含端口）；'
+      + '内网 / 回环地址与明文 http 默认被安全策略拦截，确需使用请在服务端设置 ALLOW_PRIVATE_ENDPOINT=1 / ALLOW_LOOPBACK_ENDPOINT=1',
+    credentialLabel: {
+      id: 'Access Key',
+      key: 'Secret Key',
+      idPlaceholder: '请输入 Access Key（默认 minioadmin）',
+    },
+  },
+  {
+    id: 'b2',
+    name: 'Backblaze',
+    shortName: 'B2',
+    kind: 's3',
+    endpoint: 'https://s3.us-west-004.backblazeb2.com',
+    endpointTemplate: 'https://s3.{region}.backblazeb2.com',
+    regionRequired: true,
+    regionPlaceholder: '例如 us-west-004',
+    regionHint: 'Backblaze B2 的 S3 端点地域段，如 us-west-004（在桶详情页的 Endpoint 中可见）',
+    credentialLabel: {
+      id: 'keyID',
+      key: 'applicationKey',
+      idPlaceholder: '请输入 application key ID',
+    },
+  },
+  {
     id: 'azure',
     name: 'Microsoft Azure',
     shortName: 'Blob',
@@ -137,13 +230,110 @@ function isS3(id) {
   return resolve(id).kind === 's3';
 }
 
-/** 按地域推导服务端点：厂商提供模板时按模板填充，否则用默认端点 */
+/**
+ * 该厂商是否强制**路径风格**寻址（`https://host/bucket/key`）。
+ *
+ * 默认的虚拟主机风格会拼出 `bucket.<host>`；自建对象存储（MinIO 等）常以 IP
+ * 或未配置 DNS 泛解析的域名暴露，`bucket.<host>` 根本无法解析 —— 表现为
+ * 「配置看起来全对，但每个请求都失败」。因此这条必须由厂商元数据驱动，
+ * 而不是让用户去猜一个寻址开关。
+ */
+function forcePathStyle(id) {
+  return resolve(id).forcePathStyle === true;
+}
+
+/**
+ * 该厂商是否要求用户提供「服务端点」这一栏。
+ *
+ * 两种形态都算「要用户填」：`'required'`（MinIO，填完整访问地址）与
+ * `'template'`（R2，填账户 ID）。之所以合并成一个判据，是因为对**调用方**而言
+ * 两者是同一件事 —— 「这条密钥没有用户提供的端点就不完整」，而具体填什么由
+ * `endpointLabel` / `endpointPlaceholder` 描述。若只认 `'required'`，
+ * R2 的记录会被判为「端点可选」，从而允许一条**永远连不上**的密钥落库。
+ */
+function endpointRequired(id) {
+  const m = resolve(id).endpointMode;
+  return m === 'required' || m === 'template';
+}
+
+/**
+ * 解析一次连接应当使用的**地域**。
+ *
+ * 优先级：用户填写 → 厂商默认值（`defaultRegion`）→ 空串。
+ * 「厂商默认值」解决的是 R2 / GCS 这类**要求填地域但填什么都一样**的厂商：
+ * 界面允许留空，这里补上 auto / us-east-1，避免把空串当作地域送给签名。
+ *
+ * ⚠️ 返回值**必须**经过 {@link safeRegion} —— 它会**抛错**（因此本函数也会抛）。
+ * 原因：地域会被直接拼进端点模板，入参来自用户/历史配置，属于**不可信输入**。
+ * 在唯一的读取点校验，胜过在每个调用点各判一次。
+ */
+function regionFor(id, region) {
+  const p = resolve(id);
+  const raw = String(region || '').trim() || String(p.defaultRegion || '').trim();
+  return raw ? safeRegion(raw) : '';
+}
+
+/**
+ * 按地域推导服务端点：厂商提供模板时按模板填充，否则用默认端点
+ *
+ * ⚠️ 只适用于「占位符在主机名**中段**」的厂商（阿里云 / 华为云 / 七牛 / AWS / B2）：
+ * `s3.{region}.amazonaws.com` 这类模板里，地域恰好在它该在的位置上。
+ * R2 的占位符在主机名**最前**（`{region}.r2.cloudflarestorage.com`），且那里要填的是
+ * **账户 ID 而不是地域** —— 绝不能让它落到这条推导路径上：`regionFor('r2', '')` 会给
+ * 出 `auto`，于是端点被拼成 `auto.r2.cloudflarestorage.com`。这是个**语法合法**的域名，
+ * 不会报错，只会让每一次请求都解析失败（用户看到的是一句「网络连接异常」）。
+ * 因此这里对 `endpointMode: 'template'` 的厂商直接返回空串 —— 交由调用方报
+ * 「缺少服务端点」，把问题停在配置阶段。R2 的组装见 {@link composeEndpoint}。
+ */
 function endpointFor(id, region) {
   const p = resolve(id);
+  if (p.endpointMode === 'template') return '';
   if (p.endpointTemplate && region) {
     return p.endpointTemplate.replace('{region}', safeRegion(region));
   }
   return p.endpoint || '';
+}
+
+/**
+ * 把用户在「服务端点」栏里填写的内容，按厂商的 `endpointMode` 组装成完整端点。
+ *
+ * 这是**唯一实现点**：写入端（`config-store.addCredential/updateCredential`）
+ * 与预览端（`routes/config.js` 的连接验证）都必须经过它，否则会出现
+ * 「保存时看着正常、真正连接时端点缺失 / 拼错」这类只在某一条路径上暴露的分叉。
+ *
+ * 三种形态：
+ *  - `'template'`（Cloudflare R2）：用户填的是账户 ID。这里用**非贪婪**的
+ *    `{region}` 替换，把模板 `{region}.r2.cloudflarestorage.com` 拼成
+ *    `https://<账户 ID>.r2.cloudflarestorage.com`。
+ *      为什么不能复用 `endpointFor()`：那是**贪婪**替换（`s3.{region}.amazonaws.com`
+ *      必须如此，否则会把地域后的这一段也吃掉），而 R2 的模板必须以 `.` 收尾才能
+ *      正确地在最前的占位符处停下 —— 两种替换规则相反，不能共用。
+ *      本分支**必须幂等**：表单回填的是库里**已组装好的完整端点**，用户不动它直接
+ *      保存时若再拼一次，就会得到
+ *      `https://<id>.r2.cloudflarestorage.com.r2.cloudflarestorage.com` ——
+ *      而这是一个**语法完全合法**的域名，不会报错，只会在连接时静默失败。
+ *  - `'required'`（MinIO）：用户填的就是完整端点，原样透传（仍是**未校验**的，
+ *    由调用方紧接着送 `assertSafeEndpoint()`）。
+ *  - 其余厂商（含未声明 `endpointMode` 的历史厂商）：透传。**关键**：用户在
+ *    自定义端点栏里填了什么就是什么，绝不做拼接 —— 这条路径必须与历史行为逐字
+ *    一致，否则存量配置会被改写。
+ *
+ * @param {string} id    厂商 id
+ * @param {string} input 用户输入（空串表示未填写）
+ * @returns {string} 可直接交由 `assertSafeEndpoint()` 校验的端点；未填写时为空串
+ */
+function composeEndpoint(id, input) {
+  const raw = String(input === undefined || input === null ? '' : input).trim();
+  if (!raw) return '';
+  const p = resolve(id);
+  if (p.endpointMode === 'template' && p.endpointTemplate) {
+    // 幂等保护（见上）：带协议的、或已含本模板固定域名后缀的，一律视为已组装完毕
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const suffix = p.endpointTemplate.replace('{region}', '');
+    if (suffix && raw.toLowerCase().endsWith(suffix.toLowerCase())) return 'https://' + raw;
+    return 'https://' + p.endpointTemplate.replace('{region}', raw);
+  }
+  return raw;
 }
 
 /**
@@ -171,4 +361,5 @@ function safeRegion(region) {
 module.exports = {
   PROVIDERS, DEFAULT_PROVIDER_ID,
   list, get, resolve, isSupported, nameOf, isCos, isS3, endpointFor,
+  forcePathStyle, endpointRequired, regionFor, composeEndpoint,
 };

@@ -36,7 +36,7 @@ function createClient(cfg) {
     throw err;
   }
   const endpoint = String(cfg.endpoint || '').trim() ||
-    providers.endpointFor(pid, cfg.region);
+    providers.endpointFor(pid, providers.regionFor(pid, cfg.region));
   // SEC-03：自定义端点必须先过安全校验（禁云元数据/回环/私网，非回环强制 https），
   // 否则可被用来让服务端替请求方访问内网或云实例元数据端点（盲 SSRF）。
   if (cfg.endpoint) assertSafeEndpoint(cfg.endpoint);
@@ -53,7 +53,13 @@ function createClient(cfg) {
     });
   }
   if (!endpoint) {
-    const err = new Error(`${meta.name} 缺少服务端点（Endpoint），请在密钥中补充`);
+    // 缺端点时的文案要按**该厂商实际要求填什么**来说（R2 要账户 ID、MinIO 要访问地址…），
+    // 否则用户拿到一句「请在密钥中补充 Endpoint」却找不到那个输入栏 —— 表单里
+    // 那一栏的标签就是厂商元数据里的 endpointLabel。
+    const need = meta.endpointLabel
+      ? `请在密钥中填写「${meta.endpointLabel}」`
+      : '请在密钥中补充服务端点';
+    const err = new Error(`${meta.name} 缺少服务端点：${need}`);
     err.status = 400;
     throw err;
   }
@@ -61,8 +67,14 @@ function createClient(cfg) {
     accessKeyId: cfg.secretId,
     secretAccessKey: cfg.secretKey,
     endpoint,
-    region: cfg.region,
+    // 地域经 regionFor 解析：R2 / GCS 允许留空，由厂商默认值（auto）补齐；
+    // 自建 MinIO 未填时落到 us-east-1。SigV4 的签名串必须带地域，空串会让
+    // 客户端各自兜底成不同值（客户端 us-east-1、服务端却按端点推导），签名对不上。
+    region: providers.regionFor(pid, cfg.region),
     bucket: cfg.bucket,
+    // 自建对象存储（MinIO）默认虚拟主机风格会拼出 `bucket.<host>` 而无法解析，
+    // 必须按厂商元数据切到路径风格（见 s3-client._virtualHosted）。
+    forcePathStyle: providers.forcePathStyle(pid),
   });
 }
 

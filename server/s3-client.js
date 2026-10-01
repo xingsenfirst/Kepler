@@ -90,11 +90,12 @@ function encodeKeyPath(key) {
  *  - oss-cn-hangzhou.aliyuncs.com -> cn-hangzhou
  *  - obs.cn-north-4.myhuaweicloud.com -> cn-north-4
  *  - s3.cn-north-1.qiniucs.com -> cn-north-1
+ *  - s3.us-west-004.backblazeb2.com -> us-west-004
  */
 function deriveRegionFromHost(endpoint) {
   try {
     const host = new URL(endpoint).host.toLowerCase();
-    const DOM = '(?:aliyuncs|myhuaweicloud|qiniucs|amazonaws)\\.com';
+    const DOM = '(?:aliyuncs|myhuaweicloud|qiniucs|amazonaws|backblazeb2)\\.com';
     const SVC = '(?:s3|oss|obs|cos|kodo)';
     // 地域段固定要求「两字母 + 至少一个 -xxx」，避免把服务名（s3 / oss / obs）误当地域
     const REGION = '([a-z]{2}(?:-[a-z0-9]+)+)';
@@ -232,7 +233,7 @@ function unescapeXml(s) {
 
 class S3Client {
   /**
-   * @param {object} opts { accessKeyId, secretAccessKey, endpoint, bucket, region }
+   * @param {object} opts { accessKeyId, secretAccessKey, endpoint, bucket, region, forcePathStyle }
    */
   constructor(opts) {
     const o = opts || {};
@@ -247,6 +248,20 @@ class S3Client {
     this.host = u.host;
     this.protocol = u.protocol;
     this.basePath = u.pathname.replace(/\/+$/, '');
+    /**
+     * 是否强制**路径风格**寻址（`https://host/bucket/key`）。
+     *
+     * 默认的虚拟主机风格会拼出 `bucket.<host>`，这要求 `*.host` 能解析 —— 而自建
+     * 对象存储（MinIO 等）大多直接用 IP 或未配置泛解析的域名暴露，`bucket.<host>`
+     * 根本不存在。此时**必须**走路径风格，否则每个请求都失败（表现为「配置全对但
+     * 什么都干不了」）。由 `providers.forcePathStyle()` 按厂商下发，用户无需知道
+     * 这个开关的存在。
+     *
+     * 注意：端点自带路径（`basePath !== ''`，如 `https://host/s3`）**已经**是路径
+     * 风格 —— 那种情况下 host 里本就没有桶名子域，`<host>/<bucket>/<key>` 是唯一
+     * 可行形式。两者取或，语义一致。
+     */
+    this.forcePathStyle = o.forcePathStyle === true;
     this.timeout = Number(o.timeout) || DEFAULT_TIMEOUT_MS;
   }
 
@@ -254,6 +269,17 @@ class S3Client {
   _ctx(params) {
     const bucket = (params && params.Bucket) || this.bucket;
     return { bucket: String(bucket || '') };
+  }
+
+  /**
+   * 本次请求走虚拟主机风格还是路径风格 —— **唯一判据**。
+   *
+   * 四处拼 URL 的地方（`_request`、`getObjectUrl`）必须共用它。此前是同一条
+   * 判据（`basePath === ''`）在四处各写一遍，任何一次「只改一处」都会造成
+   * 「列举能跑、下载 404」这类只在部分操作上暴露的分叉。
+   */
+  _virtualHosted() {
+    return !this.forcePathStyle && this.basePath === '';
   }
 
   /** 生成 SigV4 签名后的请求头（host 必须使用实际请求的 hostHeader，含桶前缀） */
@@ -314,11 +340,11 @@ class S3Client {
     const query = spec.query || {};
     const headers = Object.assign({}, spec.headers || {});
 
-    const hostHeader = bucket && this.basePath === ''
+    const hostHeader = bucket && this._virtualHosted()
       ? `${bucket}.${this.host}`          // 虚拟主机风格（S3 默认）
       : this.host;
     let path;
-    if (bucket && this.basePath === '') {
+    if (bucket && this._virtualHosted()) {
       path = '/' + encodeKeyPath(key);
     } else {
       // 路径风格：/bucket/key（部分厂商与自定义 endpoint 需要）
@@ -929,8 +955,8 @@ class S3Client {
       const bucket = params.Bucket || this.bucket;
       const key = params.Key || '';
       const expires = Math.max(1, Math.min(604800, Number(params.Sign && params.Expires ? params.Expires : 3600) || 3600));
-      const hostHeader = bucket ? `${bucket}.${this.host}` : this.host;
-      const path = (bucket && this.basePath === '' ? '/' : this.basePath + '/' + bucket + '/') + encodeKeyPath(key);
+      const hostHeader = bucket && this._virtualHosted() ? `${bucket}.${this.host}` : this.host;
+      const path = (bucket && this._virtualHosted() ? '/' : this.basePath + '/' + bucket + '/') + encodeKeyPath(key);
 
       const now = new Date();
       const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');

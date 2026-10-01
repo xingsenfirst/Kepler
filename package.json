@@ -1,6 +1,6 @@
 {
   "name": "object-manager",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "基于对象存储的云存储管理系统",
   "main": "server/index.js",
   "scripts": {

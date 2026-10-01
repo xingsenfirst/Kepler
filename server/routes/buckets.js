@@ -83,9 +83,7 @@ async function probeBucket(bucket, region, credOverride) {
 router.post('/buckets/local', requireAdmin, async (req, res) => {
   const b = req.body || {};
   const bucket = String(b.bucket || '').trim();
-  const region = String(b.region || '').trim();
-  if (!bucket) return res.status(400).json({ error: '请填写存储桶名称（需含 APPID 后缀）' });
-  if (!region) return res.status(400).json({ error: '请填写存储桶地域（Region）' });
+  let region = String(b.region || '').trim();
   const q = b.quotaBytes !== undefined ? Number(b.quotaBytes) : 0;
   if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
   try {
@@ -106,6 +104,30 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
           endpoint: cred.endpoint || '',
         };
       }
+    }
+    /**
+     * 地域是否必填**取决于厂商**（又拍云 / GCS / R2 / MinIO 都不需要）—— 与
+     * `fs-gateway` / `webdav-server` / `bucket-stats` 三处运行期判定同源。
+     *
+     * 旧实现在**推导出厂商之前**就无条件 `if (!region) return 400`，于是
+     * 「地域可留空」的厂商在这里被硬性挡住 —— 界面上明明写着「可留空」，提交却报
+     * 「请填写存储桶地域」，用户只能胡乱填一个值（而那会真的进入签名串）。
+     *
+     * 厂商来源按调用方给出的线索取：绑定密钥 → 入参 provider → 当前生效配置。
+     * 三者都没有时按默认厂商（腾讯云）从严要求地域。
+     */
+    if (!bucket) return res.status(400).json({ error: '请填写存储桶名称（需含 APPID 后缀）' });
+    const effectiveProvider = provider
+      || (b.provider && providers.get(String(b.provider).trim()) ? String(b.provider).trim() : '')
+      || (configStore.effective() || {}).provider
+      || providers.DEFAULT_PROVIDER_ID;
+    const provMeta = providers.get(effectiveProvider) || providers.resolve(effectiveProvider);
+    // 允许留空的厂商补上默认地域：空串进签名串会让客户端与服务端各自兜底成不同值
+    if (!region && provMeta.regionRequired === false) {
+      region = providers.regionFor(effectiveProvider, '');
+    }
+    if (!region && provMeta.regionRequired !== false) {
+      return res.status(400).json({ error: '请填写存储桶地域（Region）' });
     }
     const exists = (configStore.listBuckets().buckets || []).some((x) => x.bucket === bucket);
     // FUN-08：仅对**新建**记录做云端探测。已存在的桶走这里多半只是改备注/配额，

@@ -43,7 +43,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/K
 
 | 模块 | 能力 |
 | --- | --- |
-| **多云接入** | 统一管理多家对象存储服务商：腾讯云走原生 SDK，阿里云 / 华为云 / 七牛云 / 又拍云 / AWS S3 使用内置 **AWS Signature V4 + S3 兼容协议**适配器（手写签名，零新增依赖）；每条密钥与存储桶均记录所属服务商与 Endpoint，可并存切换 |
+| **多云接入** | 统一管理多家对象存储服务商：腾讯云走原生 SDK，其余厂商（阿里云 / 华为云 / 七牛云 / 又拍云 / AWS S3 / Google Cloud Storage / Cloudflare R2 / MinIO / Backblaze B2）一律使用内置 **AWS Signature V4 + S3 兼容协议**适配器（手写签名，零新增依赖）。各厂商要求的参数不同，界面按所选服务商自动切换字段名与提示：多数厂商只需密钥 + 地域（地域可为空时服务端补默认值），**Cloudflare R2 需要账户 ID、MinIO 需要自建访问地址**（见下一节的「服务端点」说明）；每条密钥与存储桶均记录所属服务商与 Endpoint，可并存切换 |
 | **密钥与存储桶** | 多访问密钥管理（本地加密保存、掩码回显、启用/停用、可见性、备注）、多存储桶管理（添加 / 从云端拉取 / 备注名外显 / 容量配额 / 可见性）、主备自定义域名、一键测试连接 |
 | **文件管理** | 类资源管理器布局（地址栏 / 目录树 / 文件区 / 状态栏）、列表 / 大图标 / 小图标 / 缩略图四种视图、新建文件夹、上传（文件 / 文件夹 / 拖拽）、下载、重命名、移动、递归删除、多选与批量处理、属性面板、名称 / 类型 / 日期 / 大小组合搜索（可限定当前目录、支持续扫与请求取消） |
 | **分片上传** | 大文件自动分片、3 分片并发、暂停 / 继续 / 取消 / 重试、断点续传（会话持久化，进程重启不丢失）、自动 `Abort Multipart Upload` 清理碎片 |
@@ -74,9 +74,15 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/K
 | 七牛云 | Kodo | S3 兼容（SigV4） | `cn-east-1` | ✅ 已支持 |
 | 又拍云 | USS | S3 兼容（SigV4，地域可留空） | `us-east-1` | ✅ 已支持 |
 | Amazon Web Services | S3 | S3 兼容（SigV4） | `us-east-1` | ✅ 已支持 |
+| Google Cloud | Cloud Storage | S3 互操作层（SigV4，地域可留空） | `auto` | ✅ 已支持 |
+| Cloudflare | R2 | S3 兼容（SigV4，需账户 ID，地域可留空） | `auto` | ✅ 已支持 |
+| MinIO | MinIO | S3 兼容（SigV4，自建地址，地域可留空） | `us-east-1` | ✅ 已支持 |
+| Backblaze | B2 | S3 兼容（SigV4） | `us-west-004` | ✅ 已支持 |
 | Microsoft Azure | Blob Storage | 独立鉴权协议（计划中） | — | 🚧 即将支持，当前版本不可接入 |
 
-> 各厂商的 Endpoint 按地域自动推导（如 `https://oss-cn-beijing.aliyuncs.com`），也支持在密钥中填写自定义 Endpoint。历史版本（无服务商字段）的配置在加载时自动归为腾讯云，无需手动迁移。
+> 各厂商的 Endpoint 按地域自动推导（如 `https://oss-cn-beijing.aliyuncs.com`）；少数厂商的端点不由地域决定，需要在密钥里多填一项「服务端点」——Cloudflare R2 填的是**账户 ID**（系统据此拼出 `https://<账户 ID>.r2.cloudflarestorage.com`），MinIO 填的是**自建访问地址**（含端口）。历史版本（无服务商字段）的配置在加载时自动归为腾讯云，无需手动迁移。
+>
+> ⚠️ **自建 / 内网端点的安全策略**：MinIO 这类自建部署常用内网地址或回环地址，而本系统默认**拒绝**把服务端点指向回环、内网 / 链路本地 / 保留 IP 字面量（防盲 SSRF），也要求非回环端点必须走 `https://`。确需在内网使用，请在服务端显式设置 `ALLOW_PRIVATE_ENDPOINT=1`（内网 IP 字面量）与 / 或 `ALLOW_LOOPBACK_ENDPOINT=1`（本机回环）后重启；这两项只应在本机受控环境下开启。
 
 ---
 
@@ -129,7 +135,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（36 个文件 / 500+ 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（37 个文件 / 500+ 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
@@ -207,9 +213,9 @@ docker run -d -p 3000:3000 -p 3443:3443 -v cos-data:/app/data cos-manager
 ---
 
 1. 首次打开进入初始化页，创建**管理员账号**并登录。
-2. 自动弹出「系统设置」，在**访问密钥管理**卡片中通过**图标卡片**选择服务商（非下拉菜单），再按该服务商的字段名填入访问密钥（腾讯云为 SecretId / SecretKey，阿里云为 AccessKey ID / AccessKey Secret 等，界面随选择自动切换提示）。
+2. 自动弹出「系统设置」，在**访问密钥管理**卡片中通过**图标卡片**选择服务商（非下拉菜单），再按该服务商的字段名填入访问密钥（腾讯云为 SecretId / SecretKey，阿里云为 AccessKey ID / AccessKey Secret，Google Cloud 需用互操作性 HMAC 密钥，Backblaze 为 keyID / applicationKey 等，界面随选择自动切换提示）。选择 **Cloudflare R2 / MinIO** 时，表单会额外出现「服务端点」一栏（R2 填账户 ID、MinIO 填自建访问地址），其余厂商不显示该栏。
 3. 可点「测试连接」用未保存的密钥先验证，再「保存密钥」。
-4. 在左侧「存储桶」区域点击 **+** 添加桶：填写桶名与地域，或点「从云端获取桶列表并选择」（**仅管理员**）；可添加多个桶，点击列表项切换；每个桶可设置备注名与容量配额（0 = 不限）。
+4. 在左侧「存储桶」区域点击 **+** 添加桶：填写桶名与地域，或点「从云端获取桶列表并选择」（**仅管理员**）；又拍云 / Google Cloud / R2 / MinIO 的地域可留空（服务端会补上服务商默认值，界面上该栏的星号会同步隐藏）。可添加多个桶，点击列表项切换；每个桶可设置备注名与容量配额（0 = 不限）。
 5. 删除桶**仅移除本地记录，不会删除云端桶或其中任何数据**。
 6. 受对象存储原生功能限制，本系统不设回收站，文件删除即永久丢失。
 

@@ -239,7 +239,12 @@ router.post('/config/verify', requireAdmin, async (req, res) => {
 
     // 请求体携带的自定义端点必须先做安全校验（拒绝元数据/回环/私网，非回环强制 https）
     if (b.endpoint !== undefined && String(b.endpoint).trim()) {
-      try { assertSafeEndpoint(b.endpoint); } catch (e) {
+      // 端点先按厂商规则组装再校验 —— R2 的「账户 ID」本身不是 URL，直接送校验会被
+      // 误判为格式非法；组装用的厂商取入参优先、否则沿用当前生效配置（与下游
+      // 建客户端时的取法一致，避免「校验按 A 厂商、连接按 B 厂商」的口径分叉）。
+      const epProvider = (b.provider && String(b.provider).trim())
+        || stored.provider || providers.DEFAULT_PROVIDER_ID;
+      try { assertSafeEndpoint(providers.composeEndpoint(epProvider, b.endpoint)); } catch (e) {
         return res.status(e.status || 400).json({ ok: false, error: e.message });
       }
     }
@@ -291,7 +296,12 @@ router.post('/config/verify', requireAdmin, async (req, res) => {
     const bucket = (b.bucket && String(b.bucket).trim()) || stored.bucket || '';
     const region = (b.region && String(b.region).trim()) || stored.region || '';
     const provider = (b.provider && String(b.provider).trim()) || stored.provider || providers.DEFAULT_PROVIDER_ID;
-    const endpoint = (b.endpoint && String(b.endpoint).trim()) || stored.endpoint || '';
+    // 与写入路径同源：先按厂商规则组装（R2 的账户 ID → 完整端点），
+    // 否则「测试连接」会用账户 ID 当端点去发请求，必然失败。
+    const endpoint = providers.composeEndpoint(
+      provider,
+      (b.endpoint && String(b.endpoint).trim()) || stored.endpoint || ''
+    );
     if (!secretId || !secretKey) return res.status(400).json({ ok: false, error: '请先填写访问密钥（AccessKey ID / Secret Access Key）' });
 
     let client;

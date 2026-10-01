@@ -2602,6 +2602,169 @@ const CASES = [
       testFile: 'audit25-regressions.test.js',
       minFail: 1,
     },
+    /* ==================== R26 · 新增四家 S3 兼容服务商 ====================
+     *
+     * 本轮的判据全部落在**厂商差异点**上：R2 的账户 ID 前缀、MinIO 的路径风格、
+     * 「地域可留空」的建桶闸门、以及「重新保存不得改写厂商/端点」。
+     * 每条对照对应 `tests/audit26-regressions.test.js` 里**各自**的断言落点。
+     *
+     * ⚠️ 有些差异点由**三处**协同实现（元数据 → 客户端工厂 → 寻址判据），
+     * 每一处都单独登记一条 —— 只钉住其中一处时，另外两处被摘掉照旧全绿。
+     */
+    {
+      name: 'R26-01 · 前端展示顺序漏掉新增厂商（与服务端注册表漂移）',
+      file: 'public/js/provider-logos.js',
+      anchor: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'gcs', 'r2', 'minio', 'b2', 'azure'];",
+      replacement: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'minio', 'b2', 'azure'];",
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-01b · 商标图形被换成别的版本（viewBox 与源文件不一致）',
+      file: 'public/js/provider-logos.js',
+      anchor: "    viewBox: '0 0 2048 1024',",
+      replacement: "    viewBox: '0 0 1024 1024',",
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-02 · R2 端点组装不再幂等（重复保存把域名拼成两层）',
+      file: 'server/providers.js',
+      anchor: '    if (/^https?:\\/\\//i.test(raw)) return raw;\n'
+        + "    const suffix = p.endpointTemplate.replace('{region}', '');\n"
+        + "    if (suffix && raw.toLowerCase().endsWith(suffix.toLowerCase())) return 'https://' + raw;",
+      replacement: '    if (/^https?:\\/\\//i.test(raw)) return raw;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-03 · R2 回到「地域填主机名中段」的推导路径（拼出 auto.r2... 假域名）',
+      file: 'server/providers.js',
+      anchor: "  if (p.endpointMode === 'template') return '';\n  if (p.endpointTemplate && region) {",
+      replacement: '  if (p.endpointTemplate && region) {',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-04a · 地域字符集不再受限（可拼进端点改写主机 / 路径）',
+      file: 'server/providers.js',
+      anchor: 'const REGION_SAFE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;',
+      replacement: 'const REGION_SAFE_RE = /^[\\s\\S]*$/;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-04b · 允许留空的厂商不再补默认地域（空串进入签名串）',
+      file: 'server/providers.js',
+      anchor: "  const raw = String(region || '').trim() || String(p.defaultRegion || '').trim();",
+      replacement: "  const raw = String(region || '').trim();",
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-05a · MinIO 不再强制路径风格（拼出解析不了的 bucket.<host>）',
+      file: 'server/providers.js',
+      anchor: '  return resolve(id).forcePathStyle === true;',
+      replacement: '  return false;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-05b · 客户端工厂漏传 forcePathStyle（元数据对了但没接上线）',
+      file: 'server/cos.js',
+      anchor: '    forcePathStyle: providers.forcePathStyle(pid),',
+      replacement: '    forcePathStyle: false,',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-05c · 寻址判据丢掉 forcePathStyle（唯一的 _virtualHosted 实现）',
+      file: 'server/s3-client.js',
+      anchor: "    return !this.forcePathStyle && this.basePath === '';",
+      replacement: "    return this.basePath === '';",
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-06a · 「只改备注」的保存把端点一并清空（旧实现的无条件写入）',
+      file: 'server/config-store.js',
+      anchor: '      exist.endpoint = ep;',
+      replacement: '      void 0;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-06b · 重新保存无条件改写厂商（R2 密钥被回落成腾讯云）',
+      file: 'server/config-store.js',
+      anchor: '    if (explicitProvider) exist.provider = pid;',
+      replacement: '    exist.provider = pid;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-06c · 端点组装改用入参厂商（重新保存 R2 时按腾讯云组装 → 账户 ID 送校验被拒）',
+      file: 'server/config-store.js',
+      anchor: '  const epProvider = explicitProvider || (exist && exist.provider) || pid;',
+      replacement: '  const epProvider = pid;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-06d · 不再要求「必填端点」的厂商真的填端点（落库一条永远连不上的密钥）',
+      file: 'server/config-store.js',
+      anchor: '  if (endpoint || !providers.endpointRequired(pid)) return;',
+      replacement: '  return;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-06e · 更新密钥时先落值后校验（被拒绝的更新把内存里的端点改坏）',
+      file: 'server/config-store.js',
+      anchor: '    assertEndpointProvided(c.provider, nextEndpoint);',
+      replacement: '    // 变异：校验挪到落值之后',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-07a · 建桶时不再为「地域可留空」的厂商补默认地域（空串落库）',
+      file: 'server/routes/buckets.js',
+      anchor: "      region = providers.regionFor(effectiveProvider, '');",
+      replacement: '      void 0;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-07b · 建桶的地域闸门整体失效（必填厂商也放行空地域）',
+      file: 'server/routes/buckets.js',
+      anchor: "      return res.status(400).json({ error: '请填写存储桶地域（Region）' });",
+      replacement: '      void 0;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-08a · 表单的服务端点栏不再按厂商显隐',
+      file: 'public/js/credmgr.js',
+      anchor: '    epItem.hidden = !mode;',
+      replacement: '    epItem.hidden = false;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-08b · 保存密钥时不再提交服务端点（前端收了值却发不出去）',
+      file: 'public/js/credmgr.js',
+      anchor: '      await API.addCredential({ provider: pickedProvider, secretId: sid, secretKey: skey, remark, visibleToUsers, endpoint });',
+      replacement: '      await API.addCredential({ provider: pickedProvider, secretId: sid, secretKey: skey, remark, visibleToUsers });',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R26-08c · 建桶表单的地域星号不再按厂商隐显（界面说必填、服务端允许留空）',
+      file: 'public/js/main.js',
+      anchor: '    if (regionReq) regionReq.hidden = prov.regionRequired === false;',
+      replacement: '    if (regionReq) regionReq.hidden = false;',
+      testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

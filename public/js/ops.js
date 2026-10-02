@@ -46,7 +46,18 @@ export const ops = {
   },
 
   async renameOne(key) {
-    const item = currentItems().find((i) => i.key === key);
+    /**
+     * R27-01：原实现调用 `currentItems()` —— 该标识符**全库从未定义**，而抛错点在
+     * 下面的 `try` 之外、`renameSelected()` 又没有 `await`/`catch`，于是重命名
+     * （工具栏 `#op-rename` / F2 / 右键菜单三个入口）整体变成一个 rejected promise：
+     * 对话框不弹、无提示、无任何反应。
+     *
+     * 列表项的唯一归属地是 `explorer` 模块的私有 `state.items`，这里用与
+     * `explorerRefresh()` 同源的**动态 import** 取用（静态 import 会与
+     * `explorer.js → main.js → ops.js` 形成循环）。
+     */
+    const { explorer } = await import('./explorer.js');
+    const item = explorer.itemOf(key);
     const oldName = key.endsWith('/') ? key.slice(0, -1).split('/').pop() : key.split('/').pop();
     const name = await promptDialog({ title: '重命名', label: '新名称', value: oldName });
     if (!name || name === oldName) return;
@@ -83,7 +94,7 @@ export const ops = {
       if (failed.length) toast(`删除完成，${failed.length} 项失败：${failed[0].error}`, { type: 'warn', duration: 6000 });
       else toast(`已删除（共 ${r.deleted} 个对象）`, { type: 'success' });
       App.state.selection.clear();
-      explorer.updateOpsButtons && explorer.updateOpsButtons();
+      updateOpsButtons();
       refreshTree();
       explorerRefresh();
       App.refreshStorage && App.refreshStorage(); // 立即刷新状态栏存储用量
@@ -110,7 +121,7 @@ export const ops = {
           if (failed.length) toast(`移动完成，${failed.length} 项失败：${failed[0].error}`, { type: 'warn', duration: 6000 });
           else toast('移动完成', { type: 'success' });
           App.state.selection.clear();
-          explorer.updateOpsButtons && explorer.updateOpsButtons();
+          updateOpsButtons();
           refreshTree();
           explorerRefresh();
         } catch (e) {
@@ -380,6 +391,20 @@ function configured() {
 function displayName(key) { return key.endsWith('/') ? key.slice(0, -1).split('/').pop() : key.split('/').pop(); }
 function explorerRefresh() {
   import('./explorer.js').then((m) => m.explorer.refresh());
+}
+/**
+ * R27-01：显式刷新工具栏按钮状态。
+ *
+ * 旧写法是 `explorer.updateOpsButtons && ...` —— `explorer` 并未导入，能跑只是
+ * 因为 `index.html` 里有 `<section id="explorer">`，而 HTML Window 的**命名访问**
+ * 让它解析成那个 DOM 元素（`element.updateOpsButtons === undefined` → 静默 no-op）。
+ * 这依赖浏览器的一个隐式行为，任何一次给该元素改名、或把模块搬进 Worker / 测试
+ * 环境，都会立刻变成 `ReferenceError`。且它并非无用：`explorer.render()` 在
+ * 「列表为空」与「面板隐藏」两条分支上会提前 return，不会调用 `updateOpsButtons()`，
+ * 此时只有这里能把按钮置灰。
+ */
+function updateOpsButtons() {
+  import('./explorer.js').then((m) => m.explorer.updateOpsButtons && m.explorer.updateOpsButtons());
 }
 function refreshTree() {
   import('./tree.js').then((m) => m.tree.init());

@@ -181,13 +181,21 @@ router.put('/buckets/local/:id', (req, res) => {
     b.quotaBytes = Math.floor(q);
   }
   try {
-    // SEC-01：非管理员只允许改「备注 / 配额」，其余字段**一律丢弃**。
-    // 旧实现用 delete 列表（visibleToUsers / credentialId / enabled），漏掉了
-    // provider 与 region，导致普通用户可把任意桶的厂商改成默认厂商、地域改错，
-    // 使该桶对全体用户（含管理员）立即不可用。改为白名单后不会随字段新增而失效。
+    /**
+     * SEC-01：非管理员只允许改「备注」，其余字段**一律丢弃**。
+     * 旧实现用 delete 列表（visibleToUsers / credentialId / enabled），漏掉了
+     * provider 与 region，导致普通用户可把任意桶的厂商改成默认厂商、地域改错，
+     * 使该桶对全体用户（含管理员）立即不可用。改为白名单后不会随字段新增而失效。
+     *
+     * R28-02：`quotaBytes` 从白名单里**移出**（改为管理员专属）。
+     * 原因：单桶配额在此之前只是界面展示值（服务端零拦截），普通用户能改它无害；
+     * 本轮补上了桶级闸门之后，它成了**被强制执行的限额** —— 若仍允许被它约束的
+     * 普通用户自行调大，闸门等于自带一个"解除限制"按钮（自绕过）。
+     * 这与 R25 凭据级配额的处理一致：额度由管理员设置、对所有写入者生效。
+     */
     if (roleOf(req) !== 'admin') {
       for (const k of Object.keys(b)) {
-        if (k !== 'remark' && k !== 'quotaBytes') delete b[k];
+        if (k !== 'remark') delete b[k];
       }
     }
     // FUN-05：字段白名单只管住「改哪些字段」，没管住「改哪个桶」。

@@ -29,22 +29,49 @@ function secureCookieAttr() {
 /**
  * 回环 / IPv4-mapped IPv6 归一化：`::ffff:127.0.0.1` → `127.0.0.1`、`::1` → `127.0.0.1`。
  * 全库只有这一份写法（ip-guard 曾自带一份等价的私有实现，见下）。
+ *
+ * R27-07：**同时做规范化（canonicalize）**。本函数的返回值在限流与失败锁定的键里
+ * 直接充当「身份」（`ip`、`ip|username`），所以同一地址必须只有一种拼写 —— 否则
+ * 攻击者靠改写拼写（`::A` / `::a`、`::ffff:0102:0304` / `::ffff:1.2.3.4`）就能让每个
+ * 请求落进不同的键，把限流与账户锁定整条绕开。规范化交 `ip-guard.canonicalIpLiteral`
+ * （唯一实现点：IPv4 拒前导零、IPv6 必须真的能解析成 16 字节并压成 RFC 5952 形式）。
+ *
+ * 规范化失败时退回「原样（IPv6 小写化）」而不是空串：调用方
+ * `clientIpInfo()` 已经把非法转发头收敛成 `''`，走到这里的多半是 socket 地址
+ * （一定合法）；真出现异常值时保持可辨识、可记录，比硬塞一个空身份更安全。
  */
 function normalizeIp(raw) {
-  let ip = String(raw == null ? '' : raw).trim();
-  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
-  if (ip === '::1') ip = '127.0.0.1';
-  return ip;
+  const ip = String(raw == null ? '' : raw).trim();
+  if (!ip) return '';
+  /**
+   * 顺序很关键：**先规范化，再做回环折算**。
+   * 旧实现先无条件 `slice(7)` 剥 `::ffff:` 前缀 —— 那只对**点分十进制**写法正确，
+   * 对十六进制写法（`::ffff:0102:0304`）会剥出 `0102:0304` 这种半截串。
+   * `canonicalIpLiteral` 自己会把 IPv4-mapped 折算成点分十进制，故这里不再手剥。
+   */
+  let canon = null;
+  try {
+    canon = require('./ip-guard').canonicalIpLiteral(ip); // 懒加载：避免 security ↔ ip-guard 加载期成环
+  } catch (e) { canon = null; }
+  const out = canon || ip;
+  if (out === '::1' || out === '0:0:0:0:0:0:0:1') return '127.0.0.1';
+  return out.includes(':') ? out.toLowerCase() : out;
 }
 
 /**
- * R22-02：语法上是否是一个 IP **字面量**（不接受端口 / 域名 / 任意字符串）。
+ * R22-02 起：语法上是否是一个**可信的** IP 字面量（不接受端口 / 域名 / 任意字符串）。
  *
  * 为什么必须有这道校验：`X-Forwarded-For` 即便在 `TRUST_PROXY=1` 下也仍是
  * **请求方可控输入**。若取值不做格式校验，攻击者可以给每个请求**换一个不同的非法串**
  * （`a`、`b`、`c`…），而限流键与失败锁定键正是 `ip` / `ip|username` —— 键随头轮换，
  * 等于把「按 IP 限流 + 账户锁定」整条绕开（比「取首段」本身更致命）。
- * 把「不是 IP 的一律不接受」收敛到这一处，杜绝各处自行判断。
+ *
+ * R27-07：判据从「字符集 + 粗结构」升级为**真的能解析**（委托
+ * `ip-guard.canonicalIpLiteral`，与 `normalizeIp` 同一实现点）。旧实现对含 `::`
+ * 的串直接 `return true`，于是 `1::2::3` / `:::::` / `::1:2:…:9` 这类**结构非法**
+ * 的值被当成合法 IP 采用，而它们在下游 `ip-guard.evaluate()` 里解析失败 ——
+ * 后者当时会**跳过全部规则**并放行，等于「一个请求头绕过所有 IP 屏蔽」。
+ * 同时拒绝前导零写法（`01.2.3.4`），它曾把限流预算放大 81 倍。
  *
  * 只做**语法**判定，不判归属：内网 / 回环地址在局域网部署里是完全合法的客户端 IP，
  * 归属（公网 / 内网 / 国内）一律交给 `ip-guard` 判定。
@@ -52,18 +79,11 @@ function normalizeIp(raw) {
 function isIpLiteral(v) {
   const s = String(v == null ? '' : v).trim();
   if (!s || s.length > 45) return false;
-  if (s.includes(':')) {
-    // IPv6：字符集 + 结构。`::` 简写（含 `::ffff:1.2.3.4`）直接放行，
-    // 完整形态要求恰好 8 组、每组 1–4 个十六进制字符。
-    if (!/^[0-9a-fA-F:.]+$/.test(s)) return false;
-    if (s.includes('::')) return true;
-    const groups = s.split(':');
-    return groups.length === 8 && groups.every((g) => g.length >= 1 && g.length <= 4);
+  try {
+    return require('./ip-guard').canonicalIpLiteral(s) !== null;
+  } catch (e) {
+    return false; // 判据不可用时 fail-closed（宁可判为「不是 IP」→ 不采用该头）
   }
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
-  if (!m) return false;
-  for (let i = 1; i <= 4; i++) if (Number(m[i]) > 255) return false;
-  return true;
 }
 
 /** `X-Forwarded-For` 头是否存在且非空 —— 用于区分「没有头」与「头在但值不可用」 */
@@ -126,6 +146,37 @@ function clientIpInfo(req) {
  */
 function clientIp(req) {
   return clientIpInfo(req).ip;
+}
+
+/**
+ * R27-03：本次请求在**浏览器眼里**是不是 HTTPS —— 全库唯一实现点。
+ *
+ * 为什么必须有它：反代 TLS 终结（`deploy.sh` 装的就是 Nginx + `TRUST_PROXY=1`，
+ * 且 `proxy_pass http://127.0.0.1:<port>`）时，socket 是**明文 HTTP**，而本服务
+ * 从不 `app.set('trust proxy', …)` —— Express 的 `req.secure` 只按
+ * `req.connection.encrypted` 推导，于是**恒为 false**；可浏览器地址栏是 `https://`，
+ * 它发出的 `Origin` 也是 `https://host`。任何拿 `req.secure` 直接判协议的地方都会
+ * 得出相反结论。
+ *
+ * 同一件事此前在库里有 **4 份**写法：`share-routes.js` 的 `siteUrlFor` 与分享下载
+ * 来源判定、`_shared.js` 的 WebAuthn origin 三处用了
+ * `req.secure || (IS_DEPLOY && TRUST_PROXY)`，而 `share-routes.js` 的 `/s/*`
+ * 同源校验用了裸 `req.secure` —— 结果默认 HTTPS 部署下**分享页的所有 POST**
+ * （提交访问密码 / 查看密码解锁 / 发起支付 / 手动查单）都被自己的 CSRF 防护 403，
+ * 页面只显示一句「请求来源校验失败」。这正是本项目反复记档的元规律：
+ * 「同一逻辑多份实现处，必有改一半的漏网之鱼」。
+ *
+ * 语义刻意与那三处**逐字一致**（不在本函数里额外要求 `X-Forwarded-Proto` 头）：
+ * `TRUST_PROXY=1` 在本项目里的含义就是「部署方保证按 `deploy.sh` 的模板转发
+ * 真实协议」，收紧会让既有部署的分享页重新变红 —— 那是另一个决定，不该混在
+ * 这次「统一口径」里做。
+ *
+ * @param {import('http').IncomingMessage} req
+ * @returns {boolean}
+ */
+function requestIsSecure(req) {
+  const r = req || {};
+  return Boolean(r.secure || (IS_DEPLOY && TRUST_PROXY));
 }
 
 /**
@@ -494,6 +545,7 @@ module.exports = {
   // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
   normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
   isIpLiteral, hasForwardedHeader,
+  requestIsSecure, // R27-03：唯一的「本次请求是否 HTTPS」判据
   httpsRedirectHost, isBindAllHost, configuredSiteHost,
   csrfGuard, SAFE_METHODS,
   createLimiter, limitMiddleware,

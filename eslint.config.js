@@ -77,6 +77,22 @@ module.exports = [
         TextDecoder: 'readonly',
         queueMicrotask: 'readonly',
         structuredClone: 'readonly',
+        /**
+         * R27-02：以下全局此前**缺失**，使 `no-undef` 产生 25 条误报、`npm run lint`
+         * 长期恒红（30 errors），真实缺陷（`ops.js` 的 `currentItems`）被淹没在噪声里。
+         * 名单仍是手工维护 —— 新增全局时请一并补到这里，否则门禁会重新变红。
+         */
+        ReadableStream: 'readonly',
+        Blob: 'readonly',
+        Response: 'readonly',
+        Request: 'readonly',
+        Headers: 'readonly',
+        FormData: 'readonly',
+        Event: 'readonly',
+        EventTarget: 'readonly',
+        MessageChannel: 'readonly',
+        performance: 'readonly',
+        globalThis: 'readonly',
       },
     },
     rules: COMMON_RULES,
@@ -128,6 +144,41 @@ module.exports = [
         matchMedia: 'readonly',
         grecaptcha: 'readonly',
         turnstile: 'readonly',
+        /**
+         * R27-02：补齐浏览器全局（含 `innerWidth` / `innerHeight` 这类挂在 window 上、
+         * 但可在模块内以裸标识符访问的属性，以及 `XMLHttpRequest` / `btoa` / `atob` /
+         * `Node` / `CanvasRenderingContext2D`）。缺一个就多一条 `no-undef` 误报 ——
+         * 门禁恒红时，真缺陷与噪声无法区分。
+         */
+        XMLHttpRequest: 'readonly',
+        innerWidth: 'readonly',
+        innerHeight: 'readonly',
+        scrollX: 'readonly',
+        scrollY: 'readonly',
+        Node: 'readonly',
+        btoa: 'readonly',
+        atob: 'readonly',
+        CanvasRenderingContext2D: 'readonly',
+        Path2D: 'readonly',
+        ImageData: 'readonly',
+        ReadableStream: 'readonly',
+        self: 'readonly',
+        top: 'readonly',
+        parent: 'readonly',
+        history: 'readonly',
+        screen: 'readonly',
+        performance: 'readonly',
+        globalThis: 'readonly',
+        queueMicrotask: 'readonly',
+        structuredClone: 'readonly',
+        MutationObserver: 'readonly',
+        IntersectionObserver: 'readonly',
+        ResizeObserver: 'readonly',
+        DOMParser: 'readonly',
+        getSelection: 'readonly',
+        scrollTo: 'readonly',
+        createImageBitmap: 'readonly',
+        OffscreenCanvas: 'readonly',
       },
     },
     rules: COMMON_RULES,
@@ -152,6 +203,23 @@ module.exports = [
         clearTimeout: 'readonly',
         fetch: 'readonly',
         URL: 'readonly',
+        // R27-02：测试进程同样运行在 Node 上，此处缺声明会让测试文件里的
+        // `setImmediate` / `Response` / `AbortController` 变成 `no-undef` 误报。
+        setImmediate: 'readonly',
+        clearImmediate: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        queueMicrotask: 'readonly',
+        structuredClone: 'readonly',
+        AbortController: 'readonly',
+        ReadableStream: 'readonly',
+        Response: 'readonly',
+        Request: 'readonly',
+        Headers: 'readonly',
+        Blob: 'readonly',
+        TextEncoder: 'readonly',
+        TextDecoder: 'readonly',
+        globalThis: 'readonly',
       },
     },
     rules: Object.assign({}, COMMON_RULES, {

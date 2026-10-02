@@ -271,9 +271,21 @@ function placeData(m, f, codewords, version) {
   const total = codewords.length * 8 + (version >= 2 && version <= 6 ? 7 : 0);
   const getBit = (i) => (i < codewords.length * 8 ? ((codewords[i >> 3] >>> (7 - (i & 7))) & 1) : 0);
 
+  /**
+   * R27-20：跳过第 6 列时，**必须挪循环变量本身**（`right = 5`），而不是只挪一个
+   * 局部列号。
+   *
+   * 旧实现写的是 `const colA = right === 6 ? right - 1 : right;`，于是列对变成
+   * (5,4)、(4,3)、(2,1)：**第 4 列被写两次（第二遍覆盖第一遍）、第 0 列永远拿不到
+   * 数据**。标准（ISO/IEC 18004 §7.7.3）要求列对为 (5,4)、(3,2)、(1,0)。
+   * 后果是标准解码器按规范顺序读出的码字与写入顺序不符，只能靠 Reed–Solomon
+   * 纠错去"修" —— 实测每个 RS 块多出 3~8 个错误码字（纠错容量 t = 5~13），
+   * 即符号仍能被扫描，但抗污损/打印质量的余量被吃掉了大半。
+   */
   for (let right = size - 1; right >= 1; right -= 2) {
-    const colA = right === 6 ? right - 1 : right; // 跳过第 6 列（定时图案）
-    const colB = colA - 1;
+    if (right === 6) right = 5; // 跳过第 6 列（定时图案）
+    const colA = right;
+    const colB = right - 1;
     for (let vert = 0; vert < size; vert++) {
       for (let k = 0; k < 2; k++) {
         const upward = ((right + 1) & 2) === 0;

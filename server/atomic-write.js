@@ -22,24 +22,78 @@ function tmpPath(file) {
   return `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
 }
 
-/** 同步原子写入 */
-function writeAtomicSync(file, data) {
+/**
+ * R27-14：尽力把某个路径的内容刷到稳定存储。失败一律静默。
+ *
+ * 为什么需要：`write(tmp)` + `rename(tmp, file)` 只保证**崩溃一致性**（任意时刻读到的
+ * 是完整旧内容或完整新内容），不保证**断电后的持久化顺序** —— POSIX 上的 rename 可能
+ * 先于数据落盘被提交，掉电后目标文件可能是 0 字节或部分分配。对 `config.enc`
+ * （装着全部云厂商密钥与账户）与 `secret.key` 而言，这不是"丢一次写入"，
+ * 而是"必须人工恢复/无法恢复"。
+ *
+ * Windows 等平台对目录 fsync 会报错（EPERM/EISDIR），属预期，静默忽略即可 ——
+ * 所以本函数是「尽力而为」而不是「保证」。
+ */
+function fsyncPath(p) {
+  let fd = null;
+  try {
+    fd = fs.openSync(p, 'r');
+    fs.fsyncSync(fd);
+  } catch (e) { /* 平台不支持（如 Windows 目录）/ 路径不存在：忽略 */ } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch (e) { /* ignore */ } }
+  }
+}
+
+async function fsyncPathAsync(p) {
+  let fh = null;
+  try {
+    fh = await fs.promises.open(p, 'r');
+    await fh.sync();
+  } catch (e) { /* 同上 */ } finally {
+    if (fh) { try { await fh.close(); } catch (e) { /* ignore */ } }
+  }
+}
+
+/**
+ * 同步原子写入
+ *
+ * R27-13：`opts.mode` 用于**密钥类文件**（`secret.key` / `enc.key` / 证书私钥）。
+ * 旧实现不传 mode ⇒ Node 默认 `0o666 & ~umask`（常见 `0644`），而权限是在写入**之后**
+ * 由调用方 `chmod 0600` 收紧的：两者之间存在一个「同机其他用户可读」的窗口，
+ * 且进程若在窗口内被强杀（SIGKILL / OOM / 断电），权限会**永久**停在 0644 ——
+ * 重启不会纠正（读取路径不校验权限），而可读的主密钥等于全部云厂商凭据与所有
+ * `secure-store` 密文可解。这里改为**创建时**就是目标权限，chmod 只作为兜底保留。
+ *
+ * @param {string} file
+ * @param {string|Buffer} data
+ * @param {{mode?: number}} [opts]
+ */
+function writeAtomicSync(file, data, opts) {
   const tmp = tmpPath(file);
   try {
-    fs.writeFileSync(tmp, data);
+    fs.writeFileSync(tmp, data, opts && opts.mode ? { mode: opts.mode } : undefined);
+    fsyncPath(tmp);            // R27-14：先让数据落盘，再提交 rename
     fs.renameSync(tmp, file);
+    fsyncPath(path.dirname(file)); // R27-14：让 rename 本身落盘（POSIX 目录项）
   } catch (e) {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) { /* ignore */ }
     throw e;
   }
 }
 
-/** 异步原子写入 */
-async function writeAtomic(file, data) {
+/**
+ * 异步原子写入
+ * @param {string} file
+ * @param {string|Buffer} data
+ * @param {{mode?: number}} [opts] 见 `writeAtomicSync` 的 R27-13 / R27-14 说明
+ */
+async function writeAtomic(file, data, opts) {
   const tmp = tmpPath(file);
   try {
-    await fs.promises.writeFile(tmp, data);
+    await fs.promises.writeFile(tmp, data, opts && opts.mode ? { mode: opts.mode } : undefined);
+    await fsyncPathAsync(tmp);   // R27-14
     await fs.promises.rename(tmp, file);
+    await fsyncPathAsync(path.dirname(file)); // R27-14
   } catch (e) {
     try { await fs.promises.unlink(tmp); } catch (e2) { /* ignore */ }
     throw e;
@@ -167,4 +221,31 @@ async function appendAtomic(file, chunk) {
   }
 }
 
-module.exports = { writeAtomicSync, writeAtomic, appendAtomic, sweepOrphanTmp, tmpPath };
+/**
+ * R28-04：把**已存在**文件的权限收紧到 0600 —— 读取路径上的幂等自愈。
+ *
+ * 为什么需要：R27-13 只改了**创建**路径（以 `{mode:0o600}` 创建）。一台在修复之前
+ * 装好、密钥文件恰好落在 `0644` 的机器（例如写入与 `chmod` 之间被强杀）升级后，
+ * 文件权限**不会被纠正** —— 而 `secret.key` 正常运行时**永不重建**，那条暴露就一直
+ * 存在，与"已收紧"的说明不符。这里在读取路径上补一次自愈：只在权限确实过宽时动作。
+ *
+ * 平台注意：Windows 的 `stat.mode` 不表示 POSIX 权限位（实测恒为 0666），照它判断会
+ * 每次读都 chmod 一次且毫无意义，故在 Windows 上直接跳过。失败一律静默 —— 权限收紧
+ * 是尽力而为，不能因为它把启动搞挂。
+ *
+ * @param {string} file
+ * @returns {boolean} 是否真的做了收紧
+ */
+function ensurePrivateModeSync(file) {
+  if (process.platform === 'win32') return false;
+  try {
+    const st = fs.statSync(file);
+    if ((st.mode & 0o077) === 0) return false; // 已经只有属主可读写
+    fs.chmodSync(file, 0o600);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+module.exports = { writeAtomicSync, writeAtomic, appendAtomic, sweepOrphanTmp, tmpPath, ensurePrivateModeSync };

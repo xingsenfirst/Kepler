@@ -625,11 +625,20 @@ async function copyObject(bucket, srcKey, dstKey, auditAction, auditPrefix, know
   // 与 routes/fs.js 的 COPY_SIMPLE_LIMIT 保持一致：超过则先探测大小再决定是否分块复制
   let large = false;
   const given = Number(knownSize);
+  /**
+   * R27-06：把**源对象大小**带出去 —— 复制是净增占用的操作（MOVE 才是净零），
+   * 调用方要按真实字节喂配额记账，否则「已复制多少」在系统里没有任何记录。
+   */
+  let srcSize = Number.isFinite(given) && given > 0 ? given : 0;
   try {
     // R11-15：调用方（逐页列举）手里**已经有** `it.size` —— 复用它，省掉每个对象
     // 一次额外的 headObject。目录 COPY 此前比 MOVE 慢一个数量级，一半就出在这里。
     if (Number.isFinite(given) && given > 0) large = given > COPY_SIMPLE_LIMIT;
-    else large = Number((await headObject(bucket, srcK)).size) > COPY_SIMPLE_LIMIT;
+    else {
+      const h = await headObject(bucket, srcK);
+      srcSize = Number(h && h.size) || 0;
+      large = srcSize > COPY_SIMPLE_LIMIT;
+    }
   } catch (e) {
     // 探测失败不阻断：仍走简单复制，由服务端在超限时报错（行为与旧版一致）
   }
@@ -672,7 +681,7 @@ async function copyObject(bucket, srcKey, dstKey, auditAction, auditPrefix, know
     });
   }
 
-  return { copied: true, metaCopied };
+  return { copied: true, metaCopied, bytes: srcSize };
 }
 
 /**
@@ -966,6 +975,24 @@ async function movePrefix(bucket, srcPrefix, dstPrefix, auditAction, auditPrefix
    * `flushMetaSync()` 在无待写内容时是空操作，成本为零。
    */
   encStore.flushMetaSync();
+
+  /**
+   * R27-17：**空目录必须在目标侧补建目录标记**。
+   *
+   * 列举时 `skipPrefixSelf: true` 把「源目录自身的占位对象」跳过了（它是 0 字节标记，
+   * 不是内容），而下面 `allKeys.push(srcP + '/')` 又会把它删掉。对**非空**目录没影响
+   * （子对象的 key 自带前缀，目标"目录"自然存在）；但**空**目录的占位对象是它唯一的
+   * 实体：`MKCOL /dav/empty/` 后 `MOVE /dav/empty/ → /dav/renamed/` 会把源删掉、
+   * 目标侧什么都不建 —— **两个目录一起消失**，而响应仍是 201（客户端以为成功）。
+   *
+   * 位置在删源**之前**：补建失败就不该继续做不可逆的删除。
+   */
+  if (!items.length) {
+    await p(cos, 'putObject', {
+      Bucket: cfg.bucket, Region: cfg.region, Key: dstP + '/',
+      Body: Buffer.alloc(0), ContentLength: 0,
+    });
+  }
 
   // 批量删除源（含目录标记对象）
   const allKeys = items.map((x) => x.key);

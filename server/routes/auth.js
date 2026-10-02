@@ -23,7 +23,7 @@ const { sessionCookie, clearCookie, webauthnContext } = require('./_shared');
 const router = express.Router();
 
 /**
- * 登录失败锁定的键（SEC-02）
+ * 登录失败锁定的键（SEC-02 / R27-08）
  *
  * 旧实现**只按用户名**锁定：任何人只要知道管理员的用户名，连着输错 5 次密码
  * 就能把管理员本人锁在外面最长 30 分钟 —— 锁定被反向用作 DoS 工具，
@@ -32,9 +32,15 @@ const router = express.Router();
  * 锁定键必须带上**攻击者控制不了**的维度（来源 IP）：这样失败计数只对
  * 「这个 IP 试探这个账户」累积，管理员从自己的机器照常登录。
  * 分布式暴破由 loginLimiter（按 IP 限流）负责 —— 限流键才是纯 IP。
+ *
+ * R27-08：用户名必须**规范化后再入键**。`config-store.authenticateUser()` 是按
+ * `toLowerCase()` 匹配的（大小写不敏感），而这里原样拼提交值、`completeLogin()`
+ * 却用库里的规范名去清零 —— 两个后果：① 攻击者轮换大小写（`admin`/`Admin`/`ADMIN`…）
+ * 就能让每个拼写各拿 5 次预算与独立的指数锁定，账户锁定形同虚设（只剩按 IP 的
+ * 每秒级限流）；② 以不同大小写成功登录永远清不掉那个键的计数，它会一路升级到上限。
  */
 function loginLockKey(ip, username) {
-  return `${ip}|${username}`;
+  return `${ip}|${String(username == null ? '' : username).trim().toLowerCase()}`;
 }
 
 /** 两步登录共用的前置检查：限流 + 账户锁定。返回 null 表示可继续 */

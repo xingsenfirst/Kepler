@@ -261,6 +261,59 @@ async function destinationExists(cos, cfg, dstKey, srcIsDir) {
 }
 
 /**
+ * R27-16：条件请求求值（RFC 7232 §3.1 `If-Match` / §3.2 `If-None-Match`）。
+ *
+ * 为什么必须做：本服务在 HEAD / GET 上**宣告了 `ETag`**（`:648` / `:696`），而
+ * 「宣告 ETag」在 HTTP 语义里就是承诺「客户端可以用它做条件写」。全库此前
+ * `grep -i "if-match|if-none-match"` **零命中** —— 于是同步工具 / Office 在覆盖前发的
+ * `PUT If-Match: "<etag>"`（或建新文件用的 `If-None-Match: *`）被**无条件执行**：
+ * 客户端以为"我的版本没被别人改过"，服务端却直接覆盖，两边各自的修改静默丢一份。
+ * 这类丢失没有任何报错，也是 WebDAV 客户端最难排查的一类问题。
+ *
+ * 只对**带了条件头**的请求多花一次 `headObject`（普通读写零开销）。
+ * `If-Match` 用强比较（去掉 `W/` 与引号后逐字比）；`*` 表示"只要存在"。
+ * 求值失败返回 `{ status, message }`，调用方据此回 412。
+ *
+ * @returns {Promise<null | {status:number, message:string}>} null = 条件满足，放行
+ */
+async function checkPreconditions(req, cfg, key) {
+  const ifMatch = String(req.headers['if-match'] || '').trim();
+  const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
+  if (!ifMatch && !ifNoneMatch) return null;
+
+  let etag = '';
+  try {
+    const st = await gateway.headObject(cfg.bucket, key);
+    etag = String((st && st.etag) || '');
+  } catch (e) {
+    etag = ''; // 不存在 / 探测失败 → 按「无当前实体」处理
+  }
+  const strip = (v) => String(v).replace(/^W\//i, '').replace(/^"|"$/g, '').trim();
+  const listOf = (v) => v.split(',').map(strip).filter(Boolean);
+  const current = strip(etag);
+
+  if (ifMatch) {
+    if (ifMatch === '*') {
+      if (!current) return { status: 412, message: '412 Precondition Failed：If-Match: * 但目标不存在' };
+    } else if (!current || !listOf(ifMatch).includes(current)) {
+      return {
+        status: 412,
+        message: `412 Precondition Failed：If-Match 与当前 ETag 不一致（服务端为 ${current || '（不存在）'}）—— `
+          + '目标已被其它客户端修改，请先取回最新版本再重试',
+      };
+    }
+  }
+  if (ifNoneMatch) {
+    if (ifNoneMatch === '*') {
+      if (current) return { status: 412, message: '412 Precondition Failed：If-None-Match: * 但目标已存在' };
+    } else if (current && listOf(ifNoneMatch).includes(current)) {
+      return { status: 412, message: '412 Precondition Failed：If-None-Match 命中当前 ETag' };
+    }
+  }
+  return null;
+}
+
+/**
  * 逐页遍历某前缀下的全部对象（**不截断**），每页回调一次。
  *
  * R8-16：`listRecursive()` 会在 `PROPFIND_CAP` 处静默截断并直接 return。这对
@@ -487,7 +540,9 @@ function buildApp() {
   app.use((req, res, next) => {
     const v = ipGuard.guardRequest(req);
     if (v.ok) return next();
-    const tip = v.reason === 'overseas' ? '该服务仅对中国大陆 IP 开放访问' : '您的 IP 已被管理员屏蔽';
+    // R28-06：文案走唯一实现点 `ipGuard.blockTip()`（此前 HTTP 与 WebDAV 各写一份，
+    // 新增 `unparsable` 原因时只改了 HTTP 侧）
+    const tip = ipGuard.blockTip(v.reason);
     res.status(403).type('text/plain').send(`403 Forbidden：${tip}（IP: ${v.ip || ipGuard.clientIp(req)}）`);
   });
 
@@ -748,7 +803,9 @@ function buildApp() {
       if (!key) return res.status(409).type('text/plain').send('409 Conflict：无法上传到根路径');
       if (key.endsWith('/')) {
         // R25：目录是 0 字节对象 → `addBytes=0`（仅「已超额」时拒绝）
+        // R28-02：凭据级 + 桶级两层闸门（与 /fs 的写入口径一致）
         await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+        await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 });
         try { await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key }, { noStat: true }); return res.status(405).end(); } catch (e) { /* 不存在则创建 */ }
         await p(cos, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key, Body: Buffer.alloc(0), ContentLength: 0 });
         return res.status(201).end();
@@ -759,6 +816,13 @@ function buildApp() {
        */
       const putLen = Math.max(0, Number(req.headers['content-length']) || 0);
       await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: putLen });
+      await bucketStats.assertBucketQuota(cos, cfg, { addBytes: putLen }); // R28-02：单桶上限
+      /**
+       * R27-16：条件写必须在校验**之后**、真正写入**之前**求值。
+       * 位置放在配额闸门之后：超出配额时不该因为条件不匹配而给出 412（配额错更根本）。
+       */
+      const pre = await checkPreconditions(req, cfg, key);
+      if (pre) return res.status(pre.status).type('text/plain').send(pre.message);
       // 经网关写入：自动加密（mode!=='none'）+ 联动元数据 + 审计
       const r = await gateway.writeObject(
         cfg.bucket, key, req,
@@ -797,6 +861,7 @@ function buildApp() {
       const dirKey = key.endsWith('/') ? key : key + '/';
       // R25：新建集合是 0 字节对象 → `addBytes=0`
       await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+      await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 }); // R28-02：单桶上限
       try {
         await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: dirKey }, { noStat: true });
         return res.status(405).type('text/plain').send('405 Method Not Allowed：集合已存在');
@@ -821,6 +886,9 @@ function buildApp() {
       // 只把释放的字节记账，让配额判定及时跟着回落。目录删除（deletePrefix）不返回
       // 字节数，故不记账 —— 代价是额度数字偏保守（**偏严**方向，不会放行超额写入）。
       if (!key.endsWith('/')) {
+        // R27-16：DELETE 同样要尊重 If-Match（"只删我看到的那个版本"）
+        const preDel = await checkPreconditions(req, cfg, key);
+        if (preDel) return res.status(preDel.status).type('text/plain').send(preDel.message);
         const del = await gateway.deleteObject(cfg.bucket, key, 'webdav.delete', userLabel);
         if (del && del.bytesFreed) bucketStats.recordUsageDelta(cfg, -del.bytesFreed);
       } else {
@@ -900,8 +968,13 @@ function buildApp() {
        * 为什么不传源对象大小：COPY 会新增一份占用，但它要么是文件（大小已知需先 HEAD，
        * 平白多一次往返）、要么是目录（要全量列举才知道），且 WebDAV 客户端在超额时
        * 拿到 507/403 都会重试。统一取「已超额即拒」，语义简单且判定成本为零。
+       *
+       * R28-02：**两层闸门并列** —— 凭据级（该密钥名下合计）之后紧跟桶级（该桶自身上限）。
+       * 两行之间刻意不留注释：`reverse-check` 的 anchor 在扫描前会把注释抹成等长空白，
+       * 夹在锚点中间的行内注释会让锚点失配（这正是本轮 R25-07 那条对照失效的原因）。
        */
       await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+      await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 });
       if (!srcIsDir) {
         // 文件
         // R10-11：判据统一走 destinationExists（与目录分支同源）
@@ -911,7 +984,16 @@ function buildApp() {
         if (isMove) {
           await gateway.moveObject(cfg.bucket, srcKey, dstKey, 'webdav.move', userLabel);
         } else {
-          await gateway.copyObject(cfg.bucket, srcKey, dstKey, 'webdav.copy', userLabel);
+          /**
+           * R27-06：COPY 是**净增**占用（MOVE 是净零，故不计），必须把真实拷入的
+           * 字节喂给配额记账 —— 与上面 PUT 分支同一条纪律。
+           *
+           * 旧实现只在 PUT / DELETE 记账：COPY 之后 `usedBytes` 不会变化，而它的闸门
+           * 又是「已超额才拒」（`addBytes: 0`），于是在缓存刷新的 15 分钟窗口内可以
+           * 把一个大对象反复 COPY 成 copy1/、copy2/…，账面纹丝不动、存储成倍增长。
+           */
+          const r = await gateway.copyObject(cfg.bucket, srcKey, dstKey, 'webdav.copy', userLabel);
+          if (r && r.bytes) bucketStats.recordUsageDelta(cfg, r.bytes);
         }
         return res.status(201).end();
       }
@@ -1072,6 +1154,7 @@ function buildApp() {
          * 修法照抄 movePrefix：失败先置 `stopped`，再 `allSettled`，然后才取快照。
          */
         let copied = 0;
+        let copiedBytes = 0; // R27-06：目录 COPY 的净增占用（逐对象累加，成功后才记账）
         const created = [];
         let idx = 0;
         let stopped = false;
@@ -1084,7 +1167,8 @@ function buildApp() {
               if (req.destroyed) { stopped = true; break; }
               const t = targets[idx++];
               // 不逐对象写审计（沿用旧行为），但把已知大小传下去省一次 headObject
-              await gateway.copyObject(cfg.bucket, t.key, t.dst, null, null, t.size);
+              const r = await gateway.copyObject(cfg.bucket, t.key, t.dst, null, null, t.size);
+              if (r && r.bytes) copiedBytes += r.bytes; // R27-06：真实拷入字节
               created.push(t.dst);
               copied += 1;
             }
@@ -1119,6 +1203,8 @@ function buildApp() {
           throw copyErr;
         }
 
+        // R27-06：复制成功后才记账（失败路径上面已 throw，不会走到这里）
+        if (copiedBytes) bucketStats.recordUsageDelta(cfg, copiedBytes);
         statsStore.addLog({
           action: 'webdav.copy',
           level: aborted ? 'warn' : 'info',

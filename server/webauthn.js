@@ -412,11 +412,15 @@ function sha256(buf) {
  * @param {string} args.expectedChallenge   服务端已签发、待消费的挑战
  * @param {string} args.expectedOrigin      期望来源（如 http://127.0.0.1:3000）
  * @param {string} args.rpId                依赖方 ID（如 127.0.0.1）
+ * @param {string} [args.expectedUserId]    R27-24：挑战必须属于该用户（登录路径一直传，
+ *                                          注册路径此前漏传 → 归属校验被跳过）
  * @returns {{ok:true, credentialId:string, publicKey:string, signCount:number, aaguid:string, fmt:string}}
  *          或 {ok:false, reason:string}
  */
-function verifyRegistration({ clientDataJSON, attestationObject, rawId, expectedChallenge, expectedOrigin, rpId }) {
-  const consumed = consumeChallenge(expectedChallenge, 'register');
+function verifyRegistration({ clientDataJSON, attestationObject, rawId, expectedChallenge, expectedOrigin, rpId, expectedUserId }) {
+  // R27-24：把期望用户透传下去 —— 少了它，`consumeChallenge` 的 `challenge_user_mismatch`
+  // 分支永远不会被触发（见该函数的 `expectedUserId` 说明）。
+  const consumed = consumeChallenge(expectedChallenge, 'register', expectedUserId);
   if (!consumed.ok) return { ok: false, reason: consumed.reason };
 
   let clientData, attObj;

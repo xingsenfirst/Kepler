@@ -547,6 +547,15 @@ function updateOpsButtons() {
 }
 explorer.updateOpsButtons = updateOpsButtons;
 explorer.syncSelectionUi = syncSelectionUi;
+/**
+ * R27-01：按 key 取当前目录的列表项（`state.items` 是本模块私有的）。
+ *
+ * 存在的理由：`ops.js` 的重命名要读目标对象的 size（决定云端是单请求复制还是分片
+ * 复制），而它此前调用的是一个**从未定义**的 `currentItems()` —— 抛错点在 `try`
+ * 之外，于是重命名在三个入口上全部静默失效。列表项的唯一归属地是这里，故在这里
+ * 开一个只读访问口，而不是让 ops.js 去猜 / 复制一份状态。
+ */
+explorer.itemOf = (key) => state.items.find((i) => i.key === key) || null;
 
 function updateLoadMore() {
   // 搜索态：按钮语义变为「继续搜索」，可见性由续扫游标决定

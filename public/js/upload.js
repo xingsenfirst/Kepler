@@ -2,7 +2,7 @@
 import { API, xhrPut } from './api.js';
 // R25：`showQuotaDialog` 放在 util.js（纯展示助手）—— 若从 syssettings.js 取，
 // 会绕成 `upload → syssettings → main → upload` 的三方环。
-import { fmtSize, toast, escapeHtml, showQuotaDialog, QUOTA_EXCEEDED_CODE } from './util.js';
+import { fmtSize, toast, escapeHtml, showQuotaDialog, QUOTA_EXCEEDED_CODE, BUCKET_QUOTA_EXCEEDED_CODE } from './util.js';
 import { createMatcher as createGitignoreMatcher } from './gitignore.js';
 import { App } from './main.js';
 
@@ -227,9 +227,10 @@ function pump() {
         t.state = 'failed';
         t.error = e.message || '上传失败';
         // 配额超限：弹**对话框**（非 toast）并去重；其余错误仍走 toast
-        if (e && e.code === QUOTA_EXCEEDED_CODE) {
+        // R28-02：桶级配额（BUCKET_QUOTA_EXCEEDED）同属配额类，一并用对话框告知
+        if (e && (e.code === QUOTA_EXCEEDED_CODE || e.code === BUCKET_QUOTA_EXCEEDED_CODE)) {
           if (!quotaDialogShown) { quotaDialogShown = true; showQuotaDialog(e); }
-          t.error = '超出 API Key 空间上限';
+          t.error = e.code === BUCKET_QUOTA_EXCEEDED_CODE ? '超出存储桶容量配额' : '超出 API Key 空间上限';
         } else {
           toast(`上传失败：${t.key}（${t.error}）`, { type: 'error' });
         }

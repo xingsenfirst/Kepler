@@ -786,11 +786,14 @@ function openBucketDialog(existing) {
         <input type="text" id="bk-remark" placeholder="填写后外显为备注名" value="${isEdit ? escapeHtml(existing.remark || '') : ''}">
       </div>
     </div>
-    <div class="form-item">
+    ${isAdminUser ? `<div class="form-item">
       <label>容量配额（GB）</label>
       <input type="number" id="bk-quota" min="0" step="1" value="${isEdit ? ((existing.quotaBytes || 0) / 1024 ** 3) : 0}">
       <div class="hint"><b> · 容量配额功能仅用于防止存储量过高，填 0 则无限制。为安全起见，修改回源设置、跨域设置、修改访问权限等操作需前往服务商控制台，本程序不提供此类功能</b>。</div>
-    </div>
+    </div>` : `<div class="form-item">
+      <label>容量配额</label>
+      <div class="hint">当前上限：${isEdit && existing.quotaBytes ? fmtSize(existing.quotaBytes) : '无限制'}（<b>仅管理员可修改</b> —— 它是服务端强制的写入上限）</div>
+    </div>`}
     ${isAdminUser ? `<div class="form-item">
       <label class="check-line"><input type="checkbox" id="bk-visible" ${isEdit ? (existing.visibleToUsers === false ? '' : 'checked') : 'checked'}>   对普通用户可见</label>
       <div class="hint">取消勾选后，该存储桶仅管理员可见；普通用户登录后不会看到此桶。</div>
@@ -868,14 +871,21 @@ function openBucketDialog(existing) {
         text: isEdit ? '保存' : '添加', cls: 'primary', onClick: async (o, close) => {
           const region = wrap.querySelector('#bk-region').value.trim();
           const remark = wrap.querySelector('#bk-remark').value.trim();
-          const quotaGB = Number(wrap.querySelector('#bk-quota').value) || 0;
+          /**
+           * R28-02：配额输入框只对管理员渲染（它现在是服务端**强制**的写入上限，
+           * 允许被约束者自行调大等于自带解除按钮）。非管理员这里取不到元素，
+           * 因此必须判空，且**不把 `quotaBytes` 放进提交体**（服务端也会丢弃该字段）。
+           */
+          const quotaEl = wrap.querySelector('#bk-quota');
+          const quotaGB = quotaEl ? (Number(quotaEl.value) || 0) : 0;
+          const quotaPatch = quotaEl ? { quotaBytes: Math.round(quotaGB * 1024 ** 3) } : {};
           // 非管理员没有渲染该项（服务端也会丢弃该字段），提交时按「可见」处理
           const visibleEl = wrap.querySelector('#bk-visible');
           const visibleToUsers = visibleEl ? visibleEl.checked : true;
-          if (quotaGB < 0) return msg('配额不能为负数，0 表示无限制', 'bad');
+          if (quotaEl && quotaGB < 0) return msg('配额不能为负数，0 表示无限制', 'bad');
           try {
             if (isEdit) {
-              await API.updateBucket(existing.id, { region, remark, quotaBytes: Math.round(quotaGB * 1024 ** 3), visibleToUsers });
+              await API.updateBucket(existing.id, Object.assign({ region, remark, visibleToUsers }, quotaPatch));
             } else {
               const bucket = wrap.querySelector('#bk-name').value.trim();
               if (!bucket) return msg('请填写存储桶名称', 'bad');

@@ -97,6 +97,16 @@ router.post('/webauthn/register/verify', (req, res) => {
       expectedChallenge: String(b.challenge || ''),
       expectedOrigin: ctx.origin,
       rpId: ctx.rpId,
+      /**
+       * R27-24：必须声明「这枚挑战应当属于谁」。挑战在 `register/options` 里签发时
+       * 已经带了 `userId`（见上面 `issueChallenge('register', { userId: me.id, … })`），
+       * 但旧实现消费时不传期望用户 → `consumeChallenge` 的归属校验被整条跳过。
+       * 后果：持被盗会话（但**不知道当前密码**）者可拿受害者已通过密码校验、随后
+       * 放弃的那枚待用挑战，提交**自己**验证器的证明，把自己绑成受害者的第二因素
+       * （持久化后门；仍不足以绕过密码，故为低危）。登录路径早已传这个参数
+       * （`routes/auth.js` 的同一调用），注册路径漏了 —— 典型的「同一判据两处只改一处」。
+       */
+      expectedUserId: me.id,
     });
     if (!r.ok) {
       statsStore.addLog({ action: 'webauthn.register.fail', level: 'warn', detail: `用户「${me.username}」Windows Hello 注册校验失败（${r.reason}）` });

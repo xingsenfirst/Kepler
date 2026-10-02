@@ -256,6 +256,21 @@ router.put('/payment/config/:platform', requireAdmin, (req, res) => {
     const merged = paymentProviders.applySave(id, prev, patch);
     const hasAny = Object.keys(merged).length > 0;
 
+    /**
+     * R27-18：**全空提交等价于「清除该渠道凭证」**，必须与 DELETE 走同一道约束校验。
+     *
+     * `savePayment(id, {})` 会 `delete platforms[id]`（连同 `enabled` 一起删掉），
+     * 而 DELETE 路由有 `checkChannelToggle` 兜着、这里没有 —— 于是同一种管理员意图
+     * （「清掉最后一条渠道的凭证」）走 DELETE 会被 400 拦下，走 PUT 却被静默接受，
+     * 配置停在「总开关开着、零渠道」这个代码明确定义为非法的状态。运行时
+     * `resolvePaidState` 返回 `no-channel / effective:false` ⇒ **所有付费链接静默变成
+     * 免费下载**，而界面上不会有任何错误提示。
+     */
+    if (!hasAny) {
+      const chk = paymentRules.checkChannelToggle(currentStates(stored), id, false, stored.enabled);
+      if (!chk.ok) return res.status(400).json({ error: chk.message });
+    }
+
     if (hasAny) {
       const r = paymentProviders.validate(id, merged);
       if (!r.ok) {

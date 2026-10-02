@@ -512,7 +512,14 @@ test('R10-10 · 分片上传完成后用量缓存必须被修正（缓存键须�
       region: BASE_CFG.region, size, chunkSize: 8 * 1024 * 1024,
       provider: BASE_CFG.provider, createdBy: 'admin',
     });
+    /**
+     * R27-12：会话必须**齐全**才能合并 —— `size=12MB` / `chunkSize=8MB` 意味着
+     * 应有 2 片（第 2 片 4MB）。本用例的主题是「用量缓存修正必须命中」，与分片是否
+     * 完整无关，故这里补齐第 2 片；只登记 ETag 不登记明文尺寸，可顺带验证
+     * 「尺寸未知时不参与 R27-04 的字节核对」这条兼容路径。
+     */
     uploadSessions.setPart(sess.id, 1, 'etag-1');
+    uploadSessions.setPart(sess.id, 2, 'etag-2');
 
     const c = await request(app2.port, 'POST', '/api/fs/upload/complete', {
       body: { sessionId: sess.id },

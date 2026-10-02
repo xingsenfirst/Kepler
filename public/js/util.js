@@ -153,13 +153,19 @@ export function promptDialog({ title, label, value = '', okText = '确定', hint
 /* ------------------------------ 配额超限提示（R25） ------------------------------ */
 
 /**
- * 服务端「超出 API Key 配额」的机器可读码（与 `server/bucket-stats.js` 的
- * `QUOTA_EXCEEDED_CODE` **必须一致**，改一处就要改另一处）。
+ * 服务端配额超限的两枚机器可读码
+ * （与 `server/bucket-stats.js` 的 `QUOTA_EXCEEDED_CODE` / `BUCKET_QUOTA_EXCEEDED_CODE`
+ * **必须一致**，改一处就要改另一处）。
+ *
+ * R28-02：桶级配额此前只是展示值，本轮补上了服务端闸门，于是多了一枚码 ——
+ * 两者的"出路"不同（一个去「系统设置 → 负载均衡」，一个去「存储桶管理」），
+ * 所以对话框必须按 `scope` 分开说。
  */
 export const QUOTA_EXCEEDED_CODE = 'CREDENTIAL_QUOTA_EXCEEDED';
+export const BUCKET_QUOTA_EXCEEDED_CODE = 'BUCKET_QUOTA_EXCEEDED';
 
 /**
- * 把「超出 API Key 配额」的服务端错误渲染成**对话框**（其余错误返回 false 由调用方自理）。
+ * 把「超出配额」的服务端错误渲染成**对话框**（其余错误返回 false 由调用方自理）。
  *
  * 放在 util.js 而不是 syssettings.js：它是纯展示助手（只用 openModal / escapeHtml / fmtSize），
  * 而 syssettings.js 与 main.js 互相 import —— 上传模块再去 import 它就会绕成
@@ -173,20 +179,31 @@ export const QUOTA_EXCEEDED_CODE = 'CREDENTIAL_QUOTA_EXCEEDED';
  * @returns {boolean} true 表示已按配额错误处理（调用方不要再弹通用提示）
  */
 export function showQuotaDialog(err) {
-  if (!err || err.code !== QUOTA_EXCEEDED_CODE) return false;
+  if (!err) return false;
+  const isBucket = err.code === BUCKET_QUOTA_EXCEEDED_CODE;
+  if (err.code !== QUOTA_EXCEEDED_CODE && !isBucket) return false;
   const q = err.quota || {};
   const rows = [
     ['已使用', fmtSize(q.usedBytes || 0)],
     ['空间上限', fmtSize(q.quotaBytes || 0)],
   ];
   if (q.addBytes) rows.push(['本次待写入', fmtSize(q.addBytes)]);
+  if (q.estimated) rows.push(['用量口径', '估算（桶内对象过多，未全量列举）']);
+  /**
+   * 出路按作用层级分开：桶级配额去「存储桶管理」调该桶上限；凭据级去「负载均衡」。
+   * `scope` 由服务端下发（R28-02 起桶级错误带 `scope: 'bucket'`），老响应没有该字段时
+   * 按凭据级处理，保持向后兼容。
+   */
+  const hint = isBucket
+    ? '可在「存储桶管理」中编辑该桶的容量配额（填 0 表示无限制），或清理桶内文件后重试。'
+    : '可在「系统设置 → 负载均衡」中调大该密钥的上限（填 0 表示无限制），或清理该密钥下的文件后重试。';
   openModal({
-    title: '超出 API Key 空间上限',
-    body: { html: `<p style="line-height:1.7;font-size:13px">${escapeHtml(err.message || '该 API Key 的存储空间已达上限。')}</p>
+    title: isBucket ? '超出存储桶容量配额' : '超出 API Key 空间上限',
+    body: { html: `<p style="line-height:1.7;font-size:13px">${escapeHtml(err.message || '存储空间已达上限。')}</p>
       <ul class="note-list" style="margin:8px 0 0">
         ${rows.map(([k, v]) => `<li>${escapeHtml(k)}：<b>${escapeHtml(v)}</b></li>`).join('')}
       </ul>
-      <div class="hint" style="margin-top:8px">可在「系统设置 → 负载均衡」中调大该密钥的上限（填 0 表示无限制），或清理该密钥下的文件后重试。</div>` },
+      <div class="hint" style="margin-top:8px">${escapeHtml(hint)}</div>` },
     foot: [{ text: '我知道了', cls: 'primary', onClick: (o, close) => close() }],
   });
   return true;

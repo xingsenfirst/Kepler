@@ -125,7 +125,22 @@ async function bucketStat(client, cfg) {
     t: Date.now(),
   };
   bucketSizeCache.set(key, out);
-  noteFreshSample(key); // R25：同上
+  /**
+   * R27-05：**只有精确样本才能清空待定增量**。
+   *
+   * `estimated === true` 意味着这次扫描在上限处被截断（这里只取了前 5001 个对象），
+   * 得到的是一个**下界**，它**并不包含**此前的写入 —— 而旧实现无条件
+   * `noteFreshSample(key)`，把唯一能补偿截断的机制一并清掉。
+   *
+   * 后果不是「数字略偏」而是**闸门长期失效**：`getBucketStatViaApi()` 仅对腾讯云
+   * 生效（其它厂商一律走本分支），所以任何非腾讯云厂商的桶只要对象数超过 5001，
+   * 判定基准就永远是一个远小于真实占用的下界，且每次缓存过期（15 分钟）都把新记的
+   * 增量再清一次 —— 管理员以为配了额度，实际上没有。
+   *
+   * 保留增量的代价是「可能偏高」（云端迟早会把写入算进去，而增量仍未清），方向上
+   * 偏保守（宁可多拦，不可漏放），与本模块 `assertCredentialQuota` 的失败取向一致。
+   */
+  if (!out.estimated) noteFreshSample(key);
   return out;
 }
 
@@ -331,6 +346,68 @@ async function assertCredentialQuota(credId, opts) {
   return usage;
 }
 
+/**
+ * R28-02：**单桶**配额的机器可读码（与凭据级区分开，前端据此给不同文案）。
+ */
+const BUCKET_QUOTA_EXCEEDED_CODE = 'BUCKET_QUOTA_EXCEEDED';
+
+/**
+ * R28-02：断言**单个存储桶**的空间配额未超限；超限时抛 403。
+ *
+ * 为什么需要它：桶记录上的 `quotaBytes` 此前**只在界面展示** —— `Develop_Document.md`
+ * 写的是「桶配额仍是**单桶上限**」、`CHANGELOG` 称其为「**单桶**限额」、界面还会把
+ * `sizeBytes > quotaBytes` 的桶标成「超额」并把进度条染红，但服务端**没有任何一处**
+ * 拿它拦过写入（全库 `quotaBytes` 的消费者只有「存取 / 归一化」与「展示」两类，
+ * 唯一的判定是凭据级的 `assertCredentialQuota`）。于是设了 1GB 桶配额却写进 10GB
+ * 不会有任何反应 —— 与 R25 那轮明确批评过的失败模式同型（「配了额度却拦不住，
+ * 比没有额度更危险」）。
+ *
+ * 判定口径与凭据级**刻意保持一致**（便于读者只记一套规则）：
+ *  - `usedBytes + addBytes > quotaBytes`（**严格大于**才拒，「正好用满」放行）；
+ *  - `quotaBytes` 为 0 / 非法 = 无限制，直接放行；
+ *  - 用量 = 桶的官方/列举容量（15 分钟缓存）**+ 待定增量**，理由见 `bucketPendingDelta`
+ *    的说明（只读缓存会让 TTL 窗口变成无限制超额窗口）；
+ *  - 未知大小（mkdir / rename / move / WebDAV COPY）传 `addBytes: 0`，即「已经超出
+ *    上限就不许再写」。
+ *
+ * 需要 `client` 的原因：桶容量查询走 `bucketStat()`（官方 `?stats` 优先、分页列举兜底）。
+ * 调用方手里本来就有客户端（`/fs` 的 `getClient(cfg)`、WebDAV 的 `requireCos()`），
+ * 且该查询有缓存，因此与既有的凭据级判定共享同一份缓存，不额外打云端。
+ *
+ * @param {object} client 该桶的云端客户端
+ * @param {object} cfg 生效桶配置（需含 provider/secretId/bucket/region/quotaBytes）
+ * @param {{addBytes?: number}} [opts]
+ * @returns {Promise<object|null>} 用量明细；无上限时返回 null
+ * @throws {Error} status=403 / code=BUCKET_QUOTA_EXCEEDED / quota={...}
+ */
+async function assertBucketQuota(client, cfg, opts) {
+  const quotaBytes = configStore.normalizeQuotaBytes(cfg && cfg.quotaBytes);
+  if (!quotaBytes) return null; // 0 = 无限制
+  const addBytes = Math.max(0, Math.floor(Number((opts && opts.addBytes) || 0) || 0));
+  const st = await bucketStat(client, cfg);
+  const pending = Math.max(0, pendingUsageDelta(cfg));
+  const usedBytes = (Number(st && st.sizeBytes) || 0) + pending;
+  if (usedBytes + addBytes > quotaBytes) {
+    const e = new Error(
+      `该存储桶的空间配额已达上限（已用 ${humanBytes(usedBytes)} / 上限 ${humanBytes(quotaBytes)}），`
+      + '无法继续写入；请在「存储桶管理」中调大该桶配额，或清理桶内文件后再试'
+    );
+    e.status = 403;
+    e.code = BUCKET_QUOTA_EXCEEDED_CODE;
+    e.quota = {
+      scope: 'bucket',
+      bucket: (cfg && cfg.bucket) || '',
+      quotaBytes,
+      usedBytes,
+      addBytes,
+      estimated: Boolean(st && st.estimated),
+      reason: BUCKET_QUOTA_EXCEEDED_CODE,
+    };
+    throw e;
+  }
+  return { quotaBytes, usedBytes, addBytes };
+}
+
 module.exports = {
   bucketCacheKey, bucketSizeCache, BUCKET_STAT_CACHE_MS, BUCKET_STAT_CACHE_MAX,
   pruneBucketSizeCache, getBucketStatViaApi, bucketStat,
@@ -338,4 +415,6 @@ module.exports = {
   // R25：按 API Key 的配额
   QUOTA_EXCEEDED_CODE, humanBytes, recordUsageDelta, pendingUsageDelta,
   credentialUsage, assertCredentialQuota,
+  // R28-02：按**单个存储桶**的配额
+  BUCKET_QUOTA_EXCEEDED_CODE, assertBucketQuota,
 };

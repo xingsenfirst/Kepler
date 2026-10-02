@@ -29,6 +29,8 @@ const {
   bucketCacheKey, bucketSizeCache, BUCKET_STAT_CACHE_MS, getBucketStatViaApi, bucketStat,
   resolveBucketClient, mapLimit,
   QUOTA_EXCEEDED_CODE, assertCredentialQuota, credentialUsage, recordUsageDelta,
+  // R28-02：单桶配额（与凭据级配额并列的两个层级）
+  BUCKET_QUOTA_EXCEEDED_CODE, assertBucketQuota,
 } = require('../bucket-stats');
 
 exports = module.exports = {};
@@ -302,7 +304,7 @@ function splitHostPort(hostHeader) {
 function webauthnContext(req) {
   const { hostname, port } = splitHostPort(req.headers.host);
   const rpId = hostname || '127.0.0.1';
-  const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
+  const proto = security.requestIsSecure(req) ? 'https' : 'http'; // R27-03：唯一判据
   // 重建 host 串：IPv6 已带方括号，直接拼端口即可
   const hostWithPort = port ? rpId + ':' + port : rpId;
   /**
@@ -616,4 +618,6 @@ Object.assign(module.exports, {
   sendError, errorBody,
   // R25：按 API Key 的配额（闸门 + 明细）
   QUOTA_EXCEEDED_CODE, assertCredentialQuota, credentialUsage, recordUsageDelta,
+  // R28-02：按单个存储桶的配额（闸门 + 明细）
+  BUCKET_QUOTA_EXCEEDED_CODE, assertBucketQuota,
 });

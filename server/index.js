@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 服务入口 —— 本地 Web 服务（HTTP + HTTPS）
  *
  *  - 所有对象存储 API 通信默认走 HTTPS（SDK Protocol 默认 https:）
@@ -41,17 +41,6 @@ const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;
 const DATA_DIR = process.env.COS_DATA_DIR ? path.resolve(process.env.COS_DATA_DIR) : path.join(__dirname, '..', 'data');
 
 app.disable('x-powered-by');
-// FUN-01：上传路由的**原始请求体解析必须先于全局 express.json 挂载**。
-//  上传走 `PUT /api/fs/upload/{simple,chunk}` + `express.raw({type:()=>true})`，
-//  但若全局 json 解析器先执行，它会识别 `Content-Type: application/json`
-//  （浏览器对 `.json` 文件的默认 MIME）并把 req.body 解析成对象、置 req._body=true，
-//  于是后续 express.raw 认为"已被解析过"而直接跳过 →
-//  fs.js 里 `!req.body || !req.body.length` 对对象恒为真 → 抛 400「请求体为空」。
-//  结果：上传**任何 .json / .geojson 文件必然失败**，且直传（≤8MB）与分片（>8MB）
-//  两条路径都受影响（>2MB 时更早被 json 解析器以 413 拒绝）。
-//  这里把这两个路径的 raw 解析提前，使其不受全局 json 影响。
-app.use(['/api/fs/upload/simple', '/api/fs/upload/chunk'], express.raw({ type: () => true, limit: '64mb' }));
-app.use(express.json({ limit: '2mb' }));
 // P12：gzip 压缩（必须早于路由与静态中间件注册）
 //  — 覆盖 /api 的 JSON 响应 + 静态前端资源（.html/.js/.css/.svg/.json）
 //  — 下载/缩略图/分享下载/测速等流式接口自动跳过，避免大文件缓冲进内存
@@ -176,6 +165,24 @@ app.use('/api', (req, res, next) => {
     activeBucketId: session.activeBucketId || '',
   }, () => next());
 });
+
+/**
+ * R27-22：请求体解析必须挂在 **IP 守卫与鉴权之后**。
+ *
+ * `body-parser` 的语义是「先把整个请求体读进内存，再调用 next()」—— 所以它挂得越靠前，
+ * 就越早把内存交出去。旧实现把上传用的 raw 解析（`limit: '64mb'`）与全局 json 解析
+ * 挂在最前面（早于 `ipGuard.middleware` 与 `/api` 鉴权），于是**匿名**客户端（含已被
+ * 拉黑的 IP）可以并发制造 64MB/请求的常驻内存 —— 一个不需要任何凭据的 OOM 入口。
+ *
+ * 位置约束（两条必须同时满足）：
+ *  ① raw 解析仍须**早于**全局 json 解析（FUN-01：否则 `Content-Type: application/json`
+ *     的 `.json` 上传会被 json 解析器先吃掉，`req._body = true` 让 raw 直接跳过，
+ *     上传任何 .json 文件必然 400「请求体为空」）；
+ *  ② 两者都必须在 ipGuard 与 `/api` 鉴权**之后**（本条）。
+ * 因此整体下移到鉴权块之后、路由之前 —— 顺序约束一条不破，只是不再为未认证请求缓冲。
+ */
+app.use(['/api/fs/upload/simple', '/api/fs/upload/chunk'], express.raw({ type: () => true, limit: '64mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 // API
 app.use('/api', routes);

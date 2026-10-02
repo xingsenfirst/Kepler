@@ -65,12 +65,20 @@ function masterKey() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (fs.existsSync(KEY_FILE)) {
     const hex = fs.readFileSync(KEY_FILE, 'utf8').trim();
-    if (/^[0-9a-f]{64}$/i.test(hex)) { masterKeyCache = Buffer.from(hex, 'hex'); return masterKeyCache; }
+    if (/^[0-9a-f]{64}$/i.test(hex)) {
+      // R28-04：与 config-store 的 secret.key 同款自愈（存量 0644 文件不会自己变好）
+      if (atomicWrite.ensurePrivateModeSync(KEY_FILE)) {
+        console.warn('[enc-store] 检测到 data/enc.key 权限过宽，已收紧为 0600');
+      }
+      masterKeyCache = Buffer.from(hex, 'hex');
+      return masterKeyCache;
+    }
     // 文件存在但内容不是合法密钥：备份后抛错，绝不静默覆盖
     throw configStore.unwritableError(KEY_FILE, 'bad', '内容不是合法的 32 字节十六进制密钥');
   }
   masterKeyCache = crypto.randomBytes(32);
-  atomicWrite.writeAtomicSync(KEY_FILE, masterKeyCache.toString('hex'));
+  // R27-13：以 0600 创建（理由见 config-store 的同一处说明：先落地再 chmod 会留窗口）
+  atomicWrite.writeAtomicSync(KEY_FILE, masterKeyCache.toString('hex'), { mode: 0o600 });
   try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) { /* 部分平台不支持，忽略 */ } // S4：收紧密钥文件权限
   return masterKeyCache;
 }
@@ -999,6 +1007,21 @@ function decryptTransform(meta) {
   let si = 0, phase = 'magic', remaining = CRYPTO_MAGIC.length;
   let pending = Buffer.alloc(0);
   let decipher = null, ctLeft = 0;
+  /**
+   * R27-11：本段**已解密但尚未认证**的明文暂存区。
+   *
+   * 为什么必须攒着：GCM 的认证标签覆盖整段密文，`final()` 之前无法判定真伪，
+   * 而 `download-stream` 早已按 `encMeta.origSize` 声明了 `Content-Length`。
+   * 旧实现把 `decipher.update()` 的返回值**立刻** push 给下游 —— 能改写云端对象者
+   * 只需翻转密文某一位（IV 与标签保持与本地元数据一致，R24-03 的逐段比对因此全过），
+   * 就能让等长的错误明文在 `final()` 抛错**之前**全部到达客户端；随后
+   * `res.destroy()` 发的是优雅 FIN，「收满 Content-Length」的客户端会保留篡改后的文件。
+   * 这与本函数「任何篡改都会报错，不会输出损坏明文」的承诺直接矛盾。
+   *
+   * 代价：一段的明文驻留内存（分片上传的段最大 48MB，直传路径最大 64MB）。
+   * 这是「先认证后下发」的固有成本 —— 想省内存就只能放弃这条承诺。
+   */
+  let segPlain = [];
 
   const take = (n) => {
     if (pending.length < n) return null;
@@ -1058,6 +1081,7 @@ function decryptTransform(meta) {
                 + '该对象可能被重排 / 拼接或已损坏'));
             }
             decipher = crypto.createDecipheriv('aes-256-gcm', mk, t);
+            segPlain = []; // R27-11：新的一段，清空暂存区
             ctLeft = segs[si].ctLen;
             phase = 'ct'; progressed = true;
           } else if (phase === 'ct') {
@@ -1066,7 +1090,7 @@ function decryptTransform(meta) {
             if (!n) break;
             const t = take(n);
             ctLeft -= n;
-            this.push(decipher.update(t));
+            segPlain.push(decipher.update(t)); // R27-11：先攒着，认证通过后再 push
             if (!ctLeft) { phase = 'tag'; remaining = TAG_LEN; }
             progressed = true;
           } else if (phase === 'tag') {
@@ -1079,7 +1103,10 @@ function decryptTransform(meta) {
                 + '该对象可能被重排 / 拼接或已损坏'));
             }
             decipher.setAuthTag(t);
-            this.push(decipher.final()); // 认证失败在此抛出
+            const tail = decipher.final(); // R27-11：认证失败在此抛出（此前一个字节都未下发）
+            for (const b of segPlain) this.push(b); // 认证通过 → 本段明文才可以交给下游
+            segPlain = [];
+            if (tail.length) this.push(tail);
             si++;
             if (si < segs.length) { phase = 'iv'; remaining = IV_LEN; }
             else phase = 'done';

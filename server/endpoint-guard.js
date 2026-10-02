@@ -47,6 +47,19 @@ function isLoopbackHost(host) {
   return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '::ffff:127.0.0.1';
 }
 
+/**
+ * R27-25：用于**黑名单比对**的主机规范化 —— 去掉末尾的点。
+ *
+ * 尾点写法（`localhost.`、`metadata.google.internal.`）在 DNS 语义上与不带尾点是
+ * **同一个名字**（尾点只是把它标成绝对 FQDN），但字符串比较不认，于是
+ * `METADATA_HOSTS`（文档写明「永远拒绝，不受环境变量影响」）与回环判据都能被
+ * 一个尾点绕过：实测 `assertSafeEndpoint('https://metadata.google.internal.')`
+ * 旧实现直接放行、`https://localhost.` 也一样。规范化后两者都回到黑名单里。
+ */
+function normalizeHostForCompare(host) {
+  return String(host || '').trim().toLowerCase().replace(/\.+$/, '');
+}
+
 function reject(msg) {
   const err = new Error(msg);
   err.status = 400;
@@ -76,14 +89,15 @@ function assertSafeEndpoint(endpoint) {
 
   const host = u.hostname.replace(/^\[/, '').replace(/\]$/, '');
   if (!host) throw reject('服务端点缺少主机名');
+  const hostKey = normalizeHostForCompare(host); // R27-25：去尾点后再比对黑名单
 
   // ① 云元数据地址：最高优先级，无条件拒绝
-  if (METADATA_HOSTS.has(host.toLowerCase())) {
+  if (METADATA_HOSTS.has(hostKey)) {
     throw reject('该地址属于云平台实例元数据服务，禁止作为服务端点');
   }
 
   // ② 回环地址
-  if (isLoopbackHost(host)) {
+  if (isLoopbackHost(hostKey)) {
     if (!ALLOW_LOOPBACK_ENDPOINT) {
       throw reject('服务端点不能指向本机回环地址（如确需本地对象存储调试，请设置环境变量 ALLOW_LOOPBACK_ENDPOINT=1）');
     }
@@ -111,6 +125,7 @@ module.exports = {
   assertSafeEndpoint,
   isIpLiteral,
   isLoopbackHost,
+  normalizeHostForCompare, // R27-25：黑名单比对前的唯一规范化点
   ALLOW_LOOPBACK_ENDPOINT,
   ALLOW_PRIVATE_ENDPOINT,
   METADATA_HOSTS,

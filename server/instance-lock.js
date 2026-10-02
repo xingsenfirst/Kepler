@@ -67,6 +67,45 @@ function lockAgeMs() {
 }
 
 /**
+ * R28-05：接管陈旧锁的**串行化标记**。
+ *
+ * R27-21 把「删旧锁 + 建新锁」换成了「rename 挪走 → 校验内容 → 建新锁」，堵掉了原窗口
+ * （两进程都读到同一个陈旧锁、双双返回 `ok:true`），但 `rename` 把 `LOCK_FILE`
+ * **挪走**之后、到「原样放回」之前，锁文件处于**缺失**状态：这段时间里第三个进程的
+ * `acquire()` 会先过「有活锁就退出」的预检（读不到文件 → 视为无锁），随后 `wx` 创建
+ * **成功** —— 它拿到锁，而原持有者仍自认持有（`held` 是内存标志，`acquire()` 直接短路
+ * 返回 `ok:true`）⇒ 双持锁（后果与 R27-21 描述的完全一致：两份配置缓存交替整体覆盖
+ * `config.enc`）。
+ *
+ * 修法：接管期间**绝不让锁文件消失**。用一个独立的 `O_EXCL` 标记把「接管权」串行化：
+ * 抢到标记者才可以就地覆写锁文件，写完释放标记；抢不到的直接认输。
+ * 标记自身也要能自愈 —— 接管途中被杀会留下标记，故内容带 pid，已死即清理后重试一次。
+ */
+const TAKEOVER_FILE = LOCK_FILE + '.takeover';
+
+/** 尝试取得接管标记。返回 true = 拿到（调用方**必须**在 finally 里 `releaseTakeover()`） */
+function claimTakeover(payload) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(TAKEOVER_FILE, payload, { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return false;
+      // 标记已存在：持有者还活着就放弃；已死（接管途中被杀）就清掉重试一次
+      let owner = null;
+      try { owner = JSON.parse(fs.readFileSync(TAKEOVER_FILE, 'utf8')); } catch (e2) { owner = null; }
+      if (owner && owner.pid && pidAlive(owner.pid)) return false;
+      try { fs.unlinkSync(TAKEOVER_FILE); } catch (e2) { return false; }
+    }
+  }
+  return false;
+}
+
+function releaseTakeover() {
+  try { fs.unlinkSync(TAKEOVER_FILE); } catch (e) { /* 已被清理，忽略 */ }
+}
+
+/**
  * 尝试获取单实例锁。
  * @returns {{ ok: true } | { ok: false, stale: boolean, pid: number|null }}
  *   ok=false 且 stale=true 表示旧锁持有者已不存在（调用方可选择 force 接管）
@@ -99,12 +138,35 @@ function acquire({ force = false } = {}) {
         return { ok: false, stale: false, pid: null };
       }
       if (!cur || !cur.pid || !pidAlive(cur.pid) || force) {
+        /**
+         * R27-21 + R28-05：接管陈旧锁。
+         *
+         * R27-21 的教训：不能 `unlink` + `create`（两进程都能删掉对方刚建的活锁）。
+         * R28-05 的教训：`rename` 挪走锁文件同样不行 —— 那会在「挪走」到「放回」
+         * 之间留下一个**锁文件不存在**的窗口，第三个进程会在这个窗口里 `wx` 创建成功，
+         * 与仍自认持锁的原持有者形成双持锁。
+         *
+         * 现在的做法：先抢 `TAKEOVER_FILE`（`O_EXCL`，跨平台原子）—— 抢不到就认输；
+         * 抢到者才**就地覆写** `LOCK_FILE`（文件全程存在，别人读到的要么是旧锁、
+         * 要么是新锁，绝不会「无锁」），写完释放标记。覆写前再核对一次内容：
+         * 若这期间已经出现活锁，就让位（不覆盖别人的活锁）。
+         */
+        if (!claimTakeover(payload)) {
+          return { ok: false, stale: true, pid: cur ? cur.pid : null };
+        }
         try {
-          fs.unlinkSync(LOCK_FILE);
-          fs.writeFileSync(LOCK_FILE, payload, { flag: 'wx' });
+          const again = readLock();
+          if (!force && again && again.pid && again.pid !== process.pid && pidAlive(again.pid)) {
+            return { ok: false, stale: true, pid: again.pid }; // 期间出现了活锁 → 让位
+          }
+          fs.writeFileSync(LOCK_FILE, payload); // 就地覆写（文件从不消失）
           held = true;
           return { ok: true };
-        } catch (e2) { /* 竞争失败，走下方返回 */ }
+        } catch (e2) {
+          return { ok: false, stale: true, pid: cur ? cur.pid : null };
+        } finally {
+          releaseTakeover();
+        }
       }
       return { ok: false, stale: true, pid: cur ? cur.pid : null };
     }

@@ -37,14 +37,39 @@ function shouldCompress(req, res) {
   const ae = String(req.headers['accept-encoding'] || '');
   if (!/\bgzip\b/.test(ae)) return false;
 
-  const path = String(req.path || '');
+  /**
+   * R27-26：`req.path` 必须**小写化**后再比对。
+   *
+   * Express 的默认路由匹配是**大小写不敏感**的：`GET /api/fs/DOWNLOAD` 会命中同一个
+   * 下载处理器，而 `SKIP_PATH` 的字面量全是小写 —— 旧实现因此被一个字母大小写绕过，
+   * 把本模块文档写明「绝不缓冲」的流式下载纳入压缩流程（实测
+   * `shouldCompress('/api/fs/DOWNLOAD') === true`，而同一个小写路径为 false）。
+   */
+  const path = String(req.path || '').toLowerCase();
   if (SKIP_PATH.test(path)) return false;
+
+  /**
+   * R28-03：**带 `Range` 的请求一律不压缩**（并因此不缓冲）。
+   *
+   * 这里必须看**请求头**，不能看 `res.statusCode`：本函数在路由之前执行，此刻状态码
+   * 还是默认的 200 —— R27-26 写的 `if (res.statusCode === 206) return false` 在真实
+   * 请求路径上**永远不成立**（是死代码，只有单测里喂合成的 `{statusCode:206}` 才会命中，
+   * 于是「缺陷仍在 + 护栏全绿」同时成立）。而 `Range` 是请求方在**进入路由之前**就已
+   * 送到的信息：它意味着响应可能是 206，此时再套一层 gzip 会让 `Content-Range`
+   * （按未压缩实体描述）与 `Content-Encoding` 的实体长度互相打架 —— 实测
+   * `206 + gzip` 回的是 `CL=29 / CR=bytes 0-1023/5000`，不解释内容编码、或按区间
+   * 拼接的续传客户端会拿到损坏的文件。压缩收益在续传场景本就不值得冒这个风险。
+   *
+   * 纵深防御：`end()` 阶段还会再判一次真实状态码与 `Content-Range`（见下），
+   * 覆盖「没有 Range 头、但处理器自己回了 206」的少数情况。
+   */
+  if (req.headers && req.headers.range) return false;
 
   // API：路径以 /api 开头即可（后续再按 Content-Type 二次判定）
   if (path.startsWith('/api')) return true;
 
   // 静态资源：按扩展名白名单判定，避免把二进制资源缓冲进内存
-  const ext = path.includes('.') ? path.slice(path.lastIndexOf('.')).toLowerCase() : '';
+  const ext = path.includes('.') ? path.slice(path.lastIndexOf('.')) : '';
   return STATIC_EXT.has(ext);
 }
 
@@ -105,9 +130,17 @@ function gzipMiddleware(req, res, next) {
     chunks = [];
     const type = String(res.getHeader('Content-Type') || '');
     const already = res.getHeader('Content-Encoding');
+    /**
+     * R28-03 纵深防御：**区间响应一律不压缩**。
+     *
+     * 这里是真正能看到最终状态的位置（`shouldCompress` 在路由之前执行，那里读到的
+     * `res.statusCode` 还是默认的 200）。`Content-Range` 一并判，因为 206 必然带它、
+     * 而个别处理器可能只设其一。
+     */
+    const ranged = Number(res.statusCode) === 206 || Boolean(res.getHeader('Content-Range'));
     // 二次校验：Content-Type 必须可压缩（例如 /api 下返回二进制附件时不压缩）
     const compressible = COMPRESSIBLE_TYPE.test(type) || (!type && data.length > 0);
-    if (!compressible || already || data.length < MIN_SIZE || data.length > MAX_SIZE) {
+    if (!compressible || already || ranged || data.length < MIN_SIZE || data.length > MAX_SIZE) {
       if (data.length) origWrite.call(res, data);
       return origEnd.call(res, undefined, enc, cb);
     }

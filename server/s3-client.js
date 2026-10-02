@@ -86,6 +86,32 @@ function encodeKeyPath(key) {
 }
 
 /**
+ * R27-15：按 WHATWG URL / RFC 3986 §5.2.4 的规则**删除点段**。
+ *
+ * 为什么签名前必须做这一步：`path` 同时用于「计算签名」与「拼出 fetch 的 URL」，
+ * 而 `fetch` 会用一个真正的 URL 解析器再处理一次 —— 它会删掉 `.` / `..` 段。
+ * 于是任何含 `.` 段的对象键（`docs/./x.txt`）会出现「签名的路径 ≠ 实际发出的
+ * 请求行」：S3 用收到的请求行重算签名 → `403 SignatureDoesNotMatch`，
+ * 而 `cos.js` 把它翻译成「签名错误：请检查 AccessKey / SecretKey 是否正确」，
+ * 把运维引向轮换一把本来完全有效的密钥。
+ *
+ * `..` 段在应用层已被 `normalizeKey()` 拒绝，但 `.` 段被放行（新建文件夹支持
+ * 多级输入 `docs/./2026`，WebDAV 客户端也可能发送 `./`）；此刻在唯一的发送出口
+ * 统一规范化，保证「签什么就发什么」。
+ */
+function normalizeDotSegments(p) {
+  const out = [];
+  for (const seg of String(p || '').split('/')) {
+    if (seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  let s = out.join('/');
+  if (!s.startsWith('/')) s = '/' + s;
+  return s;
+}
+
+/**
  * 从端点主机名推导地域（部分厂商无 region 入参时的兜底）：
  *  - oss-cn-hangzhou.aliyuncs.com -> cn-hangzhou
  *  - obs.cn-north-4.myhuaweicloud.com -> cn-north-4
@@ -351,6 +377,8 @@ class S3Client {
       path = this.basePath + '/' + bucket + (key ? '/' + encodeKeyPath(key) : '');
     }
     if (!path.startsWith('/')) path = '/' + path;
+    // R27-15：签名路径必须与 fetch 实际发出的请求行逐字节一致（见 normalizeDotSegments）
+    path = normalizeDotSegments(path);
 
     const hasBody = spec.body !== undefined && spec.body !== null;
     let payloadHash;
@@ -956,7 +984,9 @@ class S3Client {
       const key = params.Key || '';
       const expires = Math.max(1, Math.min(604800, Number(params.Sign && params.Expires ? params.Expires : 3600) || 3600));
       const hostHeader = bucket && this._virtualHosted() ? `${bucket}.${this.host}` : this.host;
-      const path = (bucket && this._virtualHosted() ? '/' : this.basePath + '/' + bucket + '/') + encodeKeyPath(key);
+      // R27-15：与 `_request` 同源的点段规范化 —— 预签名 URL 会被浏览器/客户端再次
+      // 解析，含 `.` 段的键同样会「签一份、发另一份」而必然 SignatureDoesNotMatch。
+      const path = normalizeDotSegments((bucket && this._virtualHosted() ? '/' : this.basePath + '/' + bucket + '/') + encodeKeyPath(key));
 
       const now = new Date();
       const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
@@ -1009,4 +1039,5 @@ function escapeXml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-module.exports = { S3Client, uriEncode };
+// R27-15：`normalizeDotSegments` 对外导出，供护栏直接断言「签名的路径 = 发出的路径」的规范化规则
+module.exports = { S3Client, uriEncode, normalizeDotSegments };

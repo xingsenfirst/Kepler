@@ -647,8 +647,11 @@ const CASES = [
     {
       name: 'R10-10 · 分片 complete 的用量缓存修正退回手拼 cfg（缺 secretId → 恒不命中）',
       file: 'server/routes/fs.js',
-      anchor: '    adjustStorageCache(sess.size, sessCfg);',
-      replacement: '    adjustStorageCache(sess.size, { bucket: sess.bucket, region: sess.region, provider: sess.provider, credentialId: sess.credentialId });',
+      // R27-04：R10-10 的记账已从 `sess.size` 改为**实际字节** `actualBytes`，
+      // 原 anchor（`adjustStorageCache(sess.size, sessCfg)`）已不存在。变异语义不变：
+      // 仍是把「完整 cfg」退回「缺 secretId 的手拼对象」→ 缓存键永不相等 → 修正恒为空操作。
+      anchor: '    adjustStorageCache(actualBytes, sessCfg);',
+      replacement: '    adjustStorageCache(actualBytes, { bucket: sess.bucket, region: sess.region, provider: sess.provider, credentialId: sess.credentialId });',
       testFile: 'audit10-regressions.test.js',
       minFail: 1,
     },
@@ -2503,11 +2506,13 @@ const CASES = [
       // 注释被 `stripComments` 抹白成等长空格，注释长度一旦相同两条 anchor 就会互相命中
       // （`String.replace` 只替换首处 → 变异打偏 → 假绿）。故 anchor 必须带上紧随其前的
       // **真实代码行**（各不相同），唯一性才由代码而非注释长度决定。
-      anchor: '    const cfg = requireConfig();\n'
-        + '    // R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）\n'
-        + '    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
-      replacement: '    const cfg = requireConfig();\n'
-        + '    // R25：（变异）闸门已摘除',
+      // R28-02：anchor 改为**纯代码行**（不再夹注释）—— 本轮给每个闸门后面追加了
+      // `assertBucketQuota`，夹注释的 anchor 会因为「注释变长」而失配（注释在扫描前
+      // 被抹成等长空白，长度一变就命中不了）。代码行本身足以唯一。
+      anchor: '    await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
+        + '    const client = getClient(cfg);\n'
+        + '    await assertBucketQuota(client, cfg, { addBytes: 0 });',
+      replacement: '    const client = getClient(cfg);',
       testFile: 'audit25-regressions.test.js',
       minFail: 1,
     },
@@ -2522,8 +2527,12 @@ const CASES = [
     {
       name: 'R25-05【init】· 分片上传初始化不再过配额闸门',
       file: 'server/routes/fs.js',
-      anchor: '      await assertCredentialQuota(cfg.credentialId, { addBytes: Math.max(0, size - already) });',
-      replacement: '      void 0;',
+      // R28-02：init 的净增量先落到 `netAdd` 变量再进闸门（两处闸门共用同一口径），
+      // 故 anchor 随之改为这三行纯代码。
+      anchor: '      const netAdd = Math.max(0, size - already);\n'
+        + '      await assertCredentialQuota(cfg.credentialId, { addBytes: netAdd });\n'
+        + '      await assertBucketQuota(client, cfg, { addBytes: netAdd });',
+      replacement: '      const netAdd = Math.max(0, size - already);',
       testFile: 'audit25-regressions.test.js',
       minFail: 1,
     },
@@ -2560,10 +2569,10 @@ const CASES = [
     {
       name: 'R25-07【WebDAV PUT·目录】· 不再过配额闸门',
       file: 'server/webdav-server.js',
-      anchor: "      if (key.endsWith('/')) {\n"
-        + '        // R25：目录是 0 字节对象 → `addBytes=0`（仅「已超额」时拒绝）\n'
-        + '        await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
-      replacement: "      if (key.endsWith('/')) {",
+      // R28-02：同「mkdir」—— anchor 去注释化，靠 8 空格缩进与 MKCOL/COPY 的 6 空格区分
+      anchor: '        await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
+        + '        await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 });',
+      replacement: '        void 0;',
       testFile: 'audit25-regressions.test.js',
       minFail: 1,
     },
@@ -2589,6 +2598,7 @@ const CASES = [
       name: 'R25-07【WebDAV COPY·MOVE】· 不再过配额闸门',
       file: 'server/webdav-server.js',
       anchor: '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
+        + '      await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 });\n'
         + '      if (!srcIsDir) {',
       replacement: '      if (!srcIsDir) {',
       testFile: 'audit25-regressions.test.js',
@@ -2763,6 +2773,200 @@ const CASES = [
       anchor: '    if (regionReq) regionReq.hidden = prov.regionRequired === false;',
       replacement: '    if (regionReq) regionReq.hidden = false;',
       testFile: 'audit26-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ============================================================== *
+     * R27 台账补登（外部独立审计 26 条）
+     *
+     * 第 27 轮当时只加了 tests/audit27-regressions.test.js 的行为护栏，
+     * 未登记反向对照 —— 于是「撤掉修复是否真的变红」从未被验证过。
+     * 这里按铁律补齐：每条都撤销该轮引入的**判据本身**（而非某个副作用）。
+     * ============================================================== */
+    {
+      name: 'R27-01 · 重命名入口重新引用 explorer 上不存在的成员（对话框不弹、静默无反应）',
+      file: 'public/js/ops.js',
+      anchor: '    const item = explorer.itemOf(key);',
+      replacement: '    const item = explorer.__noSuchMember(key);',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-03 · 分享页同源校验退回裸 req.secure（反代 TLS 终结下全部 POST 被自己挡成 403）',
+      file: 'server/share-routes.js',
+      anchor: '    secure: security.requestIsSecure(req), // R27-03：与上面同一判据（Referer 回退分支同病）',
+      replacement: '    secure: req.secure,',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-07 · XFF 规范化不再拒绝前导零写法（同一地址得到多个限流键 → 预算可轮换）',
+      file: 'server/ip-guard.js',
+      anchor: '    if (/(^|\\.)0\\d/.test(s)) return null;',
+      replacement: '    void 0;',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-09 · 规则目标 `1.2.3.4/` 重新退化成 /0（一条笔误屏蔽全网）',
+      file: 'server/ip-guard.js',
+      anchor: "    if (prefixPart !== null && prefixPart === '') return null;",
+      replacement: '    void 0;',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-10 · 畸形百分号编码重新把 ip-guard 打成 500（未认证可达 + 日志刷屏）',
+      file: 'server/ip-guard.js',
+      anchor: '    try {\n'
+        + '      return decodeURIComponent(m[1]);\n'
+        + '    } catch (e) {\n'
+        + '      return null;\n'
+        + '    }',
+      replacement: '    return decodeURIComponent(m[1]);',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-11 · AES-GCM 在认证通过前就把明文下发（等长错误明文先到客户端）',
+      file: 'server/enc-store.js',
+      anchor: '            segPlain.push(decipher.update(t)); // R27-11：先攒着，认证通过后再 push',
+      replacement: '            this.push(decipher.update(t));',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-13 · 主密钥回到「先以默认权限落地再 chmod」（存在同机可读私钥的窗口）',
+      file: 'server/config-store.js',
+      anchor: "writeAtomicSync(KEY_FILE, key.toString('hex'), { mode: 0o600 })",
+      replacement: "writeAtomicSync(KEY_FILE, key.toString('hex'))",
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-14 · 原子写不再 fsync（断电后 rename 可能先于数据落盘）',
+      file: 'server/atomic-write.js',
+      anchor: '    fs.fsyncSync(fd);',
+      replacement: '    void 0;',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-15 · S3 签名路径不再删除点段（含 `.` 段的键必然 SignatureDoesNotMatch）',
+      file: 'server/s3-client.js',
+      anchor: "    if (seg === '.') continue;",
+      replacement: '    void 0;',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-20 · 二维码走位不再跳过第 6 列（第 0 列永远拿不到数据位）',
+      file: 'server/qrcode.js',
+      anchor: '    if (right === 6) right = 5;',
+      replacement: '    void 0;',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-25 · 端点黑名单比对不再去掉尾点（`localhost.` / 元数据主机名可绕过）',
+      file: 'server/endpoint-guard.js',
+      anchor: '  const hostKey = normalizeHostForCompare(host); // R27-25：去尾点后再比对黑名单',
+      replacement: "  const hostKey = String(host || '').toLowerCase();",
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-26 · gzip 跳过判据不再小写化（/api/fs/DOWNLOAD 被纳入压缩流程）',
+      file: 'server/gzip.js',
+      anchor: "  const path = String(req.path || '').toLowerCase();",
+      replacement: "  const path = String(req.path || '');",
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R27-04/12 · 合并完成不再按实际字节记账（重回客户端在 init 声明的 size）',
+      file: 'server/routes/fs.js',
+      anchor: '    adjustStorageCache(actualBytes, sessCfg);',
+      replacement: '    adjustStorageCache(sess.size, sessCfg);',
+      testFile: 'audit27-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ============================================================== *
+     * R28 台账补登（第二轮独立审计 6 条）
+     * ============================================================== */
+    {
+      name: 'R28-01 · 派生缓存 `_parsed` 重新被一并加密落盘（IPv6 规则重启后永不命中）',
+      file: 'server/ip-guard.js',
+      anchor: '      delete copy._parsed;',
+      replacement: '      void 0;',
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-02 · /fs/mkdir 的桶级配额闸门被摘除（quotaBytes 退回「只展示、零拦截」）',
+      file: 'server/routes/fs.js',
+      anchor: '    const client = getClient(cfg);\n'
+        + '    await assertBucketQuota(client, cfg, { addBytes: 0 });\n'
+        + "    let key = normalizeKey(String((req.body || {}).path || ''));",
+      replacement: '    const client = getClient(cfg);\n'
+        + "    let key = normalizeKey(String((req.body || {}).path || ''));",
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-03 · 带 Range 的请求重新进入压缩流程（206 与 Content-Encoding 打架）',
+      file: 'server/gzip.js',
+      // 本轮的修复是**两层**（`shouldCompress` 按请求头 `Range` 早退 + `end()` 阶段按真实 206 /
+      // `Content-Range` 兜底），任何一层单独摘掉都不可观测（另一层仍然拦住）—— 这正是
+      // 「纵深防御」的正常形态。故这里用多步变异把**两层一起**退回旧实现，
+      // 判据是真实 Range 请求的响应头（audit28 的端到端用例）。
+      mutations: [
+        { anchor: '  if (req.headers && req.headers.range) return false;', replacement: '  void 0;' },
+        {
+          anchor: '    const ranged = Number(res.statusCode) === 206 || Boolean(res.getHeader(\'Content-Range\'));',
+          replacement: '    const ranged = false;',
+        },
+      ],
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-04 · 弱签名判据回到 X509Certificate#signatureAlgorithm（Node 18/20/22 无此属性 → 恒 false）',
+      file: 'server/local-cert.js',
+      anchor: '    const oid = signatureOidOf(new crypto.X509Certificate(certPem).raw);\n'
+        + '    return !oid || WEAK_SIGNATURE_OIDS.has(oid);',
+      replacement: "    return /sha1/i.test(String(new crypto.X509Certificate(certPem).signatureAlgorithm || ''));",
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-04 · 判据函数还在、但读取路径不再调用它（重签分支永远不可达）',
+      file: 'server/local-cert.js',
+      anchor: '      if (c.key && c.cert && fresh && !isWeakSignature(c.cert)) return c;',
+      replacement: '      if (c.key && c.cert && fresh) return c;',
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-05 · 接管时「先让锁文件消失再放行」（第三实例可趁隙抢到锁）',
+      file: 'server/instance-lock.js',
+      // 早期实现（R27-21）是「把锁文件 rename 挪走 → 校验 → 建新锁」，R28-05 换成
+      // 「抢 O_EXCL 接管标记 → 就地覆写」。这里复现**可观测后果**：接管时把 LOCK_FILE
+      // 删掉并直接放行（不抢标记）—— 锁文件在窗口内不存在，第三实例的 wx 创建会成功
+      // 并与原持有者形成双持锁（见 audit28 的 R28-05 用例）。
+      anchor: "      fs.writeFileSync(TAKEOVER_FILE, payload, { flag: 'wx' });",
+      replacement: '      try { fs.unlinkSync(LOCK_FILE); } catch (e) { /* 变异：锁文件已不存在 */ }\n'
+        + '      return true;',
+      testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R28-06 · unparsable 与「规则命中」文案重新分不清（把人引去找一条不存在的规则）',
+      file: 'server/ip-guard.js',
+      anchor: "  if (reason === 'unparsable') return '无法识别您的来源地址（反代未按模板转发 X-Forwarded-For，或该值非法），已拒绝访问';",
+      replacement: "  if (reason === 'unparsable') return '您的 IP 已被管理员屏蔽';",
+      testFile: 'audit28-regressions.test.js',
       minFail: 1,
     },
   ];

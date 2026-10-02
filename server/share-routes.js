@@ -63,7 +63,17 @@ router.use((req, res, next) => {
     let ok = false;
     try {
       const u = new URL(origin);
-      const proto = req.secure ? 'https:' : 'http:';
+      /**
+       * R27-03：协议判据必须走 `security.requestIsSecure()`。
+       *
+       * 旧实现用裸 `req.secure` —— 反代 TLS 终结下它恒为 `false`（本服务从不
+       * `app.set('trust proxy', …)`），而 HTTPS 页面发出的 `Origin` 是 `https://host`，
+       * 于是**同源请求被判成跨站**：`POST /s/:id`（访问密码）、`POST /s/:id/unlock`
+       * （查看密码）、`POST /s/:id/pay`、`POST /s/:id/pay/check` 在默认部署下
+       * 一律 403「请求来源校验失败」。页面显示的是安全提示，实际是自己的防护
+       * 把正常用户挡在外面（fail-closed，故不是绕过，但功能整体不可用）。
+       */
+      const proto = security.requestIsSecure(req) ? 'https:' : 'http:';
       ok = u.protocol === proto && u.host === String(req.headers.host || '');
     } catch (e) { ok = false; }
     if (!ok) {
@@ -77,7 +87,7 @@ router.use((req, res, next) => {
     secFetchSite: req.headers['sec-fetch-site'],
     referer: req.headers.referer || req.headers.referrer,
     host: req.headers.host,
-    secure: req.secure,
+    secure: security.requestIsSecure(req), // R27-03：与上面同一判据（Referer 回退分支同病）
     hasTicket: false,
   });
   if (!v.allow) {
@@ -739,7 +749,7 @@ function siteUrlFor(req) {
   if (base && !security.isOwnSiteHost(base, [])) base = '';
   if (base) return base.replace(/\/+$/, '');
 
-  const proto = (req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)) ? 'https' : 'http';
+  const proto = security.requestIsSecure(req) ? 'https' : 'http'; // R27-03：唯一判据
   const host = String(req.headers.host || '');
   /**
    * R24-01：**兜底路径不得信任任意请求 Host**。
@@ -1193,6 +1203,21 @@ router.post('/s/:id/unlock', asyncHandler(async (req, res) => {
   if (!l) return statePage(res, 'notfound');
   const st = shareStore.status(l);
   if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  /**
+   * R27-23：**分享密码必须先通过**，才能进入「加密访问密码」的验证。
+   *
+   * 兄弟路由全都做了这一步（`GET /s/:id`、`POST /s/:id/pay`、`GET /s/:id/dl` 都校验
+   * `shareStore.verifyToken`），唯独这里漏了。而本端点成功时签发的是
+   * `encStore.issueToken()` —— 一枚**与链接、对象无关**的全局令牌（只绑过期时间与
+   * 系统级「加密访问密码」的哈希），它同时被分享下载门禁与管理端 `/fs/download` 接受。
+   * 于是一个「既设了分享密码、又是密文对象」的链接，会给不知道分享密码的匿名访客
+   * 提供一个**不限速**的系统级密码猜测接口（只有 10 次/分/IP + IP 冻结），
+   * 猜中后拿到的令牌还能作用于其它密文对象。这不是直接的下载绕过（下载仍受分享密码拦），
+   * 但把「两把锁」降级成了一把。
+   */
+  if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
+    return res.redirect(303, '/s/' + l.id); // 与其它入口同款：先回分享页（那里有密码表单）
+  }
   if (!encGateNeeded(l)) return res.redirect(303, '/s/' + l.id); // 无需验证（未设密码 / 明文对象）
 
   const ip = security.clientIp(req);
@@ -1363,7 +1388,7 @@ router.get('/s/:id/dl', async (req, res) => {
     secFetchSite: req.headers['sec-fetch-site'],
     referer: req.headers.referer || req.headers.referrer,
     host: req.headers.host,
-    secure: Boolean(req.secure || (security.IS_DEPLOY && security.TRUST_PROXY)),
+    secure: security.requestIsSecure(req), // R27-03：唯一判据（原本是这份正确写法的第三处副本）
     hasTicket: hasValidTicket,
   });
   if (!src.allow) {

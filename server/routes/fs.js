@@ -24,7 +24,7 @@ const { deleteMultipleConfirmed } = require('../cos'); // R10-03：批量删除�
  */
 const gateway = require('../fs-gateway');
 // R23-04：`apiHandler` 是「async 处理器 + 标准错误响应」的唯一实现点（见 _shared.js 的说明）
-const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey, apiHandler, assertCredentialQuota, errorBody } = require('./_shared');
+const { requireConfig, baseName, parentOf, typeOf, assertNotExcluded, mapLimit, bucketCacheKey, apiHandler, assertCredentialQuota, assertBucketQuota, errorBody } = require('./_shared');
 // R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
 const { adjustStorageCache } = require('./stats');
 const security = require('../security'); // SEC-09：直链签发需记录来源 IP
@@ -376,9 +376,14 @@ router.get('/fs/search', apiHandler(async (req, res) => {
 router.post('/fs/mkdir', async (req, res) => {
   try {
     const cfg = requireConfig();
-    // R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）
+    /**
+     * R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）
+     * R28-02：**两层配额**都要判 —— 凭据级（该密钥名下合计）与桶级（该桶自身上限）。
+     * 顺序：先凭据后桶，两条闸门的口径完全一致（严格大于才拒、0 = 无限制）。
+     */
     await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
     const client = getClient(cfg);
+    await assertBucketQuota(client, cfg, { addBytes: 0 });
     let key = normalizeKey(String((req.body || {}).path || ''));
     if (!key) throw badRequest('路径不能为空');
     if (!key.endsWith('/')) key += '/';
@@ -412,6 +417,7 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
      * 加密开销（魔数/IV/GCM tag）属实现细节，不计入 —— 否则「填 1GB 就该能传满 1GB」会落空。
      */
     await assertCredentialQuota(cfg.credentialId, { addBytes: req.body.length });
+    await assertBucketQuota(client, cfg, { addBytes: req.body.length }); // R28-02：单桶上限
     let body = req.body;
     let encrypted = false;
     const enc = encStore.encryptBuffer(cfg.bucket, key, req.body);
@@ -487,7 +493,10 @@ router.post('/fs/upload/init', async (req, res) => {
           Bucket: sess.bucket, Region: sess.region, Key: key, UploadId: sess.uploadId,
         });
         uploadedParts = (lp.ListPartsResult.Part || []).map((x) => ({ partNumber: Number(x.PartNumber), etag: String(x.ETag).replace(/"/g, ''), size: Number(x.Size) || 0 }));
-        // 同步本地记录
+        // 同步本地记录。
+        // R27-04：这里**不传** `plainBytes` —— 云端 `ListParts` 给的是**密文**长度
+        // （crypto 模式下每片还会多出 IV + 认证标签），拿它当明文参与「实际写了多少」
+        // 的核对会系统性偏大。尺寸未知就不参与判定（见 upload-sessions.setPart）。
         for (const sp of uploadedParts) uploadSessions.setPart(sess.id, sp.partNumber, sp.etag);
       } catch (e) {
         sess = null; // uploadId 已失效，重新创建
@@ -502,7 +511,9 @@ router.post('/fs/upload/init', async (req, res) => {
      */
     {
       const already = uploadedParts.reduce((s, x) => s + (Number(x.size) || 0), 0);
-      await assertCredentialQuota(cfg.credentialId, { addBytes: Math.max(0, size - already) });
+      const netAdd = Math.max(0, size - already);
+      await assertCredentialQuota(cfg.credentialId, { addBytes: netAdd });
+      await assertBucketQuota(client, cfg, { addBytes: netAdd }); // R28-02：单桶上限（同一净增量口径）
     }
     if (!sess) {
       const init = await p(client, 'multipartInit', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
@@ -696,7 +707,8 @@ router.put('/fs/upload/chunk', express.raw({ type: () => true, limit: '64mb' }),
       Body: body, ContentLength: body.length,
     });
     const etag = String(data.ETag || '').replace(/"/g, '');
-    uploadSessions.setPart(sess.id, partNumber, etag);
+    // R27-04：记下**明文**字节数（本片的实际大小），供 complete 核对与按真实字节记账
+    uploadSessions.setPart(sess.id, partNumber, etag, req.body.length);
     res.json({ ok: true, partNumber, etag });
     statsStore.sampleTraffic(body.length, 0);
     statsStore.trackBucket(sess.bucket, { up: body.length });
@@ -726,6 +738,65 @@ router.post('/fs/upload/complete', async (req, res) => {
       .map(([n, etag]) => ({ PartNumber: Number(n), ETag: etag }))
       .sort((a, b) => a.PartNumber - b.PartNumber);
     if (!parts.length) throw badRequest('没有已上传的分片');
+
+    /**
+     * R27-12：分片必须**连续且齐全**，否则拒绝合并。
+     *
+     * 旧实现只校验「每个已上传分片都有加密参数」（`enc-store.buildFinalMeta`），
+     * 从不校验分片是否构成 1..N —— 而这里注释写的正是「不完整则拒绝合并」。
+     * 于是构造 `init(size=3500, chunkSize=1000)` + 只传 `part=1`、`part=3`，
+     * 云端会合并出「第 1 段 + 第 3 段」，而本地元数据描述的**正好也是**这两段：
+     * 逐段 IV/标签/GCM 全部自洽、解密不报错，却与 `origSize` 不符 —— 一个部分损坏
+     * 的对象以「上传成功」落库，magic 模式的逐片完整性校验还会因此**永久降级为 none**。
+     *
+     * 判据分两层：
+     *  ① 连续性（永远可判）：序号必须是 1..M，中间不许缺号；
+     *  ② 片数（`chunkSize` 可用时可判）：必须等于 `ceil(size / chunkSize)`。
+     */
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i].PartNumber !== i + 1) {
+        throw badRequest(`分片序号不连续：第 ${i + 1} 片缺失（已收到 ${parts.length} 片）。`
+          + '请取消该上传任务后重新上传 —— 缺号合并会产出一个内容缺失、却"解密成功"的文件');
+      }
+    }
+    const chunkSize = Number(sess.chunkSize) > 0 ? Number(sess.chunkSize) : 0;
+    const size = Math.max(0, Number(sess.size) || 0);
+    if (chunkSize > 0 && size > 0) {
+      const expectParts = Math.ceil(size / chunkSize);
+      if (parts.length !== expectParts) {
+        throw badRequest(`分片不完整：按声明大小 ${size} 字节与分片大小 ${chunkSize} 字节应有 ${expectParts} 片，`
+          + `实际只有 ${parts.length} 片。请取消该上传任务后重新上传`);
+      }
+    }
+
+    /**
+     * R27-04：**实际写入的字节数**必须由服务端自己算，不能沿用客户端在 `init`
+     * 声明的 `size`。
+     *
+     * 旧实现只在 init 按声明值过闸门（`assertCredentialQuota`），chunk 与 complete
+     * 全程既不核对也不记账，最后还用 `sess.size` 记用量 —— 于是「声明 8MB+1、实际传
+     * 10000 × 8MB ≈ 78GB」这种请求不但能穿过闸门，账面上还只增加了 8MB。这与 README
+     * 承诺的「超出上限由服务端拦截、判定在所有写入出口生效、不会因统计缓存而在窗口内
+     * 偷偷超额」直接矛盾。
+     *
+     * 判定口径：仅对**尺寸已知**的分片求和（部分分片可能是 `init` 从云端回填的，
+     * 那类尺寸是密文长度，不参与）。全部分片尺寸已知时要求**恰好等于**声明大小
+     * （多传即超额、少传即残缺，两者都是错）；否则只做「不超过声明大小」的保守核对。
+     */
+    const sizes = sess.partSizes && typeof sess.partSizes === 'object' ? sess.partSizes : {};
+    const knownParts = parts.filter((x) => Number.isFinite(Number(sizes[x.PartNumber])));
+    const knownBytes = knownParts.reduce((s, x) => s + Number(sizes[x.PartNumber]), 0);
+    if (knownBytes > size) {
+      throw Object.assign(badRequest(`本次上传的实际字节数（${knownBytes}）超过会话声明的大小（${size}）—— `
+        + '已拒绝合并。若确有更大的文件，请重新发起上传'), { code: 'UPLOAD_SIZE_MISMATCH' });
+    }
+    if (knownParts.length === parts.length && knownBytes !== size) {
+      throw Object.assign(badRequest(`本次上传的实际字节数（${knownBytes}）与会话声明的大小（${size}）不一致 —— `
+        + '已拒绝合并，请取消该上传任务后重新上传'), { code: 'UPLOAD_SIZE_MISMATCH' });
+    }
+    // 记账用**真实**字节：全部已知时就是实际总量，否则退回声明值（至少不比旧行为更差）
+    const actualBytes = knownParts.length === parts.length ? knownBytes : size;
+
     const encMeta = encStore.buildFinalMeta(sess); // 加密任务：校验并生成元数据（不完整则拒绝合并）
     await p(client, 'multipartComplete', {
       Bucket: sess.bucket, Region: sess.region, Key: sess.key,
@@ -739,11 +810,15 @@ router.post('/fs/upload/complete', async (req, res) => {
     res.json({ ok: true, key: sess.key, encrypted: !!encMeta });
     // R10-10：必须传完整 cfg（见 configForSession 的说明）。手拼的 `{bucket,region,provider,credentialId}`
     // 缺 secretId → 缓存键与统计页不一致 → 修正恒为静默空操作。
-    adjustStorageCache(sess.size, sessCfg);
-    statsStore.addLog({ action: 'fs.upload', detail: `上传完成 ${sess.key}（${(sess.size / 1048576).toFixed(1)} MB，${parts.length} 分片${encMeta ? '，已加密存储' : ''}）` });
+    // R27-04：增量取**实际字节**（旧实现取 `sess.size`，与真实写入量脱钩）。
+    adjustStorageCache(actualBytes, sessCfg);
+    statsStore.addLog({ action: 'fs.upload', detail: `上传完成 ${sess.key}（${(actualBytes / 1048576).toFixed(1)} MB，${parts.length} 分片${encMeta ? '，已加密存储' : ''}）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
-    res.status(err.status || 500).json({ error: err.message });
+    // R27-04：错误体统一走 `errorBody()`（而非手拼 `{ error }`），
+    // 否则上面 R27-04 / R27-12 抛出的机器可读码（`UPLOAD_SIZE_MISMATCH`）会在
+    // 这一层被丢掉，前端只能按文案猜。
+    res.status(err.status || 500).json(errorBody(err));
     statsStore.addLog({ action: 'fs.upload', detail: '分片合并失败: ' + err.message, level: 'error' });
   }
 });
@@ -1130,6 +1205,7 @@ router.post('/fs/rename', async (req, res) => {
 
     // R25：重命名是「复制到新键 + 删源键」，同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）
     await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+    await assertBucketQuota(getClient(cfg), cfg, { addBytes: 0 }); // R28-02：单桶上限
 
     let copied = 0;
     // FUN-14：无论文件还是文件夹，写目标前都先探测 —— 云端覆写不可撤销
@@ -1187,6 +1263,7 @@ router.post('/fs/move', async (req, res) => {
     if (!paths.length) throw badRequest('未选择要移动的对象');
     // R25：移动同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）
     await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
+    await assertBucketQuota(client, cfg, { addBytes: 0 }); // R28-02：单桶上限
     const keys = paths.map((raw) => normalizeKey(String(raw)));
     // 按下标回填、按入参顺序输出（目录串行 + 文件并发，两条路径不能打乱顺序）
     const results = new Array(keys.length).fill(null);

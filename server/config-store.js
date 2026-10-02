@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 配置存储模块 —— 配置信息本地加密存储与验证机制
  *
  * 安全设计：
@@ -106,7 +106,18 @@ function getMasterKey() {
   ensureDataDir();
   if (fs.existsSync(KEY_FILE)) {
     const hex = fs.readFileSync(KEY_FILE, 'utf8').trim();
-    if (/^[0-9a-f]{64}$/i.test(hex)) { masterKeyCache = Buffer.from(hex, 'hex'); return masterKeyCache; }
+    if (/^[0-9a-f]{64}$/i.test(hex)) {
+      /**
+       * R28-04：读取路径上的权限自愈。
+       * `secret.key` 正常运行时**永不重建**，所以 R27-13（创建即 0600）救不了
+       * 「修复之前就已存在的 0644 密钥文件」—— 那台机器的暴露会一直留着。
+       */
+      if (atomic.ensurePrivateModeSync(KEY_FILE)) {
+        console.warn('[config-store] 检测到 data/secret.key 权限过宽，已收紧为 0600');
+      }
+      masterKeyCache = Buffer.from(hex, 'hex');
+      return masterKeyCache;
+    }
     // FUN-04：文件存在但内容不是合法密钥 —— **绝不能**静默生成新密钥覆盖它。
     //
     // 旧密钥是 config.enc / enc-meta / links / payments 的唯一解密凭据，
@@ -116,7 +127,9 @@ function getMasterKey() {
     throw unwritableError(KEY_FILE, 'bad', '内容不是合法的 32 字节十六进制密钥');
   }
   const key = crypto.randomBytes(32);
-  atomic.writeAtomicSync(KEY_FILE, key.toString('hex'));
+  // R27-13：以 0600 **创建**（旧实现先按默认 0644 落地、再 chmod，中间有一个
+  // 同机可读的窗口，窗口内被强杀则权限永久停在 0644）。chmod 保留为兜底。
+  atomic.writeAtomicSync(KEY_FILE, key.toString('hex'), { mode: 0o600 });
   try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) { /* 部分平台不支持 */ }
   masterKeyCache = key;
   return key;

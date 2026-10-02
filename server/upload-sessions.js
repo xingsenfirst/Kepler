@@ -170,10 +170,24 @@ function findByTarget(key, size, filter = {}) {
   return best;
 }
 
-function setPart(id, partNumber, etag) {
+/**
+ * 记录一个已上传分片。
+ *
+ * `plainBytes`（R27-04）：本片**明文**字节数，用于在 `complete` 时回答两个问题 ——
+ * 「实际写了多少」（配额记账用真实字节，而不是客户端在 `init` 里声明的 size）与
+ * 「有没有超出声明大小」。传 `undefined` 表示**尺寸未知**（例如 `init` 从云端
+ * `multipartListPart` 回填历史分片时拿到的是**密文**长度，加密模式下属实现细节，
+ * 不能当明文用）—— 未知就不参与这两项判定，而不是当成 0。
+ */
+function setPart(id, partNumber, etag, plainBytes) {
   const sess = ensure()[id];
   if (!sess) return null;
   sess.parts[partNumber] = etag;
+  const n = Number(plainBytes);
+  if (Number.isFinite(n) && n >= 0) {
+    if (!sess.partSizes || typeof sess.partSizes !== 'object') sess.partSizes = {};
+    sess.partSizes[partNumber] = n;
+  }
   sess.updatedAt = Date.now();
   persist();
   return sess;

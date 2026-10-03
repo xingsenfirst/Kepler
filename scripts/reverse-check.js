@@ -3144,6 +3144,128 @@ const CASES = [
       testFile: 'audit29-regressions.test.js',
       minFail: 1,
     },
+    {
+      /**
+       * R31-01 / R31-02：批量删除的 Content-MD5。
+       *
+       * 缺陷来源（用户报障）：网页界面删文件，Toast 显示
+       * 「删除完成，N 项失败：MissingArgument: Missing Some Required Arguments.」
+       *
+       * 定位链：`ops.js` → `API.del` → `POST /api/fs/delete` → `deleteMultipleConfirmed`
+       * → `s3-client.deleteMultipleObject` → `_send()` 的 `${code}: ${message}`。
+       * 报错文案形如 `Name: Message.`，说明**上游**返回了
+       * `<Code>MissingArgument</Code><Message>Missing Some Required Arguments.</Message>`
+       * —— 项目内四个错误整形点（`cos.translateError`、`davErrorMessage`、
+       * `deleteMultipleConfirmed`、`routes/fs.js`）输出的全是中文，故这句原文只可能来自云端。
+       *
+       * 定位到厂商与缺失项：`DeleteObjects`（`POST /<bucket>?delete`）**必须**带
+       * `Content-MD5` —— AWS S3 明确「required for all Multi-Object Delete requests」，
+       * 阿里云 OSS 的请求头表把 Content-MD5 标为「是」并示范 `Content-MD5: MD5Value`；
+       * 缺失时 OSS 回的就是上面那句**不点明缺什么**的 `MissingArgument`（现实世界同形
+       * 报错：lobe-chat#6746「s3 为阿里云的对象存储」，结论同样是补 Content-MD5）。
+       * 本项目的 `deleteMultipleObject` 一直只发 `content-type`，故**所有**文件
+       * （含刚上传成功的）在任何走该厂商的桶上都删不掉，而同桶列举/上传/下载全正常。
+       *
+       * 两条变异各自有独立的可观测后果（不是同一条的重复）：
+       *  - R31-01 摘掉请求头 → 伪服务回 400 MissingArgument，整批抛错；
+       *  - R31-02 把 base64 换成 hex（值不对）→ 伪服务回 400 InvalidDigest。
+       *    这条专门证明护栏**校验的是值**而不是「有没有这个头」：只断言 presence
+       *    的护栏挡不住「随便写个常量」。
+       *
+       * 伪服务的期望值按 AWS/OSS 规范写死（自己算 base64(MD5)），**不引用**客户端
+       * 的任何片段；并带一条「缺头必须被拒」的自检，避免伪服务形同虚设（第 30 轮
+       * SAS 假绿即「期望值与实现同源」）。
+       */
+      name: 'R31-01a · 批量删除丢掉 Content-MD5（阿里云 OSS 回 MissingArgument，任何文件都删不掉）',
+      file: 'server/s3-client.js',
+      anchor: "          headers: {\n            'content-type': 'application/xml',\n            'content-md5': md5Base64Of(xmlBuf),\n          },\n          body: xmlBuf,",
+      replacement: "          headers: { 'content-type': 'application/xml' },\n          body: xml,",
+      testFile: 's3-client.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R31-01b · Content-MD5 用 hex 而非 base64（值不对 → 上游判 InvalidDigest）',
+      file: 'server/s3-client.js',
+      anchor: "            'content-md5': md5Base64Of(xmlBuf),",
+      replacement: "            'content-md5': crypto.createHash('md5').update(xmlBuf).digest('hex'),",
+      testFile: 's3-client.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R31-02 / R31-03：用户报障的第二件事 ——（设置页两张卡片）
+       * 「支付设置」「登录验证」填好信息保存成功后，若功能当前是**停用**状态，
+       * 应自动把状态置为启用。用户明确的两个前提：
+       *  ① 必须是**本次新填了**信息（不能「关了又被自动打开」，否则开关再也关不掉）；
+       *  ② 填写的信息必须**符合规则**（凭证完整）；
+       * 支付卡片只自动开**总开关**，不动渠道开关。
+       *
+       * 实现落在两处调用链上：
+       *  - `public/js/syssettings.js` 的 `saveCaptchaSettings()`（把 enabled 一并提交，
+       *    不额外发请求 ⇒ 不存在「已保存但启用失败」的半途状态）；
+       *  - `public/js/paysettings.js` 的 `doSave()`（保存成功后追加一次
+       *    `API.setPaymentEnabled(true)`；能否开由服务端 `paymentRules.checkGlobalToggle`
+       *    裁定，前端**不复刻**该规则 —— 复刻就成了同一个判据的第二个实现点）。
+       *
+       * 这三条闸门**每一条都对应一个会红的用例**（不是同一个断言的重复）：
+       *  - ② `typedNew`：R31-02b / R31-03a 摘掉后，「没填新信息时保存」那两条用例转红；
+       *  - ① 「保存前已是启用态」：R31-02a / R31-03b 摘掉后，可停用性用例转红；
+       *  - ③ 「凭证完整」：R31-02c / R31-03c 摘掉后，不完整凭证用例转红。
+       * 之所以要三条分立，是因为「护栏覆盖了 N 处」与「它真的打在那 N 处上」是两件事
+       * （R29-02b 的 `fail=0`、AZ-03 的「文件级红灯」都栽在这里）。
+       *
+       * 判据落在**真实调用链**上：测试用桩模块图在 Node 里 import 真实的
+       * syssettings.js / paysettings.js，用假 DOM 触发真实的保存点击，
+       * 断言「实际提交给服务端的 payload」。只断言源码字样的护栏挡不住
+       * 「闸门写反了 / 条件恒真」，也挡不住「自动启用根本没接到保存流程上」。
+       */
+      name: 'R31-02a · 登录验证自动启用不再要求「保存前是停用」（取消勾选保存也会被强行打开）',
+      file: 'public/js/syssettings.js',
+      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey && hasSecret;",
+      replacement: "  const autoEnable = !checked\n    && typedNew && !!siteKey && hasSecret;",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R31-02b · 登录验证自动启用不再要求「本次新填了信息」（只拨开关再保存就被打开）',
+      file: 'public/js/syssettings.js',
+      anchor: "    && typedNew && !!siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
+      replacement: "    && !!siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R31-02c · 登录验证自动启用不再要求「凭证完整」（只填站点密钥就被启用）',
+      file: 'public/js/syssettings.js',
+      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey && hasSecret;",
+      replacement: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey;",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1, // 实测 2（「只填站点密钥」与「早已配好密钥」两条一起红）；取 1 留余量
+    },
+    {
+      name: 'R31-03a · 支付自动启用不再要求「本次新填了信息」（没改任何字段保存也会开总开关）',
+      file: 'public/js/paysettings.js',
+      anchor: "    if (!globalEnabled && typedNew && r.complete) {",
+      replacement: "    if (!globalEnabled && r.complete) {",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R31-03b · 支付自动启用不再要求「总开关处于停用」（已开着也再切一次）',
+      file: 'public/js/paysettings.js',
+      anchor: "    if (!globalEnabled && typedNew && r.complete) {",
+      replacement: "    if (typedNew && r.complete) {",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R31-03c · 支付自动启用不再要求「凭证完整」（半配好就开总开关）',
+      file: 'public/js/paysettings.js',
+      anchor: "    if (!globalEnabled && typedNew && r.complete) {",
+      replacement: "    if (!globalEnabled && typedNew) {",
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

@@ -582,16 +582,42 @@ async function loadCaptcha() {
 async function saveCaptchaSettings() {
   const msg = document.getElementById('captcha-msg');
   const showMsg = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'form-msg show ' + cls; } };
-  const enabled = document.getElementById('captcha-enabled').checked;
+  const checked = document.getElementById('captcha-enabled').checked;
   const provider = chipValue('captcha-provider') || 'recaptcha';
   const siteKey = (document.getElementById('captcha-sitekey').value || '').trim();
   const secretKey = document.getElementById('captcha-secretkey').value || '';
   const timeoutMs = Number(document.getElementById('captcha-timeout').value) || 5000;
   const onError = chipValue('captcha-onerror') || 'block';
 
+  // 服务端密钥是否可用：本次填了新的，或此前已配置 / 环境变量注入
+  const hasSecret = !!secretKey || !!(captchaCfg && captchaCfg.hasSecret);
+
+  /**
+   * R31-02：保存成功后「自动启用」。
+   *
+   * 报障场景：功能本来是停用状态，管理员把站点密钥 / 服务端密钥填好、点「保存设置」——
+   * 旧行为只是把 enabled:false 原样再存一遍，功能依旧停用，而管理员以为「保存即生效」，
+   * 登录页其实仍无任何验证；必须再回来手动拨一次开关（很多人就此以为配置没生效）。
+   *
+   * 三个闸门**同时**满足才自动启用：
+   *  ① 保存前就是停用状态（`captchaCfg.enabled` 为假）—— 功能已在启用态时，
+   *     用户的任何操作都不该被我们改判；
+   *  ② 本次提交里用户**真的新填了信息**（站点密钥与已保存值不同，或填入了服务端密钥）——
+   *     这一条专门保护「手动停用后仍要保存别的改动」：只把开关拨到停用再点保存时
+   *     typedNew 为假，仍按停用提交，绝不会「关了又被自动打开」而再也停不下来；
+   *  ③ 凭证完整（站点密钥 + 服务端密钥都在）—— 与下面那段启用前校验同源，避免出现
+   *     「自动启用了一个必然不可用的配置」。
+   * 自动启用只作用在**本次提交的入参**上（把 enabled 一并提交），不额外发一次请求，
+   * 因此不会产生「已保存但启用失败」的半途状态。
+   */
+  const typedNew = siteKey !== String((captchaCfg && captchaCfg.siteKey) || '') || !!secretKey;
+  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)
+    && typedNew && !!siteKey && hasSecret;
+  const enabled = checked || autoEnable;
+
   if (enabled) {
     if (!siteKey) { showMsg('启用验证码需填写站点密钥（Site Key）', 'bad'); return; }
-    if (!secretKey && !(captchaCfg && captchaCfg.hasSecret)) {
+    if (!hasSecret) {
       showMsg('启用验证码需填写服务端密钥（Secret Key），或通过环境变量 CAPTCHA_SECRET_KEY 注入', 'bad');
       return;
     }
@@ -599,10 +625,13 @@ async function saveCaptchaSettings() {
 
   try {
     const r = await API.saveCaptchaConfig({ enabled, provider, siteKey, secretKey, timeoutMs, onError });
+    const autoEnabled = autoEnable && !!r.enabled;
     captchaCfg = r;
     renderCaptcha(r);
-    showMsg('验证码配置已保存', 'ok');
-    toast('验证码配置已保存，登录页下次进入时生效', { type: 'success' });
+    // 措辞只说「已把状态设为启用」，不承诺「登录页必然生效」：启停还可能被
+    // CAPTCHA_ENABLED 环境变量覆盖（卡片上「当前生效」一栏会如实显示该情况）。
+    showMsg(autoEnabled ? '验证码配置已保存，并已将状态设为启用' : '验证码配置已保存', 'ok');
+    toast(autoEnabled ? '验证码已保存并启用' : '验证码配置已保存，登录页下次进入时生效', { type: 'success' });
   } catch (e) {
     showMsg('保存失败：' + e.message, 'bad');
   }

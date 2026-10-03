@@ -346,8 +346,23 @@ async function doSave() {
   if (!currentId) return;
   const p = currentPlatform();
   setMsg('正在保存…', 'info');
+  const before = settings[currentId] || {};
+  const submitted = collectValues();
+  /**
+   * R31-03：本次提交里用户**真的新填了**信息吗？
+   *
+   * 敏感字段留空表示「保持原值不变」（见 `collectValues` / `fieldControl` 的占位提示），
+   * 非敏感字段会被 `renderForm` 预填。故只有「非空且与已保存值不同」才算新填。
+   *
+   * 这一条是下面「自动启用」的必要闸门：管理员只把总开关拨到停用、再点一次保存时
+   * typedNew 恒为假 ⇒ 读数仍按停用提交，不会出现「关了又被自动打开」而无法停用。
+   */
+  const typedNew = Object.keys(submitted).some((k) => {
+    const v = submitted[k];
+    return v !== '' && v !== String((before.values || {})[k] || '');
+  });
   try {
-    const r = await API.savePayment(currentId, collectValues());
+    const r = await API.savePayment(currentId, submitted);
     settings[currentId] = { values: r.values, configured: r.configured, complete: r.complete, enabled: !!r.enabled, available: !!r.available };
     updatedAt = r.updatedAt || updatedAt;
     clearErrors();
@@ -355,13 +370,50 @@ async function doSave() {
     renderChannelSwitch();
     renderStatus();
     const empty = !(r.configured && Object.values(r.configured).some(Boolean));
-    setMsg(
-      empty
-        ? '已清除该平台的凭证。'
-        : `已保存${p ? p.name : ''}凭证${r.complete ? '，必填项完整。' : '，仍有必填项未填写，可继续补充。'}`,
-      'ok',
-    );
-    toast('支付凭证已保存', { type: 'success' });
+    const baseMsg = empty
+      ? '已清除该平台的凭证。'
+      : `已保存${p ? p.name : ''}凭证${r.complete ? '，必填项完整' : '，仍有必填项未填写，可继续补充'}`;
+
+    /**
+     * R31-03：保存成功后若「本次新填了凭证 + 凭证完整 + 总开关处于停用」，则自动打开总开关。
+     *
+     * 报障场景：管理员填完某平台的凭证并保存，以为马上就能收款 —— 但总开关仍是停用，
+     * 所有付费链接照旧是免费下载，得再回来拨一次开关。
+     *
+     * 边界（刻意不动的东西）：
+     *  - **渠道开关不动**：那是管理员对「这个平台要不要收钱」的明确选择，不是本次填写的一部分；
+     *  - **不在前端复刻规则**：开关能不能开由服务端 `paymentRules.checkGlobalToggle` 裁定
+     *    （典型拒绝：一个渠道都没开 → 「请先启用至少一个支付渠道，再开启支付功能」）。
+     *    在这里再写一份判据就成了同一个规则的第二个实现点，两边迟早漂移；被拒时如实
+     *    展示服务端原话，并保住「凭证已保存」这一事实（保存本身是成功的）。
+     */
+    let autoEnabled = false;
+    let autoEnableError = '';
+    if (!globalEnabled && typedNew && r.complete) {
+      try {
+        const g = await API.setPaymentEnabled(true);
+        globalEnabled = !!g.enabled;
+        availableChannels = Array.isArray(g.availableChannels) ? g.availableChannels : [];
+        autoEnabled = globalEnabled;
+        renderGlobalSwitch();
+        renderTabs();
+        renderChannelSwitch();
+        renderStatus();
+      } catch (e) {
+        autoEnableError = (e && e.message) ? e.message : '未知原因';
+      }
+    }
+
+    if (autoEnabled) {
+      setMsg(baseMsg + '，并已自动启用支付功能。', 'ok');
+      toast('支付凭证已保存，并已自动启用支付功能', { type: 'success' });
+    } else if (autoEnableError) {
+      setMsg(`${baseMsg}；但自动启用支付功能未成功：${autoEnableError}`, 'bad');
+      toast(`凭证已保存，但自动启用支付功能未成功：${autoEnableError}`, { type: 'warn', duration: 6000 });
+    } else {
+      setMsg(baseMsg, 'ok');
+      toast('支付凭证已保存', { type: 'success' });
+    }
   } catch (e) {
     if (Array.isArray(e.errors)) {
       const n = applyErrors(e.errors);

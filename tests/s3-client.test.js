@@ -11,6 +11,7 @@
  */
 const test = require('node:test');
 const http = require('node:http');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const { PassThrough } = require('node:stream');
 
@@ -347,6 +348,90 @@ test('R23-01 putObject 响应体为空时，ETag 取响应头且 headers 回传�
     assertEqual(d.ETag, '"put-etag-42"', 'putObject 的 ETag 应取自响应头');
     assertEqual(d.headers.etag, '"put-etag-42"', 'headers 应回传真实响应头（不再恒为 {}）');
     assertEqual(d.headers['x-amz-version-id'], 'v1', 'headers 应保留额外响应头');
+  } finally {
+    await fake.close();
+  }
+});
+
+/* ============ R31-01：多对象删除必须带 Content-MD5 ============ */
+
+/**
+ * 伪「批量删除」端点 —— 判据**按协议写死**，不引用 s3-client 的任何片段：
+ *  - 缺 Content-MD5（且无 x-amz-checksum-*）→ 400 `<Code>MissingArgument</Code>`
+ *    `<Message>Missing Some Required Arguments.</Message>`
+ *    （报文与阿里云 OSS 的真实返回逐字一致，见 lobe-chat#6746）
+ *  - 带了但不是「消息体的 base64(MD5)」→ 400 `<Code>InvalidDigest</Code>`
+ *    （OSS 文档 DeleteMultipleObjects 错误码表：MD5 不一致返回 InvalidDigest）
+ *  - 其余 → 200 `<DeleteResult>`，按请求体里的 Key 逐个回 `<Deleted>`
+ *
+ * 之所以要按规范写死：若期望值与实现同源（照抄客户端的算法），验签/校验类用例
+ * 只能证明「自己和自己一致」，实现错了它照样全绿（第 30 轮 SAS 假绿即此型）。
+ */
+function fakeOssBatchDeleteHandler(req, res, body) {
+  const md5 = req.headers['content-md5'];
+  const checksum = req.headers['x-amz-checksum-crc32'] || req.headers['x-amz-checksum-sha256'];
+  if (!md5 && !checksum) {
+    res.writeHead(400, { 'Content-Type': 'application/xml' });
+    return res.end('<?xml version="1.0" encoding="UTF-8"?><Error>'
+      + '<Code>MissingArgument</Code>'
+      + '<Message>Missing Some Required Arguments.</Message>'
+      + '</Error>');
+  }
+  if (md5 !== crypto.createHash('md5').update(body).digest('base64')) {
+    res.writeHead(400, { 'Content-Type': 'application/xml' });
+    return res.end('<?xml version="1.0" encoding="UTF-8"?><Error>'
+      + '<Code>InvalidDigest</Code>'
+      + '<Message>The Content-MD5 you specified was invalid.</Message></Error>');
+  }
+  const keys = [...String(body).matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map((m) => m[1]);
+  res.writeHead(200, { 'Content-Type': 'application/xml' });
+  res.end('<?xml version="1.0" encoding="UTF-8"?><DeleteResult>'
+    + keys.map((k) => `<Deleted><Key>${k}</Key></Deleted>`).join('')
+    + '</DeleteResult>');
+}
+
+test('R31-01 deleteMultipleObject 必须带 Content-MD5（缺失时阿里云 OSS 回 MissingArgument，任何文件都删不掉）', async () => {
+  const fake = await startFakeS3(fakeOssBatchDeleteHandler);
+  const client = makeClient(fake.port);
+  try {
+    // ① 自检伪服务：确认它**真的**会因缺头而拒绝。否则下面的断言是假绿
+    //    （「假服务什么都不校验」正是第 30 轮 SAS 假绿的成因）。
+    const rejected = await new Promise((resolve) => {
+      const r = http.request({
+        host: '127.0.0.1', port: fake.port, path: '/s3/test-bucket?delete', method: 'POST',
+        headers: { 'content-type': 'application/xml' },
+      }, (resp) => {
+        let t = '';
+        resp.on('data', (c) => { t += c; });
+        resp.on('end', () => resolve({ status: resp.statusCode, body: t }));
+      });
+      r.end('<Delete><Quiet>false</Quiet><Object><Key>x</Key></Object></Delete>');
+    });
+    assertEqual(rejected.status, 400, '伪服务必须对「缺 Content-MD5」回 400，否则本用例无判据');
+    assert(/MissingArgument/.test(rejected.body), '伪服务应回 MissingArgument（与阿里云 OSS 真实报文一致）');
+
+    // ② 真实请求：修复后必须成功（缺头 → 上面那条 400 会把整批判失败）
+    const keys = ['docs/a.txt', 'docs/b c.txt', 'k&1.txt'];
+    const d = await new Promise((resolve, reject) => {
+      client.deleteMultipleObject({
+        Bucket: 'test-bucket', Region: 'us-east-1',
+        Objects: keys.map((Key) => ({ Key })),
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(Array.isArray(d.Deleted) && d.Deleted.length, 3, '三个对象都应被云端确认删除');
+    assertEqual(d.Error.length, 0, '不应有 Error 条目');
+    assertEqual(d.Deleted.map((x) => x.Key).sort().join(','), keys.slice().sort().join(','),
+      'Deleted 里的 Key 应与请求一致（含空格与 XML 转义字符）');
+
+    // ③ 值必须是「实际发出字节」的 base64(MD5)，而不是常量 / 别的编码
+    //    注意 calls 里还混着 ① 那条自检用的裸请求（它按设计不带该头），故按
+    //    「带 SigV4 Authorization 的那次」取，而不是写死下标。
+    const call = fake.calls.filter((c) => c.headers.authorization).pop();
+    assert(call, '应能取到客户端发出的那次请求');
+    assertEqual(call.method, 'POST', '批量删除应为 POST');
+    assertEqual(call.headers['content-md5'],
+      crypto.createHash('md5').update(call.body).digest('base64'),
+      'Content-MD5 必须是实际发出字节的 base64(MD5)（写常量或换编码都会被上游判 InvalidDigest）');
   } finally {
     await fake.close();
   }

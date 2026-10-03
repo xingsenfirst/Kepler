@@ -61,6 +61,32 @@ function sha256Hex(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+/**
+ * R31-01：请求体的 Content-MD5（base64）。
+ *
+ * 对象存储的「多对象删除」（`POST /<bucket>?delete`）**要求**携带该头：
+ *  - AWS S3 API 参考 DeleteObjects：「Content-MD5 header is required for all
+ *    Multi-Object Delete requests」（新版 SDK 亦改口接受 x-amz-checksum-…）。
+ *  - 阿里云 OSS DeleteMultipleObjects 的请求头表把 Content-MD5 标为**必选**，
+ *    并写明「上传了 Content-MD5 请求头后，OSS 会计算消息体的 Content-MD5
+ *    并检查一致性」；请求语法示例里 `Content-MD5: MD5Value` 是固定的一行。
+ *
+ * 缺失时的表现极具误导性：OSS 的 S3 兼容端点回
+ * `400 <Code>MissingArgument</Code><Message>Missing Some Required Arguments.</Message>`
+ * —— 报文里既不说缺哪个参数，也从不出现 Content-MD5 字样（现实世界同形报错见
+ * lobe-chat#6746，同样是「阿里云 OSS + 批量删除」）。上游文案经 `_send()` 的
+ * `${code}: ${message}` 与 `deleteMultipleConfirmed()` 原样冒泡到界面，用户看到的
+ * 就是「MissingArgument: Missing Some Required Arguments.」；**任何**文件都删不掉
+ * （含刚上传成功的），而同桶的列举 / 上传 / 下载全部正常 —— 极易被误判成
+ * 「权限不足」或「服务商不支持批量删除」，从而去轮换一把完全有效的密钥。
+ *
+ * 入参是 Buffer 且**直接用它当 body**：MD5 必须量在「实际发出去的字节」上，
+ * 而不是在某个中间字符串上（`_request()` 里 content-length 亦取自同一份 Buffer）。
+ */
+function md5Base64Of(buf) {
+  return crypto.createHash('md5').update(buf).digest('base64');
+}
+
 function hmac(key, data) {
   return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
 }
@@ -706,6 +732,10 @@ class S3Client {
    *
    * 修复后调用方仍应使用**白名单**判据（只处理明确出现在 `Deleted` 里的 key），
    * 两层一起保证「不确定的一律不动」。
+   *
+   * R31-01：请求**必须**带 `Content-MD5`（见 `md5Base64Of`）。协议要求它，
+   * 而缺失时阿里云 OSS 只回一句 `MissingArgument: Missing Some Required Arguments.`
+   * —— 不说是哪个参数，界面把这句话原样展示，用户无从下手。
    */
   deleteMultipleObject(params, cb) {
     return this._do(cb, async () => {
@@ -719,9 +749,18 @@ class S3Client {
           '<Delete><Quiet>false</Quiet>' +
           batch.map((o) => `<Object><Key>${escapeXml(o.Key)}</Key></Object>`).join('') +
           '</Delete>';
+        // R31-01：批量删除必须带 Content-MD5（缺则阿里云 OSS 回 MissingArgument，
+        // 任何文件都删不掉）。hash 与实际 body 用同一个 Buffer，保证量的是发出的字节。
+        // 注意 `multipartComplete` 的 `?uploadId` POST **不需要**该头（OSS 的
+        // CompleteMultipartUpload 请求头表里没有它），故不要顺手一起加。
+        const xmlBuf = Buffer.from(xml, 'utf8');
         const body = await this._send({
           method: 'POST', bucket, query: { delete: '' },
-          headers: { 'content-type': 'application/xml' }, body: xml,
+          headers: {
+            'content-type': 'application/xml',
+            'content-md5': md5Base64Of(xmlBuf),
+          },
+          body: xmlBuf,
         });
         for (const blk of tagAll(body, 'Deleted')) deleted.push({ Key: unescapeXml(tag(blk, 'Key')) });
         // R9-02：不丢弃 <Error>。Key/Code/Message 三者都取，调用方按 Key 定位、按

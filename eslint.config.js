@@ -220,6 +220,8 @@ module.exports = [
         TextEncoder: 'readonly',
         TextDecoder: 'readonly',
         globalThis: 'readonly',
+        // R30：测试里解析请求行 / 查询串会用到（Node 全局，与浏览器同名）
+        URLSearchParams: 'readonly',
       },
     },
     rules: Object.assign({}, COMMON_RULES, {

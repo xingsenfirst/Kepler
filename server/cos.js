@@ -11,6 +11,7 @@ const configStore = require('./config-store');
 const statsStore = require('./stats-store');
 const providers = require('./providers');
 const { S3Client } = require('./s3-client');
+const { AzureBlobClient } = require('./azure-client');
 const { assertSafeEndpoint } = require('./endpoint-guard');
 const { LIMITS, resolveCap } = require('./limits');
 const listCache = require('./list-cache');
@@ -35,10 +36,20 @@ function createClient(cfg) {
     err.status = 400;
     throw err;
   }
+  /**
+   * 端点来源（按优先级）：
+   *  ① 用户在密钥里显式填写的端点（走安全校验）；
+   *  ② 按地域推导的厂商默认端点（阿里云 / 华为云 / AWS / B2 …）；
+   *  ③ R30：由**账户名**推导（Azure —— 账户名进主机名，与「地域进主机名中段」是两回事，
+   *     见 providers.endpointForAccount）。`secretId` 就是账户名，因此不需要用户填两遍。
+   */
   const endpoint = String(cfg.endpoint || '').trim() ||
-    providers.endpointFor(pid, providers.regionFor(pid, cfg.region));
+    providers.endpointFor(pid, providers.regionFor(pid, cfg.region)) ||
+    providers.endpointForAccount(pid, cfg.secretId);
   // SEC-03：自定义端点必须先过安全校验（禁云元数据/回环/私网，非回环强制 https），
   // 否则可被用来让服务端替请求方访问内网或云实例元数据端点（盲 SSRF）。
+  // ⚠️ 由账户名推导出来的端点**天然只可能是合法主机**（账户名字符集在
+  // `endpointForAccount` 里收敛到 `^[a-z0-9]{3,24}$` + 固定域名后缀），故不必再校验。
   if (cfg.endpoint) assertSafeEndpoint(cfg.endpoint);
   if (meta.kind === 'cos') {
     // 腾讯云 SDK 的凭据字段名为 SecretId / SecretKey（非 AWS 的 accessKeyId / secretAccessKey）
@@ -50,6 +61,19 @@ function createClient(cfg) {
       ChunkRetryTimes: 2,
       // P6：避免网络异常时请求永久挂起（默认 120 秒，可用环境变量覆盖）
       Timeout: Number(process.env.COS_TIMEOUT_MS) || 120000,
+    });
+  }
+  if (meta.kind === 'azure') {
+    /**
+     * R30：Azure Blob —— 独立鉴权协议（Shared Key）+ Block Blob 语义，见 azure-client.js。
+     * `secretId` 即存储账户名、`secretKey` 即账户密钥；端点缺省由账户名推导。
+     * 地域（`defaultRegion: 'auto'`）不参与寻址与签名，仅为满足上层「地域非空」的既有约定。
+     */
+    return new AzureBlobClient({
+      accountName: cfg.secretId,
+      accountKey: cfg.secretKey,
+      endpoint, // 已按需推导过；用户显式填写时会被 azure-client 原样使用
+      bucket: cfg.bucket,
     });
   }
   if (!endpoint) {
@@ -418,12 +442,16 @@ function encodeCopyPath(key) {
  *
  * - S3 兼容厂商：`/bucket/key`（键需百分号编码）
  * - 腾讯云 COS：外链域名形式 `bucket.cos.<region>.myqcloud.com/key`
+ * - R30 Azure Blob：同样用 `/容器/键` 形式，由 `azure-client` 自己**拼成绝对 URL**
+ *   （Azure 的 Copy Source 必须是一个 URL，且只有客户端知道自己的账户名 / 端点）。
+ *   这里刻意不返回 URL：`copySource()` 的入参里没有端点与账户名，硬拼只能拼出
+ *   `https://<容器>.blob.core.windows.net/…` 这种**语法合法但不存在**的主机名。
  *
  * 历史上 fs-gateway.js 内曾硬编码 COS 外链域名形式，导致经网关（WebDAV / 部分文件操作）
  * 触发的复制在 S3 厂商上 CopySource 格式错误而失败，与 routes.js 行为不一致 —— 故统一到此。
  */
 function copySource(provider, bucket, region, key) {
-  if (providers.isS3(provider)) return `/${bucket}/${encodeCopyPath(key)}`;
+  if (providers.isS3(provider) || providers.isAzure(provider)) return `/${bucket}/${encodeCopyPath(key)}`;
   return `${bucket}.cos.${region}.myqcloud.com/${encodeCopyPath(key)}`;
 }
 

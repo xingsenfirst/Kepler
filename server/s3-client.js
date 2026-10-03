@@ -1039,5 +1039,8 @@ function escapeXml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-// R27-15：`normalizeDotSegments` 对外导出，供护栏直接断言「签名的路径 = 发出的路径」的规范化规则
-module.exports = { S3Client, uriEncode, normalizeDotSegments };
+/**
+ * R30：`tag` / `tagAll` / `unescapeXml` 一并导出 —— Azure 适配器（`azure-client.js`）
+ * 也要从 XML 响应里取字段，两套实现必然会漂移（尤其转义处理），故共用这一份。
+ */
+module.exports = { S3Client, uriEncode, normalizeDotSegments, tag, tagAll, unescapeXml };

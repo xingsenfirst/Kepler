@@ -219,11 +219,19 @@ function requireConfig() {
   return cfg;
 }
 
-/** 密钥格式校验：仅腾讯云 SecretId 有 AKID 前缀约定，其他服务商不做前缀限制 */
+/**
+ * 密钥格式校验：仅腾讯云 SecretId 有 AKID 前缀约定，其他服务商不做前缀限制。
+ * R30：Azure 例外 —— 它的 `secretId` 是**存储账户名**，会被拼进主机名，
+ * 因此必须当场收敛字符集（否则一个 `evil.com/x` 就能把出站请求引向任意主机）。
+ */
 function validateCredentialFormat(provider, secretId) {
   const pid = providers.get(provider) ? provider : providers.DEFAULT_PROVIDER_ID;
   if (providers.isCos(pid) && !/^AKID[\w-]+$/.test(secretId)) {
     return '访问密钥 ID 格式不正确（腾讯云的 SecretId 应以 AKID 开头）';
+  }
+  if (providers.accountEndpointTemplate(pid) && !providers.isValidAccount(pid, secretId)) {
+    return `${providers.nameOf(pid)} 的${providers.resolve(pid).credentialLabel.id}格式不正确`
+      + '（3–24 位小写字母或数字，例如 myaccount）';
   }
   return '';
 }

@@ -663,10 +663,8 @@ td.c-date, th.c-date { width: 150px; }
   box-shadow: inset 0 0 0 1px var(--accent); color: var(--accent);
 }
 .pv-picker .pv-opt:has(input:focus-visible) { box-shadow: 0 0 0 3px rgba(0, 103, 192, .2); }
-/* 尚未开放的厂商：保持可选但视觉弱化，由提示文案说明原因 */
-.pv-picker .pv-opt.pv-opt--planned .pv-name::after {
-  content: '（即将支持）'; display: block; font-size: 10px; color: #b45309;
-}
+/* R30：`pv-opt--planned`（「（即将支持）」角标）已随 Microsoft Azure 正式接入而移除 ——
+   全部登记厂商均可连接，再保留这条规则只会让「已支持」与「即将支持」的样式分叉。 */
 .pv-picker .pv-name { font-weight: 500; }
 
 /* ------------------------- 存储桶管理页 ------------------------- */

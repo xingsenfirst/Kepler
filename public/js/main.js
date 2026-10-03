@@ -111,6 +111,22 @@ export const App = {
       explorer.refresh();
     });
   },
+  /**
+   * R29-02：**只**重新拉取配置并刷新依赖它的界面（侧边栏桶列表 / 状态栏 / 读取 `App.state.config`
+   * 的卡片，例如存储桶弹窗里的密钥下拉）。
+   *
+   * 与 `onConfigChanged()` 的分工：本函数不动目录树与文件列表 —— 供「只改了展示字段」的写操作
+   * 使用（改密钥备注 / 可见性 / 自定义域名）；凡是可能改变**可浏览内容**的写操作（增删密钥、
+   * 启停或删除存储桶、清空桶）都必须走 `onConfigChanged()`。
+   *
+   * 为什么需要它：设置类写操作此前只刷新自己那张卡片，而侧边栏、状态栏与其它卡片读的是
+   * `App.state.config` 这份**快照** —— 于是「改完设置要按 F5 才正确」。这类缺口在
+   * `credmgr` / `bucketmgr` 上各有若干处，统一收敛到这两个入口，避免再逐处漏。
+   */
+  reloadConfig() {
+    storageCache = null; // 状态栏用量缓存随配置一起失效
+    return loadConfig(false);
+  },
   updateStatusbar: updateStatusbar,
 };
 

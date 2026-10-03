@@ -58,28 +58,91 @@ function qs(params) {
   return p.toString();
 }
 
-/** XHR 上传（支持进度回调；返回的 Promise 附加 .xhr 引用用于中止） */
+/**
+ * R29-01：上传的**停滞**判定阈值（区分两个阶段，理由见 `xhrPut`）。
+ *  - `UPLOAD_IDLE_MS`：还在发字节时的静默容忍 —— 60 秒一个字节都没发出去，基本可判链路已断；
+ *  - `UPLOAD_SERVER_WAIT_MS`：请求体已发完、等服务端确认 —— 服务端还要加密 / 上云 / 写元数据，
+ *    大文件上云本身就可能几分钟，故给足 10 分钟。
+ *
+ * 两个值都**不是**「上传总时长」上限（那会误杀慢链路）：只有**完全没有进展**才会触发。
+ */
+const UPLOAD_IDLE_MS = 60 * 1000;
+const UPLOAD_SERVER_WAIT_MS = 10 * 60 * 1000;
+
+/**
+ * XHR 上传（支持进度回调；返回的 Promise 附加 .xhr 引用用于中止）
+ *
+ * R29-01：这里补上了**停滞看门狗**。此前没有任何超时保护：只要服务端（或其背后的对象存储）
+ * 迟迟不返回，`xhr.onload` 就永远不触发，上传任务会**无限期停在「上传中」**——用户看到的是
+ * 「大文件卡住」，而文件可能早已落云（于是又表现为「刷新一下就有了」）。
+ * 现在按阶段看门狗：
+ *  - 发送阶段 60 秒无任何上传进度 → 判定链路停滞，abort 并给出可重试的错误；
+ *  - 请求体发完后的等待阶段给到 10 分钟 → 超时同样 abort（错误里说明是服务端未确认）。
+ * 停滞错误**不设 `aborted`**，因此 `uploadWithRetry` 会按既有策略重试两次，而不是直接失败。
+ */
 export function xhrPut(url, blob, onProgress) {
   const xhr = new XMLHttpRequest();
   const p = new Promise((resolve, reject) => {
+    let settled = false;
+    let stalled = false;
+    let bodySent = false;
+    let watchdog = null;
+    const clearWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null; } };
+    const armWatchdog = () => {
+      clearWatchdog();
+      watchdog = setTimeout(() => {
+        stalled = true;
+        // 触发 onabort → 下面的分支给出「停滞」错误（而不是「已中止」）
+        try { xhr.abort(); } catch (e) { /* ignore */ }
+      }, bodySent ? UPLOAD_SERVER_WAIT_MS : UPLOAD_IDLE_MS);
+    };
+    const settle = (fn, arg) => { if (settled) return; settled = true; clearWatchdog(); fn(arg); };
+
     xhr.open('PUT', url);
     xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
     xhr.responseType = 'json';
-    xhr.upload.onprogress = (e) => { if (onProgress) onProgress(e.loaded, e.total); };
-    xhr.onload = () => {
-      const d = xhr.response || {};
-      if (xhr.status >= 200 && xhr.status < 300) resolve(d);
-      else {
-        const err = new Error(d.error || `上传失败（HTTP ${xhr.status}）`);
-        err.status = xhr.status;
-        // R25：与 request() 同源 —— 直传（XHR）路径同样要能识别配额超限
-        if (d && d.code) err.code = d.code;
-        if (d && d.quota) err.quota = d.quota;
-        reject(err);
-      }
+    xhr.upload.onprogress = (e) => {
+      if (e && e.total && e.loaded >= e.total) bodySent = true;
+      armWatchdog();
+      if (onProgress) onProgress(e.loaded, e.total);
     };
-    xhr.onerror = () => reject(new Error('网络错误，上传中断'));
-    xhr.onabort = () => { const err = new Error('已中止'); err.aborted = true; reject(err); };
+    /**
+     * R29-01：`upload.onload` 是「请求体**已全部交给网络栈**」的权威信号 —— 小文件上
+     * `onprogress` 可能一次都不触发（浏览器会合并甚至省略），只靠它就会让进度条一直停在 0%
+     * 直到响应到达。这里补一次"已发完"的回调：既让界面切到「服务器处理中」，也让看门狗
+     * 从 60 秒档切到 10 分钟档（此后的等待属于服务端处理，不是链路停滞）。
+     */
+    xhr.upload.onload = () => {
+      bodySent = true;
+      armWatchdog();
+      const total = Number(blob && blob.size) || 0;
+      if (onProgress) onProgress(total, total);
+    };
+    xhr.onload = () => {
+      clearWatchdog();
+      const d = xhr.response || {};
+      if (xhr.status >= 200 && xhr.status < 300) return settle(resolve, d);
+      const err = new Error(d.error || `上传失败（HTTP ${xhr.status}）`);
+      err.status = xhr.status;
+      // R25：与 request() 同源 —— 直传（XHR）路径同样要能识别配额超限
+      if (d && d.code) err.code = d.code;
+      if (d && d.quota) err.quota = d.quota;
+      settle(reject, err);
+    };
+    xhr.onerror = () => settle(reject, new Error('网络错误，上传中断'));
+    xhr.onabort = () => {
+      if (stalled) {
+        const err = new Error(bodySent
+          ? '上传停滞：数据已发完但服务器长时间未确认（加密 / 上云可能耗时过长，或链路中断）'
+          : '上传停滞：持续 60 秒没有数据发出（链路中断或服务端未响应）');
+        err.stalled = true; // 不设 aborted：让上层按既有的重试策略再试
+        return settle(reject, err);
+      }
+      const err = new Error('已中止');
+      err.aborted = true;
+      settle(reject, err);
+    };
+    armWatchdog();
     xhr.send(blob);
   });
   p.xhr = xhr;

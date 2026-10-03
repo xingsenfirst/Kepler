@@ -116,6 +116,17 @@ function renderAddForm(box) {
   if (!isAdmin()) return;
   const wrap = document.createElement('div');
   wrap.className = 'cred-add';
+  /**
+   * R30：厂商选项不再追加 `pv-opt--planned`。
+   *
+   * 那个 class 是「（即将支持）」角标的**唯一挂钩点**（角标文字由
+   * `public/css/style.css` 的 `.pv-opt--planned .pv-name::after { content: … }` 生成）。
+   * Microsoft Azure 正式接入后，注册表里已不存在 `kind === 'planned'` 的厂商，
+   * 该样式规则也已随之删除 —— 保留这个钩子只会留下一个**永远为空的 class**：
+   * 将来真按 `planned` 登记一家新厂商时，界面上不会有任何提示，排查者却会以为
+   * 「角标逻辑还在，只是没生效」。故连同分支一起去掉；`kind` 仍是服务端注册表的
+   * 字段（前端的 `providerSupported()` 读它），只是不再影响这里的 DOM。
+   */
   wrap.innerHTML = `
     <div class="hr"></div>
     <div style="font-size:14px;font-weight:bold;color:var(--text-2);margin-bottom:8px">添加新密钥</div>
@@ -123,7 +134,7 @@ function renderAddForm(box) {
       <label>服务商<span class="req">*</span></label>
       <div class="pv-picker" role="radiogroup" aria-label="选择服务商">
         ${providerList().map((p) => `
-          <label class="pv-opt${p.kind === 'planned' ? ' pv-opt--planned' : ''}" title="${escapeHtml(p.name)}">
+          <label class="pv-opt" title="${escapeHtml(p.name)}">
             <input type="radio" name="cred-provider" value="${escapeHtml(p.id)}"${p.id === pickedProvider ? ' checked' : ''}>
             ${providerLogo(p.id, { size: 'lg' })}
             <span class="pv-name">${escapeHtml(p.name)}</span>
@@ -170,6 +181,8 @@ function renderAddForm(box) {
    *  - `endpointMode='template'`（Cloudflare R2）→ 用户填的是**账户 ID**，
    *    由服务端 `providers.composeEndpoint()` 拼成完整端点（前端只负责把原值送上去，
    *    绝不在这里拼 URL —— 拼装是唯一实现点，前端再拼一份就会与该实现分叉）；
+   *  - `endpointMode='optional'`（Microsoft Azure，R30）→ 端点默认由**存储账户名**推导，
+   *    该栏只是为「主权云 / 本地模拟器」留的覆盖口，因此渲染但**不加必填星号**；
    *  - 其余厂商端点由地域推导，**不渲染该栏**（隐藏时一并清空，避免残留值被提交）。
    * 标签文案里的「账户 ID / 服务端点」差异同样取自元数据（同源于服务端 registry）。
    */
@@ -187,11 +200,19 @@ function renderAddForm(box) {
     epItem.hidden = !mode;
     epInput.value = '';
     if (mode) {
+      // 只有 required / template 才加必填星号（optional 的端点栏是覆盖口，留空合法）
+      const required = mode === 'required' || mode === 'template';
       wrap.querySelector('#cred-endpoint-label').innerHTML =
-        `${escapeHtml(meta.endpointLabel || '服务端点')}<span class="req">*</span>`;
+        `${escapeHtml(meta.endpointLabel || '服务端点')}${required ? '<span class="req">*</span>' : ''}`;
       epInput.placeholder = meta.endpointPlaceholder || '';
       wrap.querySelector('#cred-endpoint-hint').textContent = meta.endpointHint || '';
     }
+  }
+
+  /** 该厂商是否**必须**填端点（optional 不算） */
+  function endpointIsRequired() {
+    const m = providerMeta(pickedProvider).endpointMode;
+    return m === 'required' || m === 'template';
   }
 
   /** 读取当前应当提交的服务端点：该栏未渲染时提交 undefined（服务端按「未传即保持」处理） */
@@ -211,7 +232,8 @@ function renderAddForm(box) {
     const skey = wrap.querySelector('#cred-skey').value.trim();
     if (!sid || !skey) return msg('请先填写访问密钥', 'bad');
     const endpoint = readEndpoint();
-    if (endpoint === '') return msg('请填写服务端点', 'bad');
+    // R30：端点栏分「必填」与「可选」两种（Azure 的端点默认由账户名推导，留空合法）
+    if (endpointIsRequired() && endpoint === '') return msg('请填写服务端点', 'bad');
     msg('正在验证…', 'info');
     try {
       const r = await API.verifyConfig({ provider: pickedProvider, secretId: sid, secretKey: skey, endpoint });
@@ -225,11 +247,18 @@ function renderAddForm(box) {
     const visibleToUsers = wrap.querySelector('#cred-visible').checked;
     if (!sid || !skey) return msg('请填写访问密钥', 'bad');
     const endpoint = readEndpoint();
-    if (endpoint === '') return msg('请填写服务端点', 'bad');
+    if (endpointIsRequired() && endpoint === '') return msg('请填写服务端点', 'bad');
     try {
       await API.addCredential({ provider: pickedProvider, secretId: sid, secretKey: skey, remark, visibleToUsers, endpoint });
       msg('✓ 密钥已加密保存并启用', 'ok');
       refresh();
+      /**
+       * R29-02：新增密钥会改变**全局**配置 —— 最典型的是「首次添加密钥」把 `configured`
+       * 从 false 翻成 true：侧边栏仍写着「请先在设置中配置访问密钥」、文件区也不发列举请求，
+       * 不按 F5 就一直不对。存储桶弹窗的「访问密钥」下拉同样读 `App.state.config`。
+       * 这里走**全局刷新**（配置 + 目录树 + 文件列表）。
+       */
+      App.onConfigChanged();
     } catch (e) { msg(e.message, 'bad'); }
   };
 }
@@ -240,6 +269,7 @@ async function toggleVisibility(cred) {
     await API.updateCredential(cred.id, { visibleToUsers: want });
     toast(`该密钥已${want ? '对普通用户可见' : '设为仅管理员可见'}`, { type: 'success' });
     refresh();
+    App.reloadConfig(); // R29-02：可见性存在全局配置快照里（仅刷新配置，不动文件列表）
   } catch (e) { toast('设置失败：' + e.message, { type: 'error' }); }
 }
 
@@ -258,6 +288,11 @@ async function toggleEnabled(cred, want) {
     toast(`密钥已${label}${!want ? '，同时设为仅管理员可见' : ''}`, { type: 'success' });
     App.refreshStorage();
     refresh();
+    /**
+     * R29-02：启停密钥会改变**生效配置**（服务端按「同厂商启用密钥」回退），因此
+     * 侧边栏桶列表、状态栏与文件区都必须重新取数 —— 单靠本卡片的 `refresh()` 不够。
+     */
+    App.onConfigChanged();
   } catch (e) { toast(`${label}失败：` + e.message, { type: 'error' }); }
 }
 
@@ -279,6 +314,8 @@ async function editRemark(cred) {
           close();
           toast('备注已更新', { type: 'success' });
           refresh();
+          // R29-02：备注名会出现在存储桶弹窗的密钥下拉里（`App.state.config.credentials`）
+          App.reloadConfig();
         } catch (e) { toast('保存失败：' + e.message, { type: 'error' }); }
       } },
     ],
@@ -296,6 +333,7 @@ async function deleteCredential(cred) {
     await API.deleteCredential(cred.id);
     toast('密钥已删除', { type: 'success' });
     refresh();
+    App.onConfigChanged(); // R29-02：删掉服务当前桶的那把密钥 → 生效配置随之改变
   } catch (e) { toast('删除失败：' + e.message, { type: 'error' }); }
 }
 
@@ -306,6 +344,7 @@ async function saveDomain() {
     await API.saveConfig({ domains: { primary: primary.trim(), backup: backup.trim() } });
     domainCache = { primary: primary.trim(), backup: backup.trim() };
     toast('自定义域名已保存', { type: 'success' });
+    App.reloadConfig(); // R29-02：域名同样在全局配置快照里（影响站点地址 / rpId 的展示）
   } catch (e) {
     toast('保存失败：' + e.message, { type: 'error' });
   }

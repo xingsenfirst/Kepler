@@ -101,7 +101,7 @@ const SHAPES = {
 };
 
 /** 界面展示顺序（与 server/providers.js 保持一致） */
-const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'gcs', 'r2', 'minio', 'b2', 'azure'];
+const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'azure', 'aws', 'gcs', 'r2', 'minio', 'b2'];
 
 /**
  * 各厂商在界面上的元数据
@@ -211,13 +211,19 @@ export const PROVIDER_META = {
     regionHint: 'Backblaze B2 的 S3 端点地域段，如 us-west-004（在桶详情页的 Endpoint 中可见）',
   },
   azure: {
-    id: 'azure', name: 'Microsoft Azure', shortName: 'Blob', kind: 'planned',
+    id: 'azure', name: 'Microsoft Azure', shortName: 'Blob', kind: 'azure',
 
     regionRequired: false,
-    idLabel: '账户名称', keyLabel: '账户密钥', idPlaceholder: '请输入存储账户名称',
-    hint: 'Azure Blob 采用独立的鉴权协议，当前版本尚未开放。',
-    regionPlaceholder: '',
-    regionHint: 'Azure Blob 采用独立的鉴权协议，当前版本尚未开放',
+    idLabel: '存储账户名称', keyLabel: '存储账户密钥', idPlaceholder: '例如 myaccount（仅小写字母与数字，3–24 位）',
+    hint: 'Microsoft Azure Blob Storage，使用独立的 Shared Key 鉴权；'
+      + '填「存储账户名称」与「存储账户密钥」即可，端点由账户名自动推导。',
+    regionPlaceholder: '固定 auto（可留空）',
+    regionHint: 'Azure Blob 不按地域寻址（端点由存储账户名决定），固定使用 auto，通常无需修改',
+    endpointMode: 'optional',
+    endpointLabel: '服务端点（可选）',
+    endpointPlaceholder: '留空即用 https://<存储账户名>.blob.core.windows.net',
+    endpointHint: '仅在使用主权云（如 Azure 中国）或本地模拟器（Azurite）时才需要填写；'
+      + '常规情况留空即可，系统会按存储账户名推导端点。',
   },
 };
 

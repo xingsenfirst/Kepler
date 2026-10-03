@@ -2624,8 +2624,10 @@ const CASES = [
     {
       name: 'R26-01 · 前端展示顺序漏掉新增厂商（与服务端注册表漂移）',
       file: 'public/js/provider-logos.js',
-      anchor: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'gcs', 'r2', 'minio', 'b2', 'azure'];",
-      replacement: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'minio', 'b2', 'azure'];",
+      // R30：Azure 正式接入后 ORDER 变为「又拍云 → Azure → AWS S3」，锚点随之更新；
+      // 变异语义不变（删掉一家 → 前端顺序与服务端注册表逐项比对必然错位）。
+      anchor: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'azure', 'aws', 'gcs', 'r2', 'minio', 'b2'];",
+      replacement: "const ORDER = ['tencent', 'aliyun', 'huawei', 'qiniu', 'upyun', 'aws', 'gcs', 'r2', 'minio', 'b2'];",
       testFile: 'audit26-regressions.test.js',
       minFail: 1,
     },
@@ -2967,6 +2969,179 @@ const CASES = [
       anchor: "  if (reason === 'unparsable') return '无法识别您的来源地址（反代未按模板转发 X-Forwarded-For，或该值非法），已拒绝访问';",
       replacement: "  if (reason === 'unparsable') return '您的 IP 已被管理员屏蔽';",
       testFile: 'audit28-regressions.test.js',
+      minFail: 1,
+    },
+    /* ============ R29 / R30 / AZ · Azure 接入 + 用户报告问题的修复 ============
+     *
+     * 第 29 轮（用户报告的两个运行期问题）与第 30 轮（Azure 接入）此前**只写了行为护栏、
+     * 没登记变异**（台账停在 233），这里连同第 30 轮缺陷检测（`AZ-01`~`AZ-05`）一并补登。
+     *
+     * ⚠️ Azure 这一组要绕开两类「改了也全绿」：
+     *  ① **假服务的期望值曾与实现同源**（SAS 规范资源一处照抄了客户端的错误形态）——
+     *     两侧共享同一假设时，验签只能证明自洽。现在假服务按官方规范写死期望值，
+     *     故 AZ-01 的变异是**真的**会红（这也是它当初能骗过 20 条用例的原因）。
+     *  ② **纵深防御的各层单独摘掉都不可观测**：块列表的「只发一页」与「按分片号去重」
+     *     互为兜底，任一层单独摘掉都不改变可观测结果 → R30-02 按**多步变异**登记
+     *     （一起退回旧实现：既多打一次请求，又把同一批分片重复累加）。
+     *
+     * ⚠️ 补登后逐条实跑，又逼出四处台账自身的问题（判据与修法都写在这里，别再踩）：
+     *  ① **变异必须自包含，不能只删一半**：AZ-03 最初只锚到 `if (!this._isGone(e)) throw e;`
+     *     那一行，替换后留下一个悬空的 `}` ⇒ 整个测试文件语法错误、以
+     *     `not ok 1 - tests\azure-client.test.js`（**文件级**）计入 fail。计数同样是 1，
+     *     `fail>=1` 被**巧合满足**而一条行为断言都没跑 —— 与 R7-07（搬源码撞 TDZ）同型。
+     *     判据：红的是**用例名**，还是文件本身？只看 `fail>=1` 看不出来，必须看名单。
+     *  ② **期望失败数要按实测写**：R30-02 / AZ-05 原本写 `minFail: 2`，实测各只有 1 条用例
+     *     能观测（两层防御的另一层在单页 / 同会话场景下无从触发）。写高了会把**正确**的
+     *     变异误判成失败，写低了才是真放过。
+     *  ③ **护栏可能被注释满足**：R29-02b 首跑 `fail=0`，追下去是 `audit29-regressions.test.js`
+     *     的 `src.slice(i, i + 900).includes('App.onConfigChanged(')` —— 而 `toggleBucketEnabled`
+     *     上方那段**说明注释里也有同样字样**，真调用被摘掉后注释照旧命中。判据改为只认
+     *     代码行（该文件里的 `codeLines()`）后正常变红。**这正是为什么每条护栏都要跑一次
+     *     反向变异**：护栏自称覆盖了 N 处，与它真的打在那 N 处上，是两件事。
+     */
+    {
+      name: 'R30-01 · 账户级请求（列容器）被误回退成默认容器（getService 打到 /容器?comp=list）',
+      file: 'server/azure-client.js',
+      anchor: "      return this.basePath || '/'; // 账户级请求：路径即根",
+      replacement: "      return this.basePath + '/' + encodeURIComponent(this.container); // 旧实现：误当成「用默认容器」",
+      testFile: 'azure-client.test.js',
+      minFail: 1,
+    },
+    {
+      // 多步变异：① 去掉按分片号去重；② 只要响应带游标就再取一次同一页（旧实现的 marker 循环
+      // 从未把 marker 送进请求，因此第二圈拿到的还是第一页）—— 合起来正是旧实现的可观测后果：
+      // 请求数 +1 且分片被重复累加（实测 [1,2,1,2]）。
+      name: 'R30-02 · Get Block List 被写成翻页循环（多打一次请求 + 同一批分片重复累加）',
+      file: 'server/azure-client.js',
+      mutations: [
+        {
+          anchor: "        if (!n || seen.has(n)) continue;\n        seen.add(n);",
+          replacement: "        if (!n) continue;",
+        },
+        {
+          anchor: "      const { text } = await this._request({\n        method: 'GET', bucket, key, query: { comp: 'blocklist', blocklisttype: 'uncommitted' },\n      });",
+          replacement: "      let { text } = await this._request({\n        method: 'GET', bucket, key, query: { comp: 'blocklist', blocklisttype: 'uncommitted' },\n      });\n"
+            + "      if (tag(text, 'NextMarker')) { // 旧实现：游标从未进入请求 ⇒ 再取一次仍是同一页\n"
+            + "        const again = await this._request({\n          method: 'GET', bucket, key, query: { comp: 'blocklist', blocklisttype: 'uncommitted' },\n        });\n"
+            + '        text += again.text;\n      }',
+        },
+      ],
+      testFile: 'azure-client.test.js',
+      minFail: 1, // 实测：只有「带游标」那条用例能观测到（无游标时单页，两层防御都无从触发）
+    },
+    {
+      name: 'AZ-01 · SAS 规范资源退回旧形态（缺 /blob 服务名、且用编码后的路径去签）',
+      file: 'server/azure-client.js',
+      anchor: "      const canonicalizedResource = `/blob/${this.accountName}/${bucket}`\n        + (key ? '/' + String(key) : '');",
+      replacement: "      const canonicalizedResource = `/${this.accountName}${path}`;",
+      testFile: 'azure-client.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'AZ-02 · 复制源 URL 硬编码公有云域名（主权云 / Azurite 下复制必然失败）',
+      file: 'server/azure-client.js',
+      anchor: "    return `${this.protocol}//${this.host}${this.basePath}${p}`;",
+      replacement: "    return `https://${this.accountName}.blob.core.windows.net${p}`;",
+      testFile: 'azure-client.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'AZ-03 · 单删退回「不存在即报错」（与 S3/COS 及本文件批删口径分叉）',
+      file: 'server/azure-client.js',
+      // ⚠️ 锚点必须**带上收尾的 `}`**。第一版只锚到 `if (!this._isGone(e)) throw e;` 那一行，
+      // 替换后留下一个孤立的 `}` ⇒ 整个 azure-client.test.js 变成语法错误、以
+      // `not ok 1 - tests\azure-client.test.js`（文件级）计入 fail —— 计数同样是 1，
+      // 「撤掉修复必须变红」被**巧合满足**，而实际上一条行为断言都没跑到。
+      // 这正是 R7-07 那类「变异把源码弄成另一件事」的坑（判据：看红的是**用例名**还是文件本身）。
+      anchor: "      try {\n        await this._request({ method: 'DELETE', bucket, key });\n      } catch (e) {\n"
+        + "        if (!this._isGone(e)) throw e; // 本就不存在 = 已达成删除（与 S3 / COS 的幂等语义一致）\n      }",
+      replacement: "      await this._request({ method: 'DELETE', bucket, key });",
+      testFile: 'azure-client.test.js',
+      minFail: 1,
+    },
+    {
+      // 旧实现用的是一个「宽容解码」助手（非法转义原样保留）。这里把两半都复现出来，
+      // 避免变异引入原实现没有的异常路径（那会让"进程因别的原因死掉"混进来）。
+      name: 'AZ-04 · 查询值在签名里被重复解码（键名含字面 %XX 时签名与实发不符 ⇒ 403）',
+      file: 'server/azure-client.js',
+      anchor: "    out += '\\n' + name.toLowerCase() + ':' + value;",
+      replacement: "    let decoded;\n    try { decoded = decodeURIComponent(String(value)); } catch (err) { decoded = String(value); }\n"
+        + "    out += '\\n' + name.toLowerCase() + ':' + decoded;",
+      testFile: 'azure-client.test.js',
+      minFail: 1,
+    },
+    {
+      // 旧实现不按会话过滤：Azure 的未提交块挂在目标对象上，他次会话遗留的块照样被当成进度。
+      // 判据取「提交结果里出现了外来的那个块」，而不是「块名长什么样」——后者改不动行为。
+      name: 'AZ-05 · 块列表不再按会话令牌过滤（采信上一次会话遗留的块）',
+      file: 'server/azure-client.js',
+      anchor: "        if (blockTokenIn(name) !== own) continue; // 他次会话的遗留块：不认，否则会跳过本应重传的分片",
+      replacement: "        // 旧实现不按会话过滤：他次会话的块照样被当成「已落云」的进度",
+      testFile: 'azure-client.test.js',
+      minFail: 1, // 实测：本文件里只有这条专属用例构造了「他次会话遗留的块」；同会话内续传照旧全绿
+    },
+    {
+      name: 'R29-01a · 上传停滞看门狗被摘掉（服务端不回应就永远停在「上传中」）',
+      file: 'public/js/api.js',
+      anchor: "    const armWatchdog = () => {\n      clearWatchdog();",
+      replacement: "    const armWatchdog = () => {\n      if (UPLOAD_IDLE_MS >= 0) return; // 旧实现：没有任何停滞保护（不 arm 定时器）\n      clearWatchdog();",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R29-01b · 停滞错误被标成 aborted（本该重试两次变成一次即失败）',
+      file: 'public/js/api.js',
+      anchor: "        err.stalled = true; // 不设 aborted：让上层按既有的重试策略再试",
+      replacement: "        err.stalled = true;\n        err.aborted = true; // 旧实现：标成 aborted ⇒ uploadWithRetry 直接放弃",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-01c · 进度条不再封顶 99%（请求体一发完就显示 100%，看起来就是「假死」）',
+      file: 'public/js/upload.js',
+      anchor: "  t.progress = t.size ? Math.min(99, (t.loaded / t.size) * 100) : 99;",
+      replacement: "  t.progress = t.size ? Math.min(100, (t.loaded / t.size) * 100) : 100;",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-01d · 丢掉「服务器处理中」相位（字节已发完却仍写「上传中」）',
+      file: 'public/js/upload.js',
+      anchor: "      if (t.state === 'uploading' && t.phase === 'processing') st[0] = '服务器处理中…';",
+      replacement: "      // 旧实现没有「服务器处理中」这一相位",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-01e · 上传成功后的界面刷新不再吞异常（业务成功却被改判成「失败」）',
+      file: 'public/js/upload.js',
+      anchor: "  try { App.refreshStorage && App.refreshStorage(); } catch (e) { /* 立即刷新状态栏存储用量 */ }",
+      replacement: "  App.refreshStorage && App.refreshStorage();",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-02a · 密钥可见性改完不再刷新全局配置（存储桶弹窗的密钥下拉读的是快照）',
+      file: 'public/js/credmgr.js',
+      anchor: "    await API.updateCredential(cred.id, { visibleToUsers: want });\n    toast(`该密钥已${want ? '对普通用户可见' : '设为仅管理员可见'}`, { type: 'success' });\n    refresh();\n    App.reloadConfig();",
+      replacement: "    await API.updateCredential(cred.id, { visibleToUsers: want });\n    toast(`该密钥已${want ? '对普通用户可见' : '设为仅管理员可见'}`, { type: 'success' });\n    refresh();",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-02b · 启停存储桶退回只派发 buckets-changed（侧边栏读的是快照，没人重新取数）',
+      file: 'public/js/bucketmgr.js',
+      anchor: "    App.onConfigChanged();\n  } catch (e) {\n    toast(`${label}失败：` + e.message, { type: 'error' });",
+      replacement: "    window.dispatchEvent(new CustomEvent('buckets-changed'));\n  } catch (e) {\n    toast(`${label}失败：` + e.message, { type: 'error' });",
+      testFile: 'audit29-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R29-02c · 清空桶 / 桶内容变动后不再走全局刷新（被删掉的文件仍留在文件列表里）',
+      file: 'public/js/bucketmgr.js',
+      anchor: "function afterBucketMutated(row) {\n  App.onConfigChanged();\n  if (row && row.active) App.refreshStorage();\n}",
+      replacement: "function afterBucketMutated(row) {\n  window.dispatchEvent(new CustomEvent('buckets-changed'));\n  if (row && row.active) { App.refreshStorage(); App.refresh(); }\n}",
+      testFile: 'audit29-regressions.test.js',
       minFail: 1,
     },
   ];

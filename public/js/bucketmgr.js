@@ -229,8 +229,16 @@ async function toggleBucketEnabled(row, want) {
   if (!ok) return;
   try {
     await API.toggleBucketEnabled(row.id, want);
-    toast(`存储桶已${label}${!want ? '，同时设为对普通用户不可见' : ''}`, { type: 'success' });
-    window.dispatchEvent(new CustomEvent('buckets-changed')); // 同步侧边栏/设置页，并触发本页刷新
+    toast(`存储桶已${label}${!want ? '，同时设为对普通用户可见性关闭' : ''}`, { type: 'success' });
+    /**
+     * R29-02：这里原来只 `dispatchEvent('buckets-changed')`，并注释说「同步侧边栏」——
+     * 但该事件的监听者只有 credmgr / bucketmgr 自己（各自重渲染本卡片），
+     * **侧边栏的桶列表由 main.js 渲染、读的是 `App.state.config` 快照**，没人重新取数。
+     * 于是刚停用的桶仍留在侧边栏里、且状态栏仍显示它 —— 必须按 F5 才正确。
+     * 改为走 `App.onConfigChanged()`（内部：loadConfig → 侧边栏/状态栏，再派发
+     * `buckets-changed` 让各卡片自行重渲染，且额外刷新目录树与文件列表）。
+     */
+    App.onConfigChanged();
   } catch (e) {
     toast(`${label}失败：` + e.message, { type: 'error' });
   }
@@ -291,9 +299,17 @@ function openNameConfirm({ title, html, bucket }) {
   });
 }
 
+/**
+ * 桶内容 / 启用态 / 可见性被改动后的统一收尾。
+ *
+ * R29-02：原来只派发 `buckets-changed` + （当前桶时）刷新用量，于是
+ * **清空当前桶之后文件列表仍是旧的**（被删掉的文件还挂在屏幕上，双击即报不存在），
+ * 侧边栏与状态栏也不会跟着更新。改走 `App.onConfigChanged()` —— 它一次性覆盖
+ * 配置快照 / 侧边栏 / 状态栏 / 目录树 / 文件列表，并顺带派发 `buckets-changed`。
+ */
 function afterBucketMutated(row) {
-  window.dispatchEvent(new CustomEvent('buckets-changed'));
-  if (row.active) { App.refreshStorage(); App.refresh(); }
+  App.onConfigChanged();
+  if (row && row.active) App.refreshStorage();
 }
 
 /* ------------------------------ 通用穿梭框组件 ------------------------------ */
@@ -473,6 +489,8 @@ async function openVisibilityDialog(_row) {
             toast(`已保存：${getSelected().length} 个桶对普通用户可见`, { type: 'success' });
             close();
             refresh();
+            // R29-02：可见性存在全局配置快照里（存储桶弹窗的「对普通用户可见」勾选框读它）
+            App.reloadConfig();
           } catch (e) {
             toast('保存失败：' + e.message, { type: 'error', duration: 6000 });
             if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存权限'; }

@@ -83,6 +83,46 @@ const PROVIDERS = [
     credentialLabel: { id: '操作员', key: '操作员密码', idPlaceholder: '请输入操作员名称' },
   },
   {
+    /**
+     * R30：**Microsoft Azure Blob Storage**（正式支持）。
+     *
+     * 与其它厂商的三处结构性差异，都体现在本条目里：
+     *  ① `kind: 'azure'` —— 用独立鉴权协议（Shared Key）与独立 REST 接口，
+     *     客户端由 `cos.js` 分派到 `azure-client.js`；
+     *  ② 端点由**存储账户名**决定（`https://<账户名>.blob.core.windows.net`），
+     *     与 R2 的「账户 ID 进主机名」同型，但账户名同时是**鉴权身份**（即 `secretId`），
+     *     因此不再让用户重复填一遍端点 —— 组装见 {@link endpointForAccount}；
+     *  ③ 没有「地域」概念（端点里不含地域），故 `regionRequired: false` +
+     *     `defaultRegion: 'auto'`：与 GCS / R2 同样是「填了等价于没填」，
+     *     界面上可留空、服务端补 auto，避免空串流到需要地域的地方。
+     *
+     * `endpointMode: 'optional'`：常规情况端点由账户名推导，**但**主权云
+     * （Azure 中国 `blob.core.chinacloudapi.cn`、US Gov）与本地模拟器（Azurite）
+     * 的域名不同，必须允许用户显式覆盖 —— 该栏可选填，填了就走端点守卫校验。
+     */
+    id: 'azure',
+    name: 'Microsoft Azure',
+    shortName: 'Blob',
+    kind: 'azure',
+    endpoint: '',
+    accountEndpointTemplate: 'https://{account}.blob.core.windows.net',
+    accountPattern: '^[a-z0-9]{3,24}$',
+    defaultRegion: 'auto',
+    regionRequired: false,
+    regionPlaceholder: '固定 auto（可留空）',
+    regionHint: 'Azure Blob 不按地域寻址（端点由存储账户名决定），固定使用 auto，通常无需修改',
+    endpointMode: 'optional',
+    endpointLabel: '服务端点（可选）',
+    endpointPlaceholder: '留空即用 https://<存储账户名>.blob.core.windows.net',
+    endpointHint: '仅在使用主权云（如 Azure 中国）或本地模拟器（Azurite）时才需要填写；'
+      + '常规情况留空即可，系统会按存储账户名推导端点。',
+    credentialLabel: {
+      id: '存储账户名称',
+      key: '存储账户密钥',
+      idPlaceholder: '例如 myaccount（仅小写字母与数字，3–24 位）',
+    },
+  },
+  {
     id: 'aws',
     name: 'AWS S3',
     shortName: 'S3',
@@ -176,17 +216,6 @@ const PROVIDERS = [
       idPlaceholder: '请输入 application key ID',
     },
   },
-  {
-    id: 'azure',
-    name: 'Microsoft Azure',
-    shortName: 'Blob',
-    kind: 'planned',
-    endpoint: '',
-    regionRequired: false,
-    regionPlaceholder: '',
-    regionHint: 'Azure Blob 采用独立的鉴权协议，当前版本尚未开放',
-    credentialLabel: { id: '账户名称', key: '账户密钥', idPlaceholder: '请输入存储账户名称' },
-  },
 ];
 
 const byId = new Map(PROVIDERS.map((p) => [p.id, p]));
@@ -230,6 +259,62 @@ function isS3(id) {
   return resolve(id).kind === 's3';
 }
 
+/** 该厂商是否为 Azure Blob（独立鉴权协议 + Block Blob 语义） */
+function isAzure(id) {
+  return resolve(id).kind === 'azure';
+}
+
+/**
+ * R30：该厂商的端点是否由**账户名**推导（Azure）。
+ *
+ * 与 S3 那套「地域进主机名中段」的推导是两件不同的事：这里的账户名既进主机名
+ * 又是鉴权身份（`secretId`），因此不能复用 `endpointFor()`（它只吃 region）。
+ */
+function accountEndpointTemplate(id) {
+  return resolve(id).accountEndpointTemplate || '';
+}
+
+/** 账户名是否合法（规则由厂商元数据给出；未登记规则的厂商恒为 false） */
+function isValidAccount(id, account) {
+  const pattern = resolve(id).accountPattern;
+  if (!pattern) return false;
+  try {
+    return new RegExp(pattern).test(String(account == null ? '' : account).trim().toLowerCase());
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 由账户名推导端点（唯一实现点）。
+ *
+ * 为什么必须在这里校验账户名：它会**直接拼进主机名**，是不折不扣的不可信输入。
+ * 放行 `evil.com/x` 这类值就等于把出站请求引向任意主机（盲 SSRF）。因此字符集
+ * 收敛到厂商登记的 `accountPattern`（Azure 为 `^[a-z0-9]{3,24}$`），拼出来的端点
+ * 天然只可能是 `https://<合法账户名>.blob.core.windows.net`。
+ *
+ * @param {string} id 厂商 id
+ * @param {string} account 账户名（未登记的厂商返回空串）
+ * @returns {string} 形如 https://myaccount.blob.core.windows.net；不适用时为空串
+ * @throws {Error} status=400 账户名缺失或非法
+ */
+function endpointForAccount(id, account) {
+  const tpl = accountEndpointTemplate(id);
+  if (!tpl) return '';
+  const raw = String(account == null ? '' : account).trim();
+  if (!raw) {
+    const err = new Error('缺少存储账户名称，无法确定服务端点');
+    err.status = 400;
+    throw err;
+  }
+  if (!isValidAccount(id, raw)) {
+    const err = new Error(`存储账户名称格式不正确（应为 3–24 位小写字母或数字）：${raw}`);
+    err.status = 400;
+    throw err;
+  }
+  return tpl.replace('{account}', raw.toLowerCase());
+}
+
 /**
  * 该厂商是否强制**路径风格**寻址（`https://host/bucket/key`）。
  *
@@ -250,6 +335,10 @@ function forcePathStyle(id) {
  * 两者是同一件事 —— 「这条密钥没有用户提供的端点就不完整」，而具体填什么由
  * `endpointLabel` / `endpointPlaceholder` 描述。若只认 `'required'`，
  * R2 的记录会被判为「端点可选」，从而允许一条**永远连不上**的密钥落库。
+ *
+ * R30 新增的 `'optional'`（Azure）**不算**「要用户填」：它的端点默认由账户名推导
+ * （见 {@link endpointForAccount}），端点栏只是为「主权云 / 本地模拟器」留的覆盖口。
+ * 因此这里刻意**不**把它计入 —— 计入会让一条完全正确的 Azure 密钥被判为不完整。
  */
 function endpointRequired(id) {
   const m = resolve(id).endpointMode;
@@ -360,6 +449,8 @@ function safeRegion(region) {
 
 module.exports = {
   PROVIDERS, DEFAULT_PROVIDER_ID,
-  list, get, resolve, isSupported, nameOf, isCos, isS3, endpointFor,
+  list, get, resolve, isSupported, nameOf, isCos, isS3, isAzure, endpointFor,
   forcePathStyle, endpointRequired, regionFor, composeEndpoint,
+  // R30：由账户名推导端点（Azure）—— 唯一实现点，含账户名字符集校验
+  accountEndpointTemplate, isValidAccount, endpointForAccount,
 };

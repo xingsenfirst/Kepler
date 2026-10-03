@@ -167,6 +167,8 @@ export const uploadMgr = {
         waiting: ['等待中', ''], uploading: ['上传中', ''], paused: ['已暂停', ''],
         done: ['已完成', 'ok'], failed: ['失败：' + escapeHtml(t.error || ''), 'bad'], canceled: ['已取消', ''],
       }[t.state] || ['', ''];
+      // R29-01：字节已全部发出、等服务端确认时明确告知 —— 否则进度条停在 99% 会被当成"卡死"
+      if (t.state === 'uploading' && t.phase === 'processing') st[0] = '服务器处理中…';
       const actions = [];
       if (t.state === 'uploading') actions.push(`<button class="icon-btn small" data-act="pause" data-id="${t.id}" title="暂停">${window.__SVG.pause}</button>`);
       if (t.state === 'paused') actions.push(`<button class="icon-btn small" data-act="resume" data-id="${t.id}" title="继续">${window.__SVG.play}</button>`);
@@ -222,6 +224,7 @@ function pump() {
   const running = tasks.filter((t) => t.state === 'uploading').length;
   waiting.slice(0, Math.max(0, MAX_FILE_CONCURRENCY - running)).forEach((t) => {
     t.state = 'uploading';
+    t.phase = 'sending'; // R29-01：新任务从"发送中"相位开始（见 updateProgress）
     runTask(t).catch((e) => {
       if (!t.canceled && !t.paused) {
         t.state = 'failed';
@@ -235,11 +238,16 @@ function pump() {
           toast(`上传失败：${t.key}（${t.error}）`, { type: 'error' });
         }
       }
-      uploadMgr.render();
+      safeRender();
       pump();
     });
   });
-  uploadMgr.render();
+  safeRender();
+}
+
+/** R29-01：渲染失败不得影响上传状态机（否则一次 DOM 异常会把成功的任务标成失败） */
+function safeRender() {
+  try { uploadMgr.render(); } catch (e) { /* ignore */ }
 }
 
 async function runTask(t) {
@@ -305,15 +313,27 @@ async function runTask(t) {
     );
     if (t.canceled) return;
     if (results.includes('paused')) { t.state = 'paused'; uploadMgr.render(); return; }
+    // R29-01：所有分片都传完，但**合并是在云端做的**（大文件上云合并可能耗时数十秒），
+    // 这里显式进入「服务器处理中」相位，避免进度条在等待期间毫无变化。
+    t.phase = 'processing';
+    uploadMgr.render();
     await API.uploadComplete(t.sessionId);
     t.sessionId = '';
   }
+  /**
+   * R29-01：上传**已经成功**，后续的界面刷新即使出错也绝不能把它改判成「失败」。
+   *
+   * 旧实现里 `uploadMgr.render()` / `App.refreshStorage()` / `notifyCurrentPrefix()`
+   * 任一抛错都会被 `pump()` 的 catch 接住并把任务标成 failed —— 而文件其实已经落云，
+   * 用户看到「上传失败」只能靠刷新页面确认，属于「业务成功、界面谎报失败」。
+   */
   t.state = 'done';
+  t.phase = 'done';
   t.progress = 100;
   t.loaded = t.size;
-  uploadMgr.render();
-  App.refreshStorage && App.refreshStorage(); // 立即刷新状态栏存储用量
-  notifyCurrentPrefix(t.prefix);
+  try { uploadMgr.render(); } catch (e) { /* 渲染失败不影响"已上传成功"这一事实 */ }
+  try { App.refreshStorage && App.refreshStorage(); } catch (e) { /* 立即刷新状态栏存储用量 */ }
+  try { notifyCurrentPrefix(t.prefix); } catch (e) { /* 刷新文件列表 */ }
   pump();
 }
 
@@ -353,7 +373,17 @@ function updateProgress(t, doneBytes, partProgress) {
   let extra = 0;
   if (partProgress) for (const v of partProgress.values()) extra += v;
   t.loaded = doneBytes + extra;
-  t.progress = t.size ? Math.min(100, (t.loaded / t.size) * 100) : 100;
+  /**
+   * R29-01：把「正在发送」与「服务器处理中」区分开。
+   *
+   * 旧实现里进度条 = 已发送 / 总大小，于是**请求体一发完就是 100%**，而服务端还要加密、
+   * 上云、写元数据（大文件上云可能几十秒到几分钟）—— 这段时间进度条定格在 100%、状态仍写着
+   * 「上传中」，看起来完全就是"假死"（用户以为没传完，其实字节早就交出去了）。
+   * 现在：发送阶段最多 99%，字节全部交出后状态改显示「服务器处理中…」，收到响应才置 100%。
+   */
+  const sentAll = t.size > 0 ? t.loaded >= t.size : true;
+  t.phase = sentAll ? 'processing' : 'sending';
+  t.progress = t.size ? Math.min(99, (t.loaded / t.size) * 100) : 99;
   const now = Date.now();
   const dt = (now - t._speedTime) / 1000;
   if (dt > 0.4) {

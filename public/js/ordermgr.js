@@ -10,6 +10,8 @@ function wire() {
   wired = true;
   const btn = document.getElementById('btn-orders-refresh');
   if (btn) btn.onclick = () => refresh();
+  const clean = document.getElementById('btn-orders-clean');
+  if (clean) clean.onclick = () => removeFailedOrders();
 }
 
 const STATUS_META = {
@@ -185,6 +187,36 @@ async function refund(o) {
     refresh();
   } catch (e) {
     toast('操作失败：' + e.message, { type: 'error' });
+  }
+}
+
+/**
+ * 删除全部「支付失败」的订单。
+ *
+ * 二次确认里带上**当前列表里待删的条数**，并且条数为 0 时也照常询问 ——
+ * 按钮的可见后果必须可预期。不做「点一下什么都不发生」的静默分支：
+ * 那会让管理员分不清是「确实没有可删的」还是「按钮坏了 / 请求没发出去」。
+ *
+ * 待删条数只是**展示用**的估算（基于本地缓存），真正的删改由服务端按
+ * `paymentOrders.removeFailed()` 的判据执行，回包里的 `removed` 才是实际删除数。
+ */
+async function removeFailedOrders() {
+  const n = ordersCache.filter((o) => o.status === 'failed').length;
+  const ok = await confirmDialog({ allowHtml: true,
+    title: '删除失效订单',
+    message: `确定删除全部处于 <b>支付失败</b> 状态的订单吗？<br><br>`
+      + `<span style="color:var(--text-2)">当前列表中共 <b>${n}</b> 笔；仅删除本地订单记录，`
+      + `「已支付」「已退款」以及仍在支付中的订单不受影响。</span>`,
+    okText: '删除', danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await API.deleteFailedOrders();
+    const removed = (r && Number(r.removed)) || 0;
+    toast(removed ? `已删除 ${removed} 笔失效订单` : '没有需要删除的失效订单', { type: 'success' });
+    refresh();
+  } catch (e) {
+    toast('删除失败：' + e.message, { type: 'error' });
   }
 }
 

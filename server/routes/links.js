@@ -147,6 +147,32 @@ router.put('/links/:id', async (req, res) => {
   }
 });
 
+/**
+ * 删除全部失效链接（「文件已删除」与「已过期」）—— 链接管理页的「删除失效链接」按钮。
+ *
+ * ⚠️ **必须注册在 `DELETE /links/:id` 之前**：express 按注册顺序匹配，若放在参数路由
+ * 后面，路径里的 `dead` 会被 `:id` 当成一个链接 id 吞掉 —— 请求永远到不了这里，
+ * 界面上表现为「点了按钮提示『链接不存在』」，而路由表里两条路径看起来都在。
+ *
+ * 作用域与列表接口一致（`shareStore.removeDead` 内部用 `canManage`），**不挂 requireAdmin**：
+ * 链接管理页普通用户也能进，每个人只清自己创建的那批。
+ *
+ * 哪些算「失效」由 `shareStore.removeDead()` 裁定（与 `status()` 同源），本路由不判。
+ */
+router.delete('/links/dead', (req, res) => {
+  const role = roleOf(req);
+  const who = (req.authUser && req.authUser.username) || '';
+  const removed = shareStore.removeDead(role, who);
+  if (removed > 0) {
+    statsStore.addLog({
+      action: 'share.delete',
+      level: 'warn',
+      detail: `「${who}」删除失效分享链接 ${removed} 条（文件已删除 / 已过期）`,
+    });
+  }
+  res.json({ ok: true, removed });
+});
+
 // 删除链接（仅删除本地分享记录，不影响云端对象；普通用户仅限自己创建的）
 router.delete('/links/:id', (req, res) => {
   const target = shareStore.get(req.params.id);

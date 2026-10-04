@@ -3266,6 +3266,123 @@ const CASES = [
       testFile: 'audit31-regressions.test.js',
       minFail: 1,
     },
+    {
+      /**
+       * R32-01 / R32-02：两个新增的批量清理按钮。
+       *
+       * 需求：① 订单管理加「删除失效订单」（清掉全部**支付失败**的订单）；
+       * ② 链接管理加「删除失效链接」（清掉**文件已删除**与**已过期**的链接）。
+       *
+       * 这一轮最容易做错的地方全都不是「功能有没有写」，而是**边界**：
+       *  - 订单那边有个现成的 `isProtected()`，顺手写成「删掉所有可裁流水」就会连
+       *    **超出支付窗口的 pending** 一起清 —— 那是「付款者可能正在收银台上」的灰色地带
+       *    （R14-03），自动裁剪按容量兜住即可，不该由一次人工点击静默清掉；
+       *  - 链接那边「已关闭」（下载次数用尽）是**可逆**状态（调大次数即可复活），
+       *    一旦被当成失效删掉就不可逆了；
+       *  - 链接管理页**普通用户也能进**，作用域必须靠 `canManage` 隔离，不能照抄
+       *    订单那边「反正调用方是管理员」的前提（那边挂了 requireAdmin，这边**不能挂**）；
+       *  - 新增的 `DELETE /links/dead` 与既有参数路由 `DELETE /links/:id` 同前缀，
+       *    注册顺序反了就会被参数路由吞掉 —— 而路由表里两条路径看起来都在。
+       *
+       * 九条变异各自瞄准一个独立的落点（`fail>=minFail` 只能说明「有东西红了」，
+       * 所以每条的期望都是「至少一条、且必须包含它指名的那个用例」）：
+       *  - R32-01a 判据放宽成 `!isProtected` → 超窗 pending 被删；
+       *  - R32-01b 去掉 `persist()` → 重启后失效订单整批复活；
+       *  - R32-01c 路由丢掉 requireAdmin → 普通用户可批量删流水；
+       *  - R32-01d 前端漏接线 → 按钮点了没有任何请求；
+       *  - R32-02a 服务端把 exhausted 当失效 → 可逆状态被不可逆地删掉；
+       *  - R32-02b 服务端丢掉作用域 → 普通用户越权删别人的链接；
+       *  - R32-02c 路由注册在 /links/:id 之后 → dead 被参数路由吞掉；
+       *  - R32-02d 前端 DEAD_STATUS 多收 exhausted → 界面承诺的条数与实际删除数不符；
+       *  - R32-02e 前端漏接线 → 按钮点了没有任何请求。
+       */
+      name: 'R32-01a · 删除失效订单的判据放宽成「所有可裁流水」（超窗 pending 被一并清掉）',
+      file: 'server/payment-orders.js',
+      anchor: "  const victims = all.filter((o) => o.status === 'failed' && !isProtected(o, now));",
+      replacement: '  const victims = all.filter((o) => !isProtected(o, now));',
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-01b · 删除失效订单后不落盘（只改内存，重启后失效订单整批复活）',
+      file: 'server/payment-orders.js',
+      anchor: '  persist();\n  return victims.length;',
+      replacement: '  return victims.length;',
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-01c · 批量删除订单的路由漏挂 requireAdmin（普通用户可清空订单流水）',
+      file: 'server/routes/payment.js',
+      anchor: "router.delete('/payment/orders/failed', requireAdmin, (req, res) => {",
+      replacement: "router.delete('/payment/orders/failed', (req, res) => {",
+      testFile: 'routes-surface.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-01d · 前端「删除失效订单」按钮没接上线（点了不发任何请求）',
+      file: 'public/js/ordermgr.js',
+      anchor: "  const clean = document.getElementById('btn-orders-clean');\n  if (clean) clean.onclick = () => removeFailedOrders();",
+      replacement: '  // （按钮未接线）',
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-02a · 服务端把「已关闭」也当成失效链接删掉（可逆状态被不可逆地清除）',
+      file: 'server/share-store.js',
+      anchor: "    if (st !== 'deleted' && st !== 'expired') continue;",
+      replacement: "    if (st !== 'deleted' && st !== 'expired' && st !== 'exhausted') continue;",
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-02b · 删除失效链接丢掉作用域判定（普通用户可删别人创建的链接）',
+      file: 'server/share-store.js',
+      anchor: "    if (!canManage(l, role, username)) continue;\n    links.splice(i, 1);",
+      replacement: '    links.splice(i, 1);',
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 顺序类缺陷的**唯一**可观测后果：把注册动作挪到 `DELETE /links/:id` 之后，
+       * 路径里的 `dead` 就会被 `:id` 当成链接 id 吞掉。此时路由表里两条路径**都还在**、
+       * 「无路由丢失」「路由总数」照样全绿 —— 只有真发请求才暴露。
+       * 因此这里用两步变异（先摘掉、再追加到文件末尾）真实还原「注册顺序反了」。
+       *
+       * 锚点里含 `${who}` 与反引号，故**必须**用双引号字符串书写（模板串会把它当插值）。
+       */
+      name: 'R32-02c · 失效链接路由注册在 /links/:id 之后（dead 被参数路由吞掉，按钮点了只提示「链接不存在」）',
+      file: 'server/routes/links.js',
+      mutations: [
+        {
+          anchor: "router.delete('/links/dead', (req, res) => {\n  const role = roleOf(req);\n  const who = (req.authUser && req.authUser.username) || '';\n  const removed = shareStore.removeDead(role, who);\n  if (removed > 0) {\n    statsStore.addLog({\n      action: 'share.delete',\n      level: 'warn',\n      detail: `「${who}」删除失效分享链接 ${removed} 条（文件已删除 / 已过期）`,\n    });\n  }\n  res.json({ ok: true, removed });\n});\n\n",
+          replacement: '',
+        },
+        {
+          anchor: '\nmodule.exports = router;',
+          replacement: "\nrouter.delete('/links/dead', (req, res) => {\n  const role = roleOf(req);\n  const who = (req.authUser && req.authUser.username) || '';\n  const removed = shareStore.removeDead(role, who);\n  if (removed > 0) {\n    statsStore.addLog({\n      action: 'share.delete',\n      level: 'warn',\n      detail: `「${who}」删除失效分享链接 ${removed} 条（文件已删除 / 已过期）`,\n    });\n  }\n  res.json({ ok: true, removed });\n});\n\nmodule.exports = router;",
+        },
+      ],
+      testFile: 'routes-surface.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-02d · 前端「失效」集合多收「已关闭」（界面承诺删 3 条、服务端只删 2 条）',
+      file: 'public/js/share-status.js',
+      anchor: "export const DEAD_STATUS = new Set(['deleted', 'expired']);",
+      replacement: "export const DEAD_STATUS = new Set(['deleted', 'expired', 'exhausted']);",
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R32-02e · 前端「删除失效链接」按钮没接上线（点了不发任何请求）',
+      file: 'public/js/linkmgr.js',
+      anchor: "  const clean = document.getElementById('btn-links-clean');\n  if (clean) clean.onclick = () => removeDeadLinks();",
+      replacement: '  // （按钮未接线）',
+      testFile: 'audit32-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

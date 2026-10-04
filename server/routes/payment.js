@@ -75,6 +75,34 @@ router.get('/payment/orders', requireAdmin, (req, res) => {
 });
 
 /**
+ * 删除全部「支付失败」的订单（管理端「删除失效订单」按钮）。
+ *
+ * 与 `POST /payment/orders/:id/refund` 同级保护：同样是**批量且不可逆**的写操作，
+ * 抹掉的又是对账页上的历史流水，因此必须沿用 `requireAdmin`。
+ *
+ * 只删 `failed` —— `paid` / `refunded` 是钱流动过的凭据，超出支付窗口的 `pending`
+ * 也刻意保留（R14-03：付款者可能正在收银台上）。这条判据的**唯一实现点**是
+ * `paymentOrders.removeFailed()`，本路由不重复实现，只负责鉴权、留痕与回包。
+ *
+ * 删除条数为 0 时不留日志：没有发生任何变更，写一条「删了 0 条」只会稀释审计日志。
+ */
+router.delete('/payment/orders/failed', requireAdmin, (req, res) => {
+  try {
+    const removed = paymentOrders.removeFailed();
+    if (removed > 0) {
+      statsStore.addLog({
+        action: 'payment.delete-failed',
+        level: 'warn',
+        detail: `管理员「${req.authUser.username}」删除失效订单 ${removed} 条（均为「支付失败」状态的订单）`,
+      });
+    }
+    res.json({ ok: true, removed });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/**
  * 标记订单为「已退款」（人工记账，非网关退款）。
  *
  * 本系统**不代持资金** —— 这笔钱从未经过本服务器，退款是在微信/支付宝/PayPal 后台

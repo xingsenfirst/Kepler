@@ -311,6 +311,36 @@ function pruneGlobal() {
   return victims.size;
 }
 
+/**
+ * 删除全部「支付失败」订单 —— 管理端「删除失效订单」按钮的**唯一实现点**。
+ *
+ * 判据刻意**不是**「所有可裁的订单」，而是「`status === 'failed'`」：
+ * `prune()` / `pruneGlobal()` 的候选里还包括**超出支付窗口的 `pending`**，
+ * 那是一个刻意的灰色地带（R14-03：付款者可能正在收银台上），由自动裁剪按容量兜住即可。
+ * 把它塞进这个由管理员手动触发的按钮里，就变成了「点一下静默清掉一批可能还在途的付款」，
+ * 而按钮上写的是「支付失败」—— 名实不符的破坏远比少删几条严重。
+ *
+ * 仍然走一遍 `isProtected()` 是**冗余但刻意的**：它是本模块关于「什么订单不能删」的
+ * 唯一判据，将来若给 `failed` 加上保护条件（例如「失败后一段时间内保留以便排查」），
+ * 这里会自动跟上，不会演变成第二个各判一套的实现点。
+ *
+ * `paid` / `refunded` 是钱真正流动过的对账凭据，任何情况下都不进入候选集。
+ *
+ * @param {number} [now] 判定时刻（测试注入用）
+ * @returns {number} 实际删除的条数
+ */
+function removeFailed(now = Date.now()) {
+  const all = load().orders;
+  const victims = all.filter((o) => o.status === 'failed' && !isProtected(o, now));
+  if (!victims.length) return 0;
+  const ids = new Set(victims.map((o) => o.id));
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (ids.has(all[i].id)) all.splice(i, 1);
+  }
+  persist();
+  return victims.length;
+}
+
 function get(id) {
   return load().orders.find((o) => o.id === id) || null;
 }
@@ -504,6 +534,7 @@ module.exports = {
   MAX_ORDERS_PER_LINK, MAX_ORDERS_TOTAL, PAYMENT_WRITE_DEBOUNCE_MS,
   create, get, findByTradeNo, listForLink, listAll, paidCountForLink,
   pruneGlobal, // R8-25：导出以供测试直接驱动跨链接裁剪
+  removeFailed, // R32-01：管理端「删除失效订单」（仅 failed；paid/refunded/在途 pending 不动）
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）
   markPaid, markFailed, markRefunded, markDownloaded, setTradeNo,
   orderToken, verifyToken, payerState, view,

@@ -149,9 +149,10 @@
           <div class="dash-grid">
             <div class="dash-card wide">
             <h3>分享链接管理 <span id="linkmgr-count" class="lk-count"></span>
-              <button id="btn-links-refresh" class="mini-btn">刷新</button></h3>
+              <button id="btn-links-refresh" class="mini-btn">刷新</button>
+              <button id="btn-links-clean" class="mini-btn danger" title="删除全部「文件已删除」与「已过期」的分享链接；仅清除本地记录，不影响云端文件。下载次数已用尽（已关闭）的链接不会被删除。">删除失效链接</button></h3>
             <div id="linkmgr-table"></div>
-            <div class="card-note">托管链接由本服务在线时提供下载（有效期 / 次数 / 密码三种限制可任意组合）；删除链接仅清除本地记录，不影响云端文件。预签名直链不在此列表中。</div>
+            <div class="card-note">托管链接由本服务在线时提供下载（有效期 / 次数 / 密码三种限制可任意组合）；删除链接仅清除本地记录，不影响云端文件。预签名直链不在此列表中。<br>「删除失效链接」一次清掉<b>文件已删除</b>与<b>已过期</b>两种链接；「已关闭」（下载次数已用尽）属于<b>可改回</b>的状态（在「编辑」里调大下载次数即可恢复），因此不在清理范围内。</div>
           </div>
           </div>
         </section>
@@ -161,9 +162,10 @@
           <div class="dash-grid">
             <div class="dash-card wide">
             <h3>付费订单 <span id="ordermgr-count" class="lk-count"></span>
-              <button id="btn-orders-refresh" class="mini-btn">刷新</button></h3>
+              <button id="btn-orders-refresh" class="mini-btn">刷新</button>
+              <button id="btn-orders-clean" class="mini-btn danger" title="删除全部处于「支付失败」状态的订单；「已支付」「已退款」以及对账所需的在途订单不会删除。">删除失效订单</button></h3>
             <div id="ordermgr-table"></div>
-            <div class="card-note">记录所有「需付费下载」链接产生的支付订单。文件名在创建订单时已快照保存，因此分享链接被删除后仍能核对款项对应的文件；「是否已下载」仅在下载<b>传输完成后</b>才标记，传输中途失败不会计入。支付结果由服务端向支付网关主动查单确认，页面上的状态随查单结果更新。<br><b>退款</b>仅对「已支付」的订单可用：本系统<b>不代持资金</b>，标记为已退款只是记账动作（该订单的支付凭证立即失效、金额不再计入「已收」），实际退款请在对应支付渠道后台完成。</div>
+            <div class="card-note">记录所有「需付费下载」链接产生的支付订单。文件名在创建订单时已快照保存，因此分享链接被删除后仍能核对款项对应的文件；「是否已下载」仅在下载<b>传输完成后</b>才标记，传输中途失败不会计入。支付结果由服务端向支付网关主动查单确认，页面上的状态随查单结果更新。<br><b>退款</b>仅对「已支付」的订单可用：本系统<b>不代持资金</b>，标记为已退款只是记账动作（该订单的支付凭证立即失效、金额不再计入「已收」），实际退款请在对应支付渠道后台完成。<br>「删除失效订单」只清理<b>支付失败</b>的流水：<b>已支付</b>与<b>已退款</b>是款项往来过的对账凭据，正在支付中或超出下单有效期的订单也不会被删除。</div>
           </div>
           </div>
         </section>
@@ -494,7 +496,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.2.8</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.2.9</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

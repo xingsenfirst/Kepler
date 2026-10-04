@@ -1,7 +1,7 @@
 /** 链接管理页 —— 查看全部分享链接，编辑 / 删除 / 复制 */
 import { API } from './api.js';
 import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime } from './util.js';
-import { STATUS_META, statusOf } from './share-status.js';
+import { STATUS_META, statusOf, isDead } from './share-status.js';
 
 let linksCache = [];
 let wired = false;
@@ -11,6 +11,8 @@ function wire() {
   wired = true;
   const btn = document.getElementById('btn-links-refresh');
   if (btn) btn.onclick = () => refresh();
+  const clean = document.getElementById('btn-links-clean');
+  if (clean) clean.onclick = () => removeDeadLinks();
 }
 
 function fmtExpiry(l) {
@@ -132,6 +134,37 @@ async function removeLink(l) {
   try {
     await API.deleteLink(l.id);
     toast('链接已删除', { type: 'success' });
+    refresh();
+  } catch (e) {
+    toast('删除失败：' + e.message, { type: 'error' });
+  }
+}
+
+/**
+ * 删除全部失效链接（「文件已删除」与「已过期」）。
+ *
+ * 「哪些算失效」**不在这里另写一份判据** —— 它取自 `share-status.js` 的 `isDead()`，
+ * 而那份与服务端 `share-store.status()` 是同序的单一事实源。本地只拿它数一下
+ * 待删条数（用于确认框文案），真正的删改由服务端 `shareStore.removeDead()` 执行。
+ *
+ * ⚠️ 「已关闭」（下载次数用尽）**不算**失效：它在「编辑」里调大次数即可复活，
+ * 删掉就不可逆了 —— 故 `isDead()` 明确把它排除在外，确认框也如实说明这一点。
+ */
+async function removeDeadLinks() {
+  const n = linksCache.filter((l) => isDead(l)).length;
+  const ok = await confirmDialog({ allowHtml: true,
+    title: '删除失效链接',
+    message: `确定删除全部<b>文件已删除</b>与<b>已过期</b>的分享链接吗？<br><br>`
+      + `<span style="color:var(--text-2)">当前列表中共 <b>${n}</b> 条；仅删除本地分享记录，`
+      + `<b>不会删除云端文件</b>。「已关闭」（下载次数已用尽）的链接不会被删除 —— `
+      + `在「编辑」里调大下载次数即可让它恢复，属于可以改回来的状态。</span>`,
+    okText: '删除', danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await API.deleteDeadLinks();
+    const removed = (r && Number(r.removed)) || 0;
+    toast(removed ? `已删除 ${removed} 条失效链接` : '没有需要删除的失效链接', { type: 'success' });
     refresh();
   } catch (e) {
     toast('删除失败：' + e.message, { type: 'error' });

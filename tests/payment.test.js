@@ -366,7 +366,7 @@ test('clientSchema 与服务端同源且可直接序列化', () => {
 test('支付路由全部挂载 requireAdmin（接口层强制校验，不依赖前端隐藏）', () => {
   const router = require(path.join(ROOT, 'server', 'routes', 'payment.js'));
   const routes = router.stack.filter((l) => l.route).map((l) => l.route);
-  assertEqual(routes.length, 9, '应有 9 条支付路由');
+  assertEqual(routes.length, 10, '应有 10 条支付路由');
 
   const seen = [];
   for (const r of routes) {
@@ -385,6 +385,9 @@ test('支付路由全部挂载 requireAdmin（接口层强制校验，不依赖�
     'DELETE /payment/config/:platform',
     'GET /payment/orders',
     'POST /payment/orders/:id/refund',
+    // R32-01：批量删除「支付失败」订单（卡片上的「删除失效订单」按钮）——
+    // 与退款同级的批量不可逆写操作，必须同样受管理员守卫保护
+    'DELETE /payment/orders/failed',
   ];
   for (const e of expected) assert(seen.includes(e), `缺少路由 ${e}，实际：${seen.join(' | ')}`);
 });

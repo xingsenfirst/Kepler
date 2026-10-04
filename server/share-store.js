@@ -228,6 +228,43 @@ function remove(id) {
   return true;
 }
 
+/**
+ * 删除全部**失效**链接 —— 管理端「删除失效链接」按钮的**唯一实现点**。
+ *
+ * 失效 = `deleted`（文件已删除）或 `expired`（已过期）。
+ *
+ * ⚠️ **刻意不含 `exhausted`（已关闭）**：次数用尽是一个**可逆**状态 ——
+ * 管理员在编辑弹窗里把「可下载次数」调大，链接立刻复活。把它一并删掉，
+ * 等于让「先收紧配额、之后再放开」这个正常运维动作变得不可逆。
+ * 而 `deleted`（云端对象真的没了）与 `expired`（时间已经过了）都无法靠改配置恢复。
+ *
+ * 作用域与 `listFor()` 同一把尺子（`canManage`）：管理员删全部，普通用户只删自己创建的。
+ * 这一点与订单管理不同，必须显式处理 —— 链接管理页**普通用户也能进**，
+ * 若照抄订单那边「反正调用方是管理员」的假设，就会变成普通用户可越权删掉别人的链接。
+ *
+ * 判定复用 `status()`，不另写一份状态规则（前端 `share-status.js` 的 `isDead()` 与它同序）。
+ *
+ * @param {'admin'|string} role 当前用户角色
+ * @param {string} username 当前用户名（管理员可传空）
+ * @param {number} [now] 判定时刻（测试注入用）
+ * @returns {number} 实际删除的条数
+ */
+function removeDead(role, username, now = Date.now()) {
+  const links = load().links;
+  let removed = 0;
+  // 倒序删除：splice 会改变后续下标，从尾部往前走才不会漏项
+  for (let i = links.length - 1; i >= 0; i--) {
+    const l = links[i];
+    const st = status(l, now);
+    if (st !== 'deleted' && st !== 'expired') continue;
+    if (!canManage(l, role, username)) continue;
+    links.splice(i, 1);
+    removed++;
+  }
+  if (removed > 0) persist();
+  return removed;
+}
+
 /* ------------------------- 对象缺失标记 ------------------------- */
 
 /**
@@ -411,6 +448,7 @@ function verifyToken(link, token) {
 
 module.exports = {
   list, listFor, canManage, get, create, update, remove, status, view,
+  removeDead, // R32-02：管理端「删除失效链接」（仅 deleted / expired，不含可逆的 exhausted）
   checkPassword, tryAcquire, release, accessToken, verifyToken,
   markMissing, clearMissing, markMissingByKeys, markMissingByBucket,
 };

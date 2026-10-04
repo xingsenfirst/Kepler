@@ -251,6 +251,8 @@ export const API = {
   createLink: (b) => request('POST', '/api/links', b),
   updateLink: (id, b) => request('PUT', `/api/links/${encodeURIComponent(id)}`, b),
   deleteLink: (id) => request('DELETE', `/api/links/${encodeURIComponent(id)}`),
+  // R32-02：删除全部失效链接（文件已删除 / 已过期）；「已关闭」不算失效，不受影响
+  deleteDeadLinks: () => request('DELETE', '/api/links/dead'),
 
   uploadInit: (key, size, mtime, extra) => request('POST', '/api/fs/upload/init', Object.assign({ key, size, mtime }, extra || {})),
   uploadComplete: (sessionId) => request('POST', '/api/fs/upload/complete', { sessionId }),
@@ -266,6 +268,8 @@ export const API = {
   paymentOrders: () => request('GET', '/api/payment/orders'),
   // 退款：本系统不代持资金，这只是把订单标记为「已退款」的人工记账动作
   refundOrder: (id) => request('POST', `/api/payment/orders/${encodeURIComponent(id)}/refund`),
+  // R32-01：删除全部「支付失败」的订单（已支付 / 已退款 / 支付中一律不受影响）
+  deleteFailedOrders: () => request('DELETE', '/api/payment/orders/failed'),
   setPaymentSiteUrl: (siteUrl) => request('PUT', '/api/payment/site-url', { siteUrl }),
   setPaymentEnabled: (enabled) => request('PUT', '/api/payment/enabled', { enabled }),
   setPaymentChannelEnabled: (platform, enabled) => request('PUT', `/api/payment/config/${encodeURIComponent(platform)}/enabled`, { enabled }),

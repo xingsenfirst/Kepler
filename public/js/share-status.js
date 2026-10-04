@@ -28,3 +28,20 @@ export function statusOf(l) {
   if (l.maxDownloads > 0 && l.downloads >= l.maxDownloads) return 'exhausted';
   return 'active';
 }
+
+/**
+ * 「失效」链接的状态集合 —— 「删除失效链接」按钮的**前端唯一判据**。
+ *
+ * ⚠️ **刻意不含 `exhausted`（已关闭）**：那是一个**可逆**状态，管理员把
+ * 「可下载次数」调大即可让链接复活；把它当失效删掉，会让「先收紧配额、之后再放开」
+ * 变成不可逆操作。`deleted`（对象真没了）与 `expired`（时间已过）才无法靠改配置恢复。
+ *
+ * 与服务端 `server/share-store.js` 的 `removeDead()` 必须保持一致：
+ * 两边各写一份就会出现「界面说 3 条失效、点下去只删掉 1 条」。
+ */
+export const DEAD_STATUS = new Set(['deleted', 'expired']);
+
+/** 该链接是否属于「失效」（可被「删除失效链接」清掉） */
+export function isDead(l) {
+  return DEAD_STATUS.has(statusOf(l));
+}

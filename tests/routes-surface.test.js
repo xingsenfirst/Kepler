@@ -44,6 +44,8 @@ const EXPECTED = [
   'POST /payment/config/:platform/validate', 'DELETE /payment/config/:platform',
   'PUT /payment/enabled', 'PUT /payment/config/:platform/enabled',
   'PUT /payment/site-url', 'GET /payment/orders', 'POST /payment/orders/:id/refund',
+  // R32-01：批量删除「支付失败」的订单（管理端「删除失效订单」按钮）
+  'DELETE /payment/orders/failed',
   'POST /webauthn/register/options', 'POST /webauthn/register/verify',
   'POST /webauthn/disable', 'POST /users/:id/webauthn/disable',
   'GET /config', 'PUT /config',
@@ -70,6 +72,8 @@ const EXPECTED = [
   'GET /webdav', 'PUT /webdav/enabled', 'POST /webdav/accounts',
   'PUT /webdav/accounts/:id', 'DELETE /webdav/accounts/:id', 'GET /webdav/accounts/:id/password',
   'GET /links', 'POST /links', 'PUT /links/:id', 'DELETE /links/:id',
+  // R32-02：批量删除失效链接（「删除失效链接」按钮）；必须注册在 /links/:id 之前
+  'DELETE /links/dead',
   'GET /fs/list', 'GET /fs/stat', 'GET /fs/search', 'POST /fs/mkdir',
   'PUT /fs/upload/simple', 'POST /fs/upload/init', 'PUT /fs/upload/chunk',
   'POST /fs/upload/complete', 'POST /fs/upload/abort', 'GET /fs/sessions',
@@ -147,6 +151,8 @@ test('敏感接口均挂载 requireAdmin', () => {
     'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
     // 退款会把订单置为不可逆终态并让支付凭证失效，必须与其它写操作同级保护
     'POST /payment/orders/:id/refund',
+    // R32-01：批量删除订单流水（不可逆），与退款同级 —— 同样是「一点就是一片」的写操作
+    'DELETE /payment/orders/failed',
     'GET /enc/settings', 'PUT /enc/settings',
     'GET /upload-excludes', 'PUT /upload-excludes',
     'GET /webdav', 'PUT /webdav/enabled', 'POST /webdav/accounts',
@@ -170,6 +176,45 @@ test('/credentials/visibility 先于 /credentials/:id 注册', () => {
   const id = ROUTES.indexOf('PUT /credentials/:id');
   assert(iv >= 0 && id >= 0, '两个路由都应存在');
   assert(iv < id, '/credentials/visibility 必须在 /credentials/:id 之前，否则会被参数捕获');
+});
+
+/**
+ * R32-02：批量清理失效链接的两条约束 —— 注册顺序与守卫强度。
+ *
+ * 顺序：express 按注册顺序匹配，`DELETE /links/dead` 若排在参数路由 `DELETE /links/:id`
+ * 之后，路径里的 `dead` 会被当成一个链接 id 吞掉。此时**路由表里两条路径都在**、
+ * 「无路由丢失」也照样绿，只有真正打请求才暴露 —— 所以顺序必须单独断言。
+ *
+ * 守卫：与订单管理不同，链接管理页**普通用户也能进**（每条链接按 `createdBy` 隔离），
+ * 因此这里**不能**挂 requireAdmin，否则普通用户的按钮一点就是 403；越权由
+ * `shareStore.removeDead()` 内部的 `canManage` 兜住。
+ */
+test('/links/dead 先于 /links/:id 注册，且不挂 requireAdmin（普通用户也要能清自己的失效链接）', () => {
+  const dead = ROUTES.indexOf('DELETE /links/dead');
+  const byId = ROUTES.indexOf('DELETE /links/:id');
+  assert(dead >= 0 && byId >= 0, '两个路由都应存在');
+  assert(dead < byId,
+    'DELETE /links/dead 必须在 DELETE /links/:id 之前，否则 dead 会被 :id 当成链接 id 吞掉'
+    + '（界面表现：点「删除失效链接」提示「链接不存在」）');
+
+  const guardMap = new Map();
+  const walk = (stack) => {
+    for (const layer of stack || []) {
+      if (layer.route) {
+        const h = layer.route.stack || layer.route.handlers || [];
+        const names = h.map((x) => (x && x.name) || '');
+        const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+        for (const m of methods) guardMap.set(`${m} ${layer.route.path}`, names.includes('requireAdmin'));
+      } else if (layer.handle && layer.handle.stack) {
+        walk(layer.handle.stack);
+      }
+    }
+  };
+  walk(routes.stack);
+  assert(guardMap.has('DELETE /links/dead'), '守卫表应包含 DELETE /links/dead（避免拼写错误导致断言空过）');
+  assertEqual(guardMap.get('DELETE /links/dead'), false,
+    'DELETE /links/dead 不得挂 requireAdmin：链接管理页普通用户也能进，'
+    + '越权由 shareStore.removeDead() 的 canManage 隔离，误挂管理员守卫会让普通用户直接 403');
 });
 
 test('/users/me 先于 /users/:id 注册（否则自助接口被参数路由吞掉）', () => {

@@ -599,6 +599,14 @@ export const fmtTime = (s) => String(s || '');
 export const fmtSize = (n) => String(n);
 // R34：syssettings.js 新增了 updateNotice 具名导入 —— 桩必须同步（否则 ESM 链接期直接报错）
 export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');
+// R35：syssettings.js 新增 USER_PREVIEW_LIMIT / filterUsersByName 具名导入 —— 桩必须同步
+// （否则 ESM 链接期直接报错，本文件所有 import syssettings.js 的用例整片变红）
+export const USER_PREVIEW_LIMIT = 10;
+export const filterUsersByName = (list, q) => {
+  const all = Array.isArray(list) ? list.slice() : [];
+  const s = String(q == null ? '' : q).trim().toLowerCase();
+  return s ? all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(s) !== -1) : all;
+};
 `;
 
 /** `main.js` 桩：只需 App.state.user（isAdmin / currentId 的判据），身份由 __me 控制 */

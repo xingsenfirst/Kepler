@@ -65,6 +65,35 @@ export function updateNotice(r) {
   return '当前已是最新版本。';
 }
 
+/* ------------------- 用户列表：预览上限与搜索（R35） ------------------- */
+
+/**
+ * 「用户管理」卡片列表的**预览条数上限**（需求：卡片列表最多展示 10 个用户）。
+ *
+ * 放在 util.js 而不是 syssettings.js：卡片截断与「全部用户」对话框的提示语
+ * 都要引用同一个数 —— 两处各写一个字面量 10，改一处就会出现
+ * 「卡片显示 10 条、提示却写 20 条」这种自相矛盾的界面。
+ */
+export const USER_PREVIEW_LIMIT = 10;
+
+/**
+ * 按用户名搜索过滤（R35「全部用户」对话框的搜索框）。
+ *
+ * 规则（**单一实现点**，卡片 / 对话框 / 将来的任何用户列表都走它）：
+ *  - 关键词去掉首尾空白；空关键词 → 返回**全部**（副本）；
+ *  - 大小写不敏感的子串匹配（`ali` 能命中 `Alice`）；
+ *  - 列表不是数组、或用户名缺失 → 安全降级，绝不抛错（数据来自服务端，
+ *    一条脏数据不该让整个对话框白屏）；
+ *  - **不修改入参**：调用方持有的是模块级 `usersState`，就地截断/排序会让
+ *    下一次过滤基于已被改过的数据，且"刷新前"的列表被悄悄改掉。
+ */
+export function filterUsersByName(list, query) {
+  const all = Array.isArray(list) ? list.slice() : [];
+  const q = String(query == null ? '' : query).trim().toLowerCase();
+  if (!q) return all;
+  return all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(q) !== -1);
+}
+
 /* ------------------------------ Toast ------------------------------ */
 export function toast(msg, opt = {}) {
   const root = document.getElementById('toast-root');
@@ -92,13 +121,18 @@ export function toast(msg, opt = {}) {
  *
  * 为向后兼容仍接受裸字符串 body，但会**按 HTML 处理**（等价于 { html }）。
  * 新代码请勿使用裸字符串；含用户数据的请用 { text } 或传 DOM 节点。
+ *
+ * `wide` 给出 720px 的通用宽版；`cls`（R35 新增）用于**个别**弹窗的专属尺寸，
+ * 例如「全部用户」要放下 7 列表格 → `cls: 'user-all-dialog'`（见 style.css）。
+ * 用参数而不是调用后 `querySelector('.dialog').classList.add(...)`，是为了让
+ * 「这个弹窗长什么样」和「它装了什么东西」在同一处声明，且能在测试里被断言。
  */
-export function openModal({ title, body, foot, wide, onClose }) {
+export function openModal({ title, body, foot, wide, cls, onClose }) {
   const root = document.getElementById('modal-root');
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.innerHTML = `
-    <div class="dialog ${wide ? 'wide' : ''}">
+    <div class="dialog ${wide ? 'wide' : ''} ${cls ? escapeHtml(cls) : ''}">
       <div class="dialog-head"><b>${escapeHtml(title || '')}</b><button class="icon-btn" data-x title="关闭">✕</button></div>
       <div class="dialog-body"></div>
       <div class="dialog-foot"></div>

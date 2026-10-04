@@ -3715,15 +3715,202 @@ const CASES = [
       testFile: 'audit34-update.test.js',
       minFail: 1,
     },
+
+    /* ---------------- R35 · 用户管理：10 条预览 + 「显示全部」对话框 ---------------- */
+    {
+      name: 'R35-01a · 卡片不再截断（11 位用户全渲染 → 「最多展示 10 个」名存实亡）',
+      file: 'public/js/syssettings.js',
+      anchor: '  const shown = users.slice(0, USER_PREVIEW_LIMIT);',
+      replacement: '  const shown = users;',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01b · 「显示全部」判据写成 >=（正好 10 位也摆出按钮，点开是与卡片一字不差的副本）',
+      file: 'public/js/syssettings.js',
+      anchor: '  const over = total > USER_PREVIEW_LIMIT;',
+      replacement: '  const over = total >= USER_PREVIEW_LIMIT;',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01c · 「显示全部」永久隐藏（超过 10 位也出不来按钮 → 后 40 个用户无从管理）',
+      file: 'public/js/syssettings.js',
+      anchor: '  if (more) more.hidden = !over;',
+      replacement: '  if (more) more.hidden = true;',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01d · 对话框也按 10 条截断（「显示全部」里仍然看不全）',
+      file: 'public/js/syssettings.js',
+      anchor: '  const shown = filterUsersByName(users, allUsersQuery);',
+      replacement: '  const shown = filterUsersByName(users, allUsersQuery).slice(0, USER_PREVIEW_LIMIT);',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01e · 搜索框不接线（弹窗里那个输入框输什么都没反应）',
+      file: 'public/js/syssettings.js',
+      anchor: '  if (search) search.oninput = () => { allUsersQuery = search.value; repaintAllUsers(); };',
+      replacement: '',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R35-01f · 搜索改成大小写敏感（`ali` 查不到 `Alice`）',
+      file: 'public/js/util.js',
+      anchor: "  const q = String(query == null ? '' : query).trim().toLowerCase();",
+      replacement: "  const q = String(query == null ? '' : query).trim();",
+      testFile: 'audit35-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R35-01g · 空关键词返回空数组（搜索框一清空、整个列表就白屏）',
+      file: 'public/js/util.js',
+      anchor: '  if (!q) return all;',
+      replacement: '  if (!q) return [];',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R35-01h · 对话框里的行不绑按钮（看得见、点不动）',
+      file: 'public/js/syssettings.js',
+      anchor: '  list.innerHTML = userTableHtml(shown, currentId);\n  bindUserRowActions(list, shown);',
+      replacement: '  list.innerHTML = userTableHtml(shown, currentId);',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R35-01i · 卡片刷新后不重绘对话框（在对话框里删掉的人继续留在对话框里）',
+      file: 'public/js/syssettings.js',
+      anchor: '  updateUserMore(users.length);\n  repaintAllUsers(); // 对话框开着时同步刷新：删/封/改名之后两边必须一致',
+      replacement: '  updateUserMore(users.length);',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01j · 登出不清理对话框（换账号后上一个账号的用户列表仍留在 DOM 里）',
+      file: 'public/js/syssettings.js',
+      anchor: "  allUsersOpen = false;\n  allUsersQuery = '';\n  const allList = document.getElementById('user-all-body');\n  if (allList) allList.innerHTML = '';",
+      replacement: "  allUsersOpen = false;\n  allUsersQuery = '';",
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01k · 关闭弹窗时不复位状态（第二次点「显示全部」再也打不开）',
+      file: 'public/js/syssettings.js',
+      anchor: "    onClose: () => { allUsersOpen = false; allUsersQuery = ''; },",
+      replacement: '    onClose: () => {},',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01l · 去掉 `.user-more[hidden]` 规则（容器是 display:flex，hidden 属性彻底失效 → 按钮一直露着）',
+      file: 'public/css/style.css',
+      anchor: '.user-more[hidden] { display: none; }\n',
+      replacement: '',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01m · 滚动容器去掉高度上限与 overflow（对话框再也滚不动，长列表把弹窗撑爆）',
+      file: 'public/css/style.css',
+      anchor: '  max-height: min(54vh, 460px); overflow: auto; border: 1px solid var(--border);',
+      replacement: '  border: 1px solid var(--border);',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01n · 对话框里另抄一份表格表头（用户表格出现两份 → 两处迟早分叉）',
+      file: 'public/js/syssettings.js',
+      anchor: '  list.innerHTML = userTableHtml(shown, currentId);',
+      replacement: "  list.innerHTML = '<table class=\"lk-table user-tbl\"><thead><tr><th>用户名</th></tr></thead><tbody></tbody></table>'"
+        + ' + userTableHtml(shown, currentId);',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01o · 去掉「仅管理员」守卫（普通用户也能打开全部用户对话框）',
+      file: 'public/js/syssettings.js',
+      anchor: 'function showAllUsers() {\n  if (!canManageUsers()) return;',
+      replacement: 'function showAllUsers() {',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01p · 空关键词返回入参本体（把模块级 usersState 交出去，调用方一 sort 就改到全局状态）',
+      file: 'public/js/util.js',
+      anchor: '  const all = Array.isArray(list) ? list.slice() : [];',
+      replacement: '  const all = Array.isArray(list) ? list : [];',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R35-01q · 对话框忽略搜索关键词（过滤与「刷新后保持过滤」两条用例同时变红）',
+      file: 'public/js/syssettings.js',
+      anchor: '  const shown = filterUsersByName(users, allUsersQuery);',
+      replacement: "  const shown = filterUsersByName(users, '');",
+      testFile: 'audit35-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      name: 'R35-01r · 反向对照脚本不再拒绝位置参数（`R35-01` 被静默忽略 → 跑满全量数小时）',
+      file: 'scripts/reverse-check.js',
+      // ⚠️ 本条的**目标文件就是台账自身**，因此 anchor 必须**跨行**（字面量里写 `\n` 转义，
+      //    而不是真换行）。单行 anchor 会在本文件里命中两次：CASES 里那处字面量
+      //    （行号更靠前！）与真正的代码，而 `String.replace` 只替**首处** —— 变异会打在
+      //    台账的字符串上、被测代码毫发无伤，实跑得到 fail=0「护栏没抓到」的假象（已踩一次）。
+      anchor: '  if (stray.length) {\n    return {\n      error: \'无法识别的参数：\' + stray.join(\' \')',
+      replacement: '  if (false) {\n    return {\n      error: \'无法识别的参数：\' + stray.join(\' \')',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
-module.exports = { runCase, CASES };
+module.exports = { runCase, CASES, parseArgs };
+
+/**
+ * 解析命令行参数（**独立成函数**，便于被测试直接驱动）。
+ *
+ * 过滤**只认** `--only=<片段>`；位置参数一律**报错**。
+ *
+ * ⚠️ 早期版本对被忽略的位置参数一声不吭：`node scripts/reverse-check.js R35-01`
+ * （本意「只跑这一轮」）会**静默**跑满全量台账 —— 全量 315 条里含 36 条以
+ * `deploy-script.test.js` 为对象的对照，而那一个文件单跑就要约 2.5 分钟，加起来是
+ * **数小时**。实测踩过一次：10 分钟才跑完 14 条，只能强杀，而强杀会留下一个
+ * **正处于变异态**的源文件（`*.reversebak` 里能看出是哪一个）。
+ *
+ * 「看着筛了、其实没筛」与护栏假绿同源（都是判据没落在它声称要守的东西上），
+ * 故这里直接报错，而不是打个提示继续跑。
+ *
+ * 校验**放在纯函数里**而不是内联在主流程：内联的话只能用「源码里有没有这段字样」
+ * 去断言，而本文件里还存着这条对照自己的 anchor 字面量 —— 文本断言会被那份副本满足，
+ * 于是**永远为真**（实测就是这么得到一次 fail=0 的假绿）。
+ */
+function parseArgs(argv) {
+  const args = Array.isArray(argv) ? argv : [];
+  const onlyArg = args.find((a) => a.startsWith('--only='));
+  const stray = args.filter((a) => a.indexOf('--only=') !== 0);
+  if (stray.length) {
+    return {
+      error: '无法识别的参数：' + stray.join(' ')
+        + '\n按用例名过滤请用 `--only=<片段>`（例如 --only=R35-01）；'
+        + '不带参数 = 跑**全量**台账（很慢，且含 36 条 2.5 分钟级的 deploy-script 对照）。',
+    };
+  }
+  return { only: onlyArg ? onlyArg.slice('--only='.length) : '' };
+}
 
 /* 直接运行时执行下面登记的用例 */
 if (require.main === module) {
   // `--only=<片段>` 按 name 过滤，便于单条复核（全量跑一遍耗时较长）
-  const onlyArg = process.argv.find((a) => a.startsWith('--only='));
-  const only = onlyArg ? onlyArg.slice('--only='.length) : '';
+  const parsed = parseArgs(process.argv.slice(2));
+  if (parsed.error) {
+    console.error(parsed.error);
+    process.exit(2);
+  }
+  const only = parsed.only;
   const matched = only ? CASES.filter((c) => c.name.indexOf(only) >= 0) : CASES;
   if (only && !matched.length) {
     console.error('没有 name 含「' + only + '」的用例');

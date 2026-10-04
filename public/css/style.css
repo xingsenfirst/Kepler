@@ -942,6 +942,31 @@ input.full { width: 100%; }
 .user-tbl .mini-btn:disabled { opacity: .45; cursor: not-allowed; }
 .user-tbl .mini-btn:disabled:hover { background: transparent; color: inherit; }
 
+/* 「显示全部」行（R35）：仅当用户数超过预览上限时出现（hidden 由 updateUserMore 控制） */
+.user-more { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
+.user-more[hidden] { display: none; }
+.user-more-hint { font-size: 12px; color: var(--text-2); }
+
+/* 「全部用户」对话框（R35）：7 列表格需要比通用宽版更宽，故用专属类（openModal 的 cls） */
+.dialog.user-all-dialog { width: min(980px, 94vw); }
+.user-all { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* 搜索栏固定在顶部：滚动只发生在下面的列表里，否则筛完还得往上滚回来 */
+.user-all-bar { display: flex; align-items: center; gap: 10px; }
+.user-all-search {
+  flex: 1 1 auto; min-width: 0; height: 32px; padding: 0 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: #fff; color: var(--text);
+}
+.user-all-search:focus { outline: none; border-color: var(--accent); }
+.user-all-count { flex: none; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+/* 列表自带滚动条（表头吸顶，长列表滚动时仍知道每列是什么） */
+.user-all-body {
+  max-height: min(54vh, 460px); overflow: auto; border: 1px solid var(--border);
+  border-radius: var(--radius); background: #fff;
+}
+.user-all-body .lk-table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.user-all-body .lk-table tr:last-child td { border-bottom: 0; }
+.user-all-body .lk-empty { padding: 22px 0; }
+
 /* ============================ 负载均衡（按 API Key 的配额，R25） ============================ */
 /* 风箱（手风琴）式列表：默认全部折叠，点标题行展开该密钥下各桶占用 */
 .lb-list { margin-top: 6px; display: flex; flex-direction: column; gap: 10px; }

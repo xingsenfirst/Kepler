@@ -119,6 +119,14 @@ export const fmtSize = (n) => String(n);
 // 否则 ESM 在**链接期**就报 does not provide an export named 'updateNotice'，
 // 本文件所有 import syssettings.js 的用例会整片变红（红的原因与它们要守的东西无关）。
 export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');
+// R35：syssettings.js 又新增了 USER_PREVIEW_LIMIT / filterUsersByName 两个具名导入，同理补上
+// （这一条若漏了，audit34-update 的家族护栏会先变红，而不是让本文件整片红得莫名其妙）
+export const USER_PREVIEW_LIMIT = 10;
+export const filterUsersByName = (list, q) => {
+  const all = Array.isArray(list) ? list.slice() : [];
+  const s = String(q == null ? '' : q).trim().toLowerCase();
+  return s ? all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(s) !== -1) : all;
+};
 `;
 
 const MAIN_STUB = `

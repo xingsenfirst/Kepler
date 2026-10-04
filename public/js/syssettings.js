@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName } from './util.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
@@ -32,16 +32,8 @@ const ADMIN_ONLY_CARDS = ['sysset-user-card', 'sysset-lb-card', 'sysset-enc-card
 function setAdminCardVisible(cardId, visible) {
   const el = document.getElementById(cardId);
   if (el) el.hidden = !visible;
-  if (!visible) {
-    const card = document.getElementById(cardId);
-    // 隐藏时顺带清空动态内容，避免 DOM 里仍留着上一角色的用户列表
-    if (card && cardId === 'sysset-user-card') {
-      const table = document.getElementById('user-table');
-      if (table) table.innerHTML = '';
-      const countEl = document.getElementById('user-count');
-      if (countEl) countEl.textContent = '';
-    }
-  }
+  // 隐藏时顺带清空动态内容，避免 DOM 里仍留着上一角色的用户列表
+  if (!visible && cardId === 'sysset-user-card') clearUserDom();
 }
 
 /** 当前是否应显示用户管理卡片（唯一判据，避免多处判断不一致） */
@@ -112,6 +104,8 @@ function wire() {
   // 用户管理
   const btnUserAdd = document.getElementById('btn-user-add');
   if (btnUserAdd) btnUserAdd.onclick = () => showUserForm(null);
+  const btnUserAll = document.getElementById('btn-user-all');
+  if (btnUserAll) btnUserAll.onclick = showAllUsers;
   // 负载均衡（仅管理员）：刷新用量
   const lbRefresh = document.getElementById('btn-lb-refresh');
   if (lbRefresh) lbRefresh.onclick = () => loadLoadBalance();
@@ -683,6 +677,34 @@ async function saveCaptchaSettings() {
 let usersState = [];
 let usersRenderId = 0; // 单调递增的渲染序号：丢弃过期响应，避免慢请求覆盖新状态
 
+// R35：「全部用户」对话框的状态。**必须**放在模块级而不是对话框闭包里 ——
+// 卡片列表每次刷新都会重绘（`loadUsers → renderUsers`），对话框里的行必须跟着一起更新
+// （在对话框里删掉一个用户、卡片上却仍显示他，是最容易漏掉的一类不一致）。
+let allUsersOpen = false; // 对话框是否开着（决定 renderUsers 末尾要不要重绘它）
+let allUsersQuery = ''; // 搜索框当前内容（跨重绘保持，否则删一个用户就把搜索条件清掉了）
+
+/**
+ * 抹掉用户卡片与「全部用户」对话框里的动态内容。
+ *
+ * 两个调用点共用它（登出 `reset()`、切到非管理员 `setAdminCardVisible()`）——
+ * 两处各手写一遍的必然结果是「只清了一处」：用户列表（用户名、角色、封禁原因）
+ * 留在 DOM 里，换账号后越权可见。
+ */
+function clearUserDom() {
+  const table = document.getElementById('user-table');
+  if (table) table.innerHTML = '';
+  const countEl = document.getElementById('user-count');
+  if (countEl) countEl.textContent = '';
+  const more = document.getElementById('user-more');
+  if (more) more.hidden = true;
+  const hint = document.getElementById('user-more-hint');
+  if (hint) hint.textContent = '';
+  allUsersOpen = false;
+  allUsersQuery = '';
+  const allList = document.getElementById('user-all-body');
+  if (allList) allList.innerHTML = '';
+}
+
 /**
  * 清空用户卡片的动态内容（登出时调用）。
  *
@@ -692,10 +714,7 @@ let usersRenderId = 0; // 单调递增的渲染序号：丢弃过期响应，避
 export function reset() {
   usersRenderId++; // 使所有在途请求的响应作废
   usersState = [];
-  const table = document.getElementById('user-table');
-  if (table) table.innerHTML = '';
-  const countEl = document.getElementById('user-count');
-  if (countEl) countEl.textContent = '';
+  clearUserDom();
   // 负载均衡：作废在途响应并抹掉密钥清单（含掩码后的 SecretId —— 换账号不得残留）
   lbRenderId++;
   lbUsage = null;
@@ -763,18 +782,15 @@ function banBadge(u) {
   return '<span class="bk-sub">正常</span>';
 }
 
-function renderUsers() {
-  const table = document.getElementById('user-table');
-  if (!table) return;
-  const users = usersState || [];
-  const currentId = App.state.user ? App.state.user.id : null;
-
-  if (!users.length) {
-    table.innerHTML = `<div class="lk-empty">暂无用户</div>`;
-    return;
-  }
-
-  table.innerHTML = `
+/**
+ * 用户表格 HTML —— 卡片列表与「全部用户」对话框的**唯一渲染器**（R35）。
+ *
+ * 两处各写一份表格，是这类界面最典型的腐烂方式：新增一列或一个按钮只改了一处，
+ * 另一处静默落后，于是出现「卡片里能封禁、对话框里却不能」这种只能翻代码才解释得通的现象。
+ * 因此它只接受「要渲染哪些用户」，渲染进哪个容器由调用方决定。
+ */
+function userTableHtml(users, currentId) {
+  return `
     <table class="lk-table user-tbl">
       <thead><tr>
         <th>用户名</th><th>角色</th><th>状态</th><th>Windows Hello</th><th>创建时间</th><th>最后更新</th><th style="width:210px;text-align:right">操作</th>
@@ -816,9 +832,17 @@ function renderUsers() {
         }).join('')}
       </tbody>
     </table>`;
+}
 
-  // 绑定操作按钮
-  table.querySelectorAll('[data-act]').forEach((btn) => {
+/**
+ * 绑定列表行内按钮（卡片与对话框共用）。
+ *
+ * `root` 限定查询范围是关键：不限定就会把**另一个容器**里的按钮一并绑上，
+ * 于是点卡片里第 3 行的「删除」可能作用到对话框里的第 3 行（两个列表的 DOM
+ * 顺序并不保证一致）。`users` 只传「这个容器刚刚渲染过的那一批」。
+ */
+function bindUserRowActions(root, users) {
+  root.querySelectorAll('[data-act]').forEach((btn) => {
     const id = btn.getAttribute('data-id');
     const act = btn.getAttribute('data-act');
     const user = users.find((x) => x.id === id);
@@ -833,6 +857,116 @@ function renderUsers() {
       btn.onclick = () => unbanUser(user);
     }
   });
+}
+
+/**
+ * 「显示全部」按钮的显隐（R35 需求 2 / 3 的**唯一判据**）。
+ *
+ * 判据用**严格大于**：正好 10 个用户时卡片已经完整展示了全部用户，
+ * 此时再摆一个「显示全部」，点开只能看到与卡片一字不差的一份副本。
+ */
+function updateUserMore(total) {
+  const more = document.getElementById('user-more');
+  const hint = document.getElementById('user-more-hint');
+  const over = total > USER_PREVIEW_LIMIT;
+  if (more) more.hidden = !over;
+  if (hint) hint.textContent = over ? `卡片仅显示前 ${USER_PREVIEW_LIMIT} 位，共 ${total} 位用户` : '';
+}
+
+function renderUsers() {
+  const table = document.getElementById('user-table');
+  if (!table) return;
+  const users = usersState || [];
+  const currentId = App.state.user ? App.state.user.id : null;
+
+  if (!users.length) {
+    table.innerHTML = `<div class="lk-empty">暂无用户</div>`;
+    updateUserMore(0);
+    repaintAllUsers();
+    return;
+  }
+
+  // 需求 1：卡片列表最多展示 USER_PREVIEW_LIMIT 个用户（按服务端顺序取前 N 个）
+  const shown = users.slice(0, USER_PREVIEW_LIMIT);
+  table.innerHTML = userTableHtml(shown, currentId);
+  bindUserRowActions(table, shown);
+
+  updateUserMore(users.length);
+  repaintAllUsers(); // 对话框开着时同步刷新：删/封/改名之后两边必须一致
+}
+
+/* ============================ 全部用户对话框（R35） ============================ */
+/*
+ * 用户数超过 USER_PREVIEW_LIMIT 时，卡片只展示前 10 位，「显示全部」把其余用户
+ * 连同**搜索框**放进一个对话框：列表自带滚动条，搜索框固定在顶部、不随列表滚走。
+ *
+ * 两条容易做错的约束：
+ *  1. 对话框里的行**必须**带完整操作按钮。「列表里看不见的用户 = 管不了的用户」
+ *     是这一版最可能犯的错：50 个用户时后 40 个将永远无法编辑 / 封禁 / 删除。
+ *  2. 所有变更（删除 / 封禁 / 编辑保存）都经由 `loadUsers() → renderUsers()` 这**一个**
+ *     收口点，所以对话框的重绘挂在 `renderUsers()` 末尾（`repaintAllUsers()`），
+ *     而不是在每个操作里各写一遍刷新 —— 那样迟早漏一个。
+ */
+
+/** 重绘「全部用户」列表（对话框没开时是空操作） */
+function repaintAllUsers() {
+  if (!allUsersOpen) return;
+  const list = document.getElementById('user-all-body');
+  if (!list) { allUsersOpen = false; return; } // 弹窗已被移除（例如登出时），别再往空气里渲染
+  const users = usersState || [];
+  const shown = filterUsersByName(users, allUsersQuery);
+  const currentId = App.state.user ? App.state.user.id : null;
+
+  const countEl = document.getElementById('user-all-count');
+  if (countEl) {
+    countEl.textContent = allUsersQuery.trim()
+      ? `匹配 ${shown.length} / 共 ${users.length} 位`
+      : `共 ${users.length} 位用户`;
+  }
+
+  if (!shown.length) {
+    // 「搜索没命中」与「系统里一个用户都没有」是两件事，文案必须分开
+    list.innerHTML = `<div class="lk-empty">${users.length ? '没有匹配的用户' : '暂无用户'}</div>`;
+    return;
+  }
+  list.innerHTML = userTableHtml(shown, currentId);
+  bindUserRowActions(list, shown);
+}
+
+/** 打开「全部用户」对话框（R35 需求 3） */
+function showAllUsers() {
+  if (!canManageUsers()) return;
+  if (allUsersOpen) return; // 连点两次不得叠出第二层遮罩
+
+  const users = usersState || [];
+  const wrap = document.createElement('div');
+  wrap.className = 'user-all';
+  wrap.innerHTML = `
+    <div class="user-all-bar">
+      <input type="search" id="user-all-search" class="user-all-search"
+        placeholder="搜索用户名（不区分大小写）" autocomplete="off" spellcheck="false">
+      <span class="user-all-count" id="user-all-count"></span>
+    </div>
+    <div class="user-all-body" id="user-all-body"></div>`;
+
+  allUsersQuery = '';
+  openModal({
+    title: `全部用户（共 ${users.length} 位）`,
+    body: wrap,
+    foot: [{ text: '关闭' }],
+    wide: true,
+    cls: 'user-all-dialog', // 7 列表格要的宽度（见 style.css）
+    onClose: () => { allUsersOpen = false; allUsersQuery = ''; },
+  });
+  allUsersOpen = true;
+
+  const search = document.getElementById('user-all-search');
+  // 搜索是**本地内存过滤**（数据已经在手），因此既不防抖也不发请求。
+  // 用 `oninput` 而不是 addEventListener：与列表按钮同一写法，且假 DOM 里可直接驱动。
+  if (search) search.oninput = () => { allUsersQuery = search.value; repaintAllUsers(); };
+
+  repaintAllUsers();
+  if (search && search.focus) search.focus();
 }
 
 /* ============================ 账户封禁（R33） ============================ */

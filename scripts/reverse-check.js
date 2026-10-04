@@ -688,8 +688,11 @@ const CASES = [
     {
       name: 'R10-12 · app.head 注册到 app.get 之后（HEAD 被 GET 吞掉 → 每次 HEAD 都下载整份对象）',
       file: 'server/webdav-server.js',
-      anchor: "  app.head('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, true) : next()));\n  app.get('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, false) : next()));",
-      replacement: "  app.get('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, false) : next()));\n  app.head('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, true) : next()));",
+      // R34：这两行的挂载点判据由手写 `req.path.startsWith(MOUNT)` 收敛为 `inMount(req.path)`，
+      // 锚点**随代码一起迁移**（否则本条会静默失效 —— 脚本只在跑到它时才报「锚点未命中」，
+      // 而没人跑就等于没登记）。守的判据不变：head 必须注册在 get 之前。
+      anchor: "  app.head('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, true) : next()));\n  app.get('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, false) : next()));",
+      replacement: "  app.get('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, false) : next()));\n  app.head('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, true) : next()));",
       testFile: 'audit10-regressions.test.js',
       minFail: 1,
     },
@@ -3555,6 +3558,161 @@ const CASES = [
       anchor: "    if (data && data.banned) {\n      err.banned = true;\n      err.reason = data.reason || '';\n      err.until = data.until || '';\n    }\n",
       replacement: '',
       testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R34：WebDAV 根路径挂载失败 —— `OPTIONS /` 答 200 + `DAV: 1`，`PROPFIND /` 却回
+       * **HTML 404**，Windows WebClient 于是报「输入的文件夹似乎无效，请选择另一个」。
+       *
+       * 根因：「路径是否在挂载点内」这一判据**手写在 9 处**，而 `/` 只在部分地方被放行。
+       * 八条各自瞄准一个独立落点，做错之后的症状都极具误导性：
+       *  - 退回手写前缀 → 根路径重新落进 Express 兜底（报文与真实原因毫无关系）；
+       *  - 去掉 `OPTIONS *` 豁免 → 服务级能力探测被边界答成 404，`DAV` 头缺席；
+       *  - 把 `inMount` 放宽到整个根命名空间 → 顺手撤销 FUN-06 的边界；
+       *  - 前缀剥离退回字符级 → `/davx` 造出「界面看不到、WebDAV 却能读」的幽灵 key `x`；
+       *  - 405 兜底退回手写前缀 → `LOCK /` 由 405 退化成 404（客户端以为资源不存在而放弃）；
+       *  - 摘掉 `/` 的写保护 → PUT / MKCOL / DELETE 在根路径上**真的动手**。
+       */
+      name: 'R34-01a · PROPFIND 包装退回手写前缀判据（根路径重新落到 Express 兜底 HTML 404）',
+      file: 'server/webdav-server.js',
+      anchor: "  app['propfind']('*', (req, res, next) => {\n    if (!inMount(req.path)) return next();",
+      replacement: "  app['propfind']('*', (req, res, next) => {\n    if (!req.path.startsWith(MOUNT)) return next();",
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01b · 去掉 `OPTIONS *` 的服务级豁免（能力探测被边界答成 404，且没有 DAV 头）',
+      file: 'server/webdav-server.js',
+      anchor: "    if (req.method === 'OPTIONS' && req.path === '*') return next();\n",
+      replacement: '',
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01c · inMount 放宽到整个根命名空间（把 FUN-06 的边界一并撤销）',
+      file: 'server/webdav-server.js',
+      anchor: "  return reqPath === '/' || reqPath === MOUNT || reqPath.indexOf(MOUNT + '/') === 0;",
+      replacement: "  return reqPath.charAt(0) === '/';",
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01d · 前缀剥离退回字符级 startsWith（`/davx` 产生界面看不到的幽灵 key `x`）',
+      file: 'server/webdav-server.js',
+      anchor: '  if (pth === MOUNT || pth.indexOf(MOUNT + \'/\') === 0) pth = pth.slice(MOUNT.length);',
+      replacement: '  if (pth.indexOf(MOUNT) === 0) pth = pth.slice(MOUNT.length);',
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01e · 405 兜底退回手写前缀判据（`LOCK /` 由 405 退化成 Express 默认 404）',
+      file: 'server/webdav-server.js',
+      anchor: "  app.use((req, res, next) => {\n    if (!inMount(req.path)) return next();\n    const m = String(req.method || '').toUpperCase();\n    if (WEBDAV_METHODS.has(m)) return next();",
+      replacement: "  app.use((req, res, next) => {\n    if (!req.path.startsWith(MOUNT)) return next();\n    const m = String(req.method || '').toUpperCase();\n    if (WEBDAV_METHODS.has(m)) return next();",
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01f · 摘掉 MKCOL 的根路径写保护（`MKCOL /` 从 409 变成真的建集合）',
+      file: 'server/webdav-server.js',
+      anchor: '      const key = reqPathToKey(req.path);\n      if (!key) return res.status(409).end();',
+      replacement: '      const key = reqPathToKey(req.path);',
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01g · 摘掉 PUT 的根路径写保护（`PUT /` 不再回 409）',
+      file: 'server/webdav-server.js',
+      anchor: "      if (!key) return res.status(409).type('text/plain').send('409 Conflict：无法上传到根路径');",
+      replacement: '',
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-01h · 摘掉 DELETE 的根路径写保护（`DELETE /` 不再回 403）',
+      file: 'server/webdav-server.js',
+      anchor: "      if (!key) return res.status(403).type('text/plain').send('403：禁止删除存储桶根');",
+      replacement: '',
+      testFile: 'audit34-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R34（其二）：「关于」卡片「检查更新」。
+       *
+       * 这一轮的落点分散在**纯函数 / 路由 / 文案 / DOM 接线**四处，每处都能单独做错，
+       * 且症状都很误导：
+       *  - 版本比较按**字符串**比 → `1.10.0` 被判成小于 `1.9.9`，升级提示永远发不出来；
+       *  - 无法解析时返回 0（相等）而不是 null → 一个不合规的 tag 被当成「已是最新」，
+       *    功能看着正常，用户永远收不到提示；
+       *  - `/update/check` 误挂 requireAdmin → 「关于」是唯一对普通用户可见的卡片，
+       *    普通用户一点就 403；
+       *  - 按钮没接线 → 点了毫无反应；
+       *  - 去掉缓存 → 未认证的 GitHub API 只有 60 次/小时，连点几下就打光额度，
+       *    之后所有人都只能看到「检查更新失败」。
+       */
+      name: 'R34-02a · updateNotice 分支写反（有新版本却提示"当前已是最新版本"）',
+      file: 'public/js/util.js',
+      anchor: '  if (r.hasUpdate) {',
+      replacement: '  if (!r.hasUpdate) {',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02b · 版本号无法解析时返回 0（不合规的 tag 被当成"已是最新"，静默失效）',
+      file: 'server/update-check.js',
+      anchor: '  if (!x || !y) return null;',
+      replacement: '  if (!x || !y) return 0;',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02c · /update/check 误挂 requireAdmin（普通用户的按钮一点就 403）',
+      file: 'server/routes/stats.js',
+      anchor: "router.get('/update/check', asyncHandler(async (req, res) => {",
+      replacement: "router.get('/update/check', requireAdmin, asyncHandler(async (req, res) => {",
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02d · 前端「检查更新」按钮没接上线（点了没有任何反应）',
+      file: 'public/js/syssettings.js',
+      anchor: '  if (btnUpdate) btnUpdate.onclick = checkUpdate;',
+      replacement: '  if (btnUpdate) btnUpdate.onclick = null;',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02e · 去掉 10 分钟结果缓存（连点按钮打光 GitHub 未认证额度）',
+      file: 'server/update-check.js',
+      anchor: '  if (!force && cache.value && (Date.now() - cache.at) < CACHE_MS) {',
+      replacement: '  if (false) {',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02f · 来源回退失效：某一级失败就整次报错（Release 不存在时功能直接不可用）',
+      file: 'server/update-check.js',
+      anchor: '      failures.push(`${src.key}：${(e && e.message) || e}`);\n      continue;',
+      replacement: '      failures.push(`${src.key}：${(e && e.message) || e}`);\n      break;',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02g · 号不可解析时直接当"已是最新"返回（换来源的兜底被摘掉）',
+      file: 'server/update-check.js',
+      anchor: '      continue; // 换下一个来源 —— 一个不合规的 tag 不该让整次检查失败',
+      replacement: '      return Object.assign({}, { latest: raw, hasUpdate: false, url: RELEASES_PAGE, source: src.key }, { current: cur });',
+      testFile: 'audit34-update.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R34-02h · 前端沙箱的 util 桩缺一个导出（ESM 链接期报错 → 9 条无关用例整片变红）',
+      file: 'tests/audit31-regressions.test.js',
+      anchor: "export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');",
+      replacement: '',
+      testFile: 'audit34-update.test.js',
       minFail: 1,
     },
   ];

@@ -86,6 +86,8 @@ const EXPECTED = [
   'POST /fs/rename', 'POST /fs/move', 'POST /fs/delete', 'GET /fs/tree',
   'GET /stats/speed', 'GET /stats/storage', 'GET /stats/summary', 'GET /stats/logs',
   'GET /health',
+  // R34：「关于」卡片的「检查更新」（服务端代理 GitHub，见 server/update-check.js）
+  'GET /update/check',
 ];
 
 test('路由总数与重构前一致', () => {
@@ -241,6 +243,10 @@ test('自助接口不挂 requireAdmin（普通用户必须可用）', () => {
     // R8-14：只回 `{ passwordSet }`（不含 mode / 魔数）。普通用户必须能读到它，
     // 否则前端 `ensureUnlocked()` 恒真、加密文件的密码验证框永不出现。
     'GET /enc/status',
+    // R34：「关于」是设置页里**唯一保留给普通用户**的卡片（见 syssettings.js 的
+    // ADMIN_ONLY_CARDS），它上面的「检查更新」按钮就必须人人可点；误挂管理员守卫
+    // 会让普通用户一点就 403。只读、无参数、结果有 10 分钟缓存，无需写操作级保护。
+    'GET /update/check',
   ];
   const guardMap = new Map();
   const walk = (stack) => {

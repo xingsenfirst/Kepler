@@ -115,6 +115,10 @@ export const confirmDialog = async () => true;
 export const openModal = () => {};
 export const fmtTime = (s) => String(s || '');
 export const fmtSize = (n) => String(n);
+// R34：syssettings.js 新增了 updateNotice 具名导入 —— 沙箱里的 util 桩必须一并提供，
+// 否则 ESM 在**链接期**就报 does not provide an export named 'updateNotice'，
+// 本文件所有 import syssettings.js 的用例会整片变红（红的原因与它们要守的东西无关）。
+export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');
 `;
 
 const MAIN_STUB = `

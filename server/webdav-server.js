@@ -89,6 +89,32 @@ function hrefFor(key) {
 }
 
 /**
+ * 请求路径是否落在 WebDAV 挂载点上（R34）
+ *
+ * 判据此前**手写在 9 处**（`req.path.startsWith(MOUNT)` / `destPath.startsWith(MOUNT + '/')`），
+ * 而根路径 `/` 在其中的**大部分**地方被落在门外 —— 只有挂载点边界中间件显式放行了它。
+ * 于是同一个路径上的两个回答互相矛盾：
+ *   - `app.options()` 的路径参数是**正则**（匹配任意路径），`/` 命中 → **200 + `DAV: 1`**，
+ *     客户端据此判定「这里是 WebDAV」；
+ *   - `app.propfind('*')` 里的前缀判据把 `/` 挡掉 → 落到 Express 默认兜底，
+ *     回一页 **HTML 404 `Cannot PROPFIND /`**。
+ *
+ * 这正是用户报告的那条链：`OPTIONS /` 的 200 让客户端愿意弹凭据框 → 401 挑战 → 密码输对 →
+ * 列目录撞 404 → 客户端无法确认这是个集合 → 「输入的文件夹似乎无效，请选择另一个」。
+ * 密码框先弹、报错在其后，顺序完全对上。
+ *
+ * 根路径上那个 301（`app.get('/')`）救不了它：**WebDAV 客户端从不用 GET 打开集合**，
+ * 第一步就是 PROPFIND，重定向对它们等于不存在。
+ *
+ * 因此把 `/` 与 `/dav` 一样当作挂载点本身：`reqPathToKey` 对两者都得到空 key（根集合）。
+ * ⚠️ 只特判**正好等于** `/` 的根路径 —— 不能把整个根命名空间都算作挂载点，
+ * 那会撤销 FUN-06 划下的边界（「挂载点之外不可读、不可写」）。
+ */
+function inMount(reqPath) {
+  return reqPath === '/' || reqPath === MOUNT || reqPath.indexOf(MOUNT + '/') === 0;
+}
+
+/**
  * 请求路径 -> 对象 Key（去掉挂载前缀；目录保留尾部 /）
  *
  * SEC-12：与 `cos.js` 共用 `normalizeKey()`，不再手写剥离。
@@ -105,7 +131,11 @@ function reqPathToKey(reqPath) {
     err.status = 400;
     throw err;
   }
-  if (pth.startsWith(MOUNT)) pth = pth.slice(MOUNT.length);
+  // R34：前缀剥离必须按**路径段**匹配。手写 `startsWith(MOUNT)` 会把 `/davx` 的前缀也剥掉，
+  // 得到 key `x` —— 一个「管理界面看不到、WebDAV 却能读」的幽灵命名空间
+  // （与 SEC-12 修掉的 `..` 幽灵对象同型）。`inMount` 已经把这类路径挡在挂载点之外，
+  // 这里再独立成立一次，避免它成为后续调用者的陷阱。
+  if (pth === MOUNT || pth.indexOf(MOUNT + '/') === 0) pth = pth.slice(MOUNT.length);
   return normalizeKey(pth); // 禁 '..'、反斜杠归一、剥前导斜杠；空串表示根
 }
 
@@ -561,8 +591,13 @@ function buildApp() {
    * 从结构上保证「挂载点之外不可写、不可读」。
    */
   app.use((req, res, next) => {
-    // 根路径交给下面的重定向处理；其余必须在 MOUNT（/dav）之下或正好等于它
-    if (req.path === '/' || req.path === MOUNT || req.path.startsWith(MOUNT + '/')) return next();
+    // R34：`OPTIONS *` 是 RFC 4918 §9.1 要求的**服务级**能力探测（「本仓库在至少某些命名空间里
+    // 支持列出的特性」），它不指向任何资源，因此没有「在不在挂载点之下」可言 —— 必须放它过去
+    // 交给下面的 OPTIONS 处理器，否则它会被这里当成越界路径回 404，而规范要求 `DAV` 头
+    // **必须**出现在对 `*` 的 OPTIONS 响应上。旧实现就是这样把 `OPTIONS *` 答成 404 的。
+    if (req.method === 'OPTIONS' && req.path === '*') return next();
+    // 根路径 / 与 /dav 都算挂载点（见 inMount）；其余必须在 MOUNT（/dav）之下或正好等于它
+    if (inMount(req.path)) return next();
     return res.status(404).type('text/plain').send('404 Not Found：WebDAV 仅挂载于 ' + MOUNT + '/');
   });
 
@@ -587,7 +622,7 @@ function buildApp() {
    * 「资源在、但这个动词不支持」。适配的动词清单与上面的 `Allow` 头保持单一来源。
    */
   app.use((req, res, next) => {
-    if (!req.path.startsWith(MOUNT)) return next();
+    if (!inMount(req.path)) return next();
     const m = String(req.method || '').toUpperCase();
     if (WEBDAV_METHODS.has(m)) return next();
     res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY');
@@ -664,7 +699,7 @@ function buildApp() {
   };
   // PROPFIND 为非标准 HTTP 方法，Express 以小写方法名注册
   app['propfind']('*', (req, res, next) => {
-    if (!req.path.startsWith(MOUNT)) return next();
+    if (!inMount(req.path)) return next();
     propfind(req, res);
   });
 
@@ -792,8 +827,8 @@ function buildApp() {
    * 就是几十 GB 的无效流量与 CPU。R10-07 的修复（HEAD 不宣告 206）同样被这条短路，
    * 因为请求根本进不了 HEAD 分支。
    */
-  app.head('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, true) : next()));
-  app.get('*', (req, res, next) => (req.path.startsWith(MOUNT) ? getObject(req, res, false) : next()));
+  app.head('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, true) : next()));
+  app.get('*', (req, res, next) => (inMount(req.path) ? getObject(req, res, false) : next()));
 
   /* PUT：上传对象（经文件网关加密后上传）；路径以 / 结尾时等价 MKCOL */
   app.put('*', async (req, res) => {
@@ -853,7 +888,7 @@ function buildApp() {
 
   /* MKCOL：新建目录 */
   app[ 'MKCOL'.toLowerCase() ]('*', async (req, res, next) => {
-    if (!req.path.startsWith(MOUNT)) return next();
+    if (!inMount(req.path)) return next();
     try {
       const { cfg, cos } = await requireCos();
       const key = reqPathToKey(req.path);
@@ -876,7 +911,7 @@ function buildApp() {
 
   /* DELETE：经网关删除（自动清理加密元数据 + 审计） */
   app.delete('*', async (req, res, next) => {
-    if (!req.path.startsWith(MOUNT)) return next();
+    if (!inMount(req.path)) return next();
     try {
       const { cfg } = await requireCos();
       const key = reqPathToKey(req.path);
@@ -929,7 +964,12 @@ function buildApp() {
       // FUN-06：Destination 必须位于本服务的挂载点之下。
       // 旧实现只取 pathname 且**不校验前缀**，于是 Destination 指向 `/任意路径` 时
       // 会把对象写到挂载点命名空间之外，破坏「/dav 即逻辑边界」的约定。
-      if (!(destPath === MOUNT || destPath.startsWith(MOUNT + '/'))) {
+      //
+      // R34：判据收敛到 `inMount()`（此前是手写的 `=== MOUNT || startsWith(MOUNT + '/')`）。
+      // 根路径 `/` 也是挂载点（见 inMount），因此这里**放行**它，由紧随其后的
+      // `!dstKey` 以 400 拒掉 —— 把根集合整个换掉在 WebDAV 里没有合法语义，
+      // 但「是不是挂载点」与「能不能当目标」是两件事，不该在这行混着判。
+      if (!inMount(destPath)) {
         return res.status(403).type('text/plain')
           .send(`403 Forbidden：Destination 必须位于 ${MOUNT}/ 挂载点之下`);
       }
@@ -1226,8 +1266,8 @@ function buildApp() {
       }
     }
   }
-  app[ 'MOVE'.toLowerCase() ]('*', (req, res, next) => (req.path.startsWith(MOUNT) ? moveCopy(req, res, true) : next()));
-  app[ 'COPY'.toLowerCase() ]('*', (req, res, next) => (req.path.startsWith(MOUNT) ? moveCopy(req, res, false) : next()));
+  app[ 'MOVE'.toLowerCase() ]('*', (req, res, next) => (inMount(req.path) ? moveCopy(req, res, true) : next()));
+  app[ 'COPY'.toLowerCase() ]('*', (req, res, next) => (inMount(req.path) ? moveCopy(req, res, false) : next()));
 
   return app;
 }
@@ -1377,6 +1417,8 @@ module.exports = {
   start, apply, close, isRunning, serverUrl, MOUNT, DEFAULT_PORT,
   // 仅供测试：SEC-12 路径→Key 的归一化必须可被直接驱动（幽灵对象的根源在它）
   __reqPathToKey: reqPathToKey,
+  // 仅供测试：R34「挂载点判据唯一实现点」必须可被直接驱动（9 处手写正是根路径漏判的成因）
+  __inMount: inMount,
   __PROPFIND_CAP: PROPFIND_CAP,
   // 仅供测试：R21-14「错误响应不得回显上游原始 message」必须可被直接驱动
   __davErrorMessage: davErrorMessage,

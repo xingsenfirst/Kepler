@@ -597,6 +597,8 @@ export const openModal = (opts) => {
 };
 export const fmtTime = (s) => String(s || '');
 export const fmtSize = (n) => String(n);
+// R34：syssettings.js 新增了 updateNotice 具名导入 —— 桩必须同步（否则 ESM 链接期直接报错）
+export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');
 `;
 
 /** `main.js` 桩：只需 App.state.user（isAdmin / currentId 的判据），身份由 __me 控制 */

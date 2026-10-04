@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice } from './util.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
@@ -115,6 +115,9 @@ function wire() {
   // 负载均衡（仅管理员）：刷新用量
   const lbRefresh = document.getElementById('btn-lb-refresh');
   if (lbRefresh) lbRefresh.onclick = () => loadLoadBalance();
+  // 关于卡片：检查更新（**所有登录用户**可见 —— 关于卡片不属 ADMIN_ONLY_CARDS）
+  const btnUpdate = document.getElementById('btn-check-update');
+  if (btnUpdate) btnUpdate.onclick = checkUpdate;
   // 验证码服务
   const capEnabled = document.getElementById('captcha-enabled');
   if (capEnabled) capEnabled.addEventListener('change', () => {
@@ -134,6 +137,37 @@ function wire() {
       });
     });
   });
+}
+
+/**
+ * R34：「关于」卡片 → 「检查更新」。
+ *
+ * 两句文案由 `updateNotice()`（util.js，纯函数、可被测试断言）决定；
+ * 这里只负责「禁用按钮 → 请求 → 渲染 → 恢复按钮」的交互，且 `finally` 里**必然**
+ * 恢复按钮 —— 否则一次网络失败就会把按钮永久禁用，用户再也点不动。
+ */
+async function checkUpdate() {
+  const btn = document.getElementById('btn-check-update');
+  const out = document.getElementById('update-result');
+  if (btn) btn.disabled = true;
+  if (out) {
+    out.classList.remove('ok', 'warn');
+    out.textContent = '正在检查…';
+  }
+  try {
+    const r = await API.checkUpdate();
+    if (out) {
+      out.textContent = updateNotice(r);
+      out.classList.add(r && r.hasUpdate ? 'warn' : 'ok');
+    }
+  } catch (e) {
+    if (out) {
+      out.textContent = '检查更新失败：' + ((e && e.message) || '未知错误');
+      out.classList.add('warn');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function toggleBlocks() {

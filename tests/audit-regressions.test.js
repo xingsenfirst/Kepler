@@ -482,8 +482,14 @@ test('SEC-06 · CSP 移除 script-src unsafe-inline，并补齐 object-src/base-
 test('FUN-06/FUN-07 · WebDAV 统一挂载点守卫；网关复制处理 >5GB 对象', () => {
   const wd = readSrc('server/webdav-server.js');
   // FUN-06：必须是"前置统一中间件"，而不是逐方法判断（逐方法正是漏掉 PUT 的原因）
-  assert(/app\.use\(\(req, res, next\)[\s\S]{0,400}?startsWith\(MOUNT/.test(wd),
-    '应存在统一的前置挂载点中间件');
+  // R34：该中间件原先就地手写 `startsWith(MOUNT)` —— 正是那 9 处手写判据让根路径 `/` 漏判，
+  // 造成 `OPTIONS /` 回 200 而 `PROPFIND /` 回 HTML 404。判据已收敛为 `inMount()`，
+  // 故本条断言**随实现一起迁移**：仍要求「统一前置中间件」，但必须经唯一判据判定。
+  assert(/app\.use\(\(req, res, next\)[\s\S]{0,800}?inMount\(req\.path\)/.test(wd),
+    '应存在统一的前置挂载点中间件（且必须经唯一判据 inMount() 判定，不得就地手写前缀比较）');
+  // 「源码里不得再出现手写前缀判据」那条不在此处断言：本文件读的是**原文**（含注释），
+  // 而 R34 的说明注释里正当地引用了旧写法 `req.path.startsWith(MOUNT)` —— 在此处断言必然假红。
+  // 剥注释后的版本在 tests/audit34-regressions.test.js（它先 stripComments 再匹配）。
   assert(/Destination 必须位于/.test(wd), 'MOVE/COPY 的 Destination 必须校验挂载前缀');
   assert(/不支持跨主机 Destination/.test(wd), 'MOVE/COPY 的 Destination 必须校验主机');
 

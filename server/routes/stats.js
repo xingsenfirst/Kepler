@@ -3,6 +3,7 @@
  */
 const { express, configStore, statsStore } = require('./_context');
 const secureStore = require('../secure-store');
+const updateCheck = require('../update-check');
 const { LIMITS } = require('../limits');
 const { getClient, p, translateError, listAll } = require('../cos');
 const { requireConfig, requireAdmin, bucketCacheKey, asyncHandler, recordUsageDelta } = require('./_shared');
@@ -179,6 +180,22 @@ router.get('/health', (req, res) => {
   if (corruptFiles.length) { out.ok = false; out.corruptFiles = corruptFiles; }
   res.status(out.ok ? 200 : 503).json(out);
 });
+
+/* ============================ 更新检查 ============================ */
+
+/**
+ * GET /update/check —— 「关于」卡片里的「检查更新」按钮。
+ *
+ * **刻意不挂 `requireAdmin`**：「关于」是设置页里**唯一保留给普通用户**的卡片
+ * （见 `public/js/syssettings.js` 的 `ADMIN_ONLY_CARDS` 与 `refresh()` 的非管理员分支），
+ * 误挂管理员守卫会让普通用户点一下就 403 —— 而那正是需求要求「所有用户都能用」的按钮。
+ *
+ * 判据与缓存全部下沉到 `server/update-check.js`（版本比较的**唯一实现点**）；
+ * 这里只做「调用 + 回包」，出错时把 `status = 502` 交给全局错误处理器。
+ */
+router.get('/update/check', asyncHandler(async (req, res) => {
+  res.json(await updateCheck.checkForUpdate());
+}));
 
 module.exports = router;
 module.exports.adjustStorageCache = adjustStorageCache;

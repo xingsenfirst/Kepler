@@ -46,8 +46,26 @@ export function banNotice(err) {
   return text;
 }
 
-/* ------------------------------ Toast ------------------------------ */
+/**
+ * R34：「关于」卡片「检查更新」的结果文案。
+ *
+ * 需求给定的两句原文：
+ *  - 已是最新 → 「当前已是最新版本。」
+ *  - 有新版本 → 「当前版本：xxx，最新版：xxx。若要更新，请前往服务器终端执行重新安装的命令。」
+ *
+ * ⚠️ 与 `banNotice` 同因放在 util.js：纯函数才能被测试**真实断言** ——
+ * 只断言源码字样挡不住「两个版本号写反位」「拼错一个标点」这类事故，
+ * 而这两句正是用户唯一能看到的信息。
+ */
+export function updateNotice(r) {
+  if (!r || !r.latest) return '未能获取版本信息。';
+  if (r.hasUpdate) {
+    return `当前版本：${r.current}，最新版：${r.latest}。若要更新，请前往服务器终端执行重新安装的命令。`;
+  }
+  return '当前已是最新版本。';
+}
 
+/* ------------------------------ Toast ------------------------------ */
 export function toast(msg, opt = {}) {
   const root = document.getElementById('toast-root');
   const el = document.createElement('div');

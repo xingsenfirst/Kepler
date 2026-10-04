@@ -497,12 +497,17 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.3.0</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.4.0</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>
                   <li>基于 WTFPL 协议开源。</li>
                 </ul>
+                <!-- R34：检查更新 —— 对比 GitHub 上发布的最新版本。对**所有登录用户**可见（关于卡片不属仅管理员卡片） -->
+                <div class="about-update">
+                  <button id="btn-check-update" class="mini-btn" type="button">检查更新</button>
+                  <span id="update-result" class="about-update-result" role="status" aria-live="polite"></span>
+                </div>
               </div>
             </div>
           </div>

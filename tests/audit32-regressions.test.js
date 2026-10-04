@@ -355,6 +355,8 @@ export const confirmDialog = async (opts) => {
 export const openModal = () => {};
 export const fmtTime = (s) => String(s || '');
 export const fmtSize = (n) => String(n);
+// R34：syssettings.js 新增了 updateNotice 具名导入 —— 桩必须同步（否则 ESM 链接期直接报错）
+export const updateNotice = (r) => (r && r.hasUpdate ? '有新版本' : '当前已是最新版本。');
 `;
 
 /** 在临时模块图里放一份**真实**模块（连带它 import 的同目录依赖） */

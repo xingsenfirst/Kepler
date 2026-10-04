@@ -161,6 +161,10 @@ export function xhrPut(url, blob, onProgress) {
 
 export const API = {
   health: () => request('GET', '/api/health'),
+  // R34：「关于」卡片的「检查更新」——服务端去 GitHub 取最新版本号后与本机比较。
+  // 服务端代理（而不是浏览器直连 api.github.com）的两个理由：不受浏览器跨域/离线影响，
+  // 且「当前版本」只有服务端能拿到权威值（package.json），前端那个 Build 号是静态文本。
+  checkUpdate: () => request('GET', '/api/update/check'),
   getConfig: () => request('GET', '/api/config'),
   saveConfig: (b) => request('PUT', '/api/config', b),
   verifyConfig: (b) => request('POST', '/api/config/verify', b),

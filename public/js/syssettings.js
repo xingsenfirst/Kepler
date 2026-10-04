@@ -702,6 +702,33 @@ async function loadUsers() {
   }
 }
 
+/**
+ * 封禁状态的展示映射（前端**唯一**判据，R33）。
+ *
+ * `u.ban` 由服务端 `config-store.banInfo()` 算好，其中已有 `state`：`none` / `active` /
+ * `expired`。前端**刻意不再自行比较时间** —— 一旦这里也写一份「until < now」的判断，
+ * 浏览器时钟偏差、时区处理差异都会让两处判据分叉，表现就是「列表显示已解封、
+ * 登录仍被拒」这种只能翻代码才解释得通的现象。这里只做**枚举 → 文案**的映射。
+ */
+const BAN_LABEL = {
+  active: '已封禁',
+  expired: '封禁已到期',
+};
+
+function banBadge(u) {
+  const b = (u && u.ban) || {};
+  if (b.state === 'active') {
+    const bits = [];
+    if (b.reason) bits.push(`原因：${b.reason}`);
+    bits.push(b.until ? `解封时间：${fmtTime(b.until)}` : '解封时间：永久（需手动解封）');
+    return `<span class="lk-badge bad" title="${escapeHtml(bits.join('；'))}">${BAN_LABEL.active}</span>`;
+  }
+  if (b.state === 'expired') {
+    return `<span class="lk-badge gone" title="封禁已到期，该用户可正常登录；再点「封禁」可重新设置">${BAN_LABEL.expired}</span>`;
+  }
+  return '<span class="bk-sub">正常</span>';
+}
+
 function renderUsers() {
   const table = document.getElementById('user-table');
   if (!table) return;
@@ -716,7 +743,7 @@ function renderUsers() {
   table.innerHTML = `
     <table class="lk-table user-tbl">
       <thead><tr>
-        <th>用户名</th><th>角色</th><th>Windows Hello</th><th>创建时间</th><th>最后更新</th><th style="width:140px;text-align:right">操作</th>
+        <th>用户名</th><th>角色</th><th>状态</th><th>Windows Hello</th><th>创建时间</th><th>最后更新</th><th style="width:210px;text-align:right">操作</th>
       </tr></thead>
       <tbody>
         ${users.map((u) => {
@@ -732,14 +759,23 @@ function renderUsers() {
           // 管理员编辑自己时由 showUserForm 内部限制不可改角色，仍可管理自己的 Windows Hello。
           // 删除按钮：自己的行禁用（不能删除当前登录账户）
           const delBtn = `<button class="mini-btn danger" data-act="del" data-id="${escapeHtml(u.id)}" type="button" ${isSelf ? 'disabled title="不能删除当前登录账户"' : ''}>删除</button>`;
+          // R33：封禁 / 解封。自己的行不给按钮（服务端也会 400 拦下自封禁）——
+          // 否则管理员一不小心就把自己锁在系统外，且没有任何人能帮他解开。
+          const banned = (u.ban || {}).state === 'active';
+          const banBtn = isSelf ? ''
+            : (banned
+              ? `<button class="mini-btn" data-act="unban" data-id="${escapeHtml(u.id)}" type="button" title="立即解除封禁，该账户可立刻重新登录">解封</button>`
+              : `<button class="mini-btn danger" data-act="ban" data-id="${escapeHtml(u.id)}" type="button" title="设置封禁原因与到期时间">封禁</button>`);
           return `<tr>
             <td><b>${escapeHtml(u.username)}</b>${selfMark}</td>
             <td>${roleBadge}</td>
+            <td>${banBadge(u)}</td>
             <td>${helloBadge}</td>
             <td class="bk-sub">${fmtTime(u.createdAt)}</td>
             <td class="bk-sub">${fmtTime(u.updatedAt)}</td>
             <td class="lk-acts" style="text-align:right">
               <button class="mini-btn" data-act="edit" data-id="${escapeHtml(u.id)}" type="button">编辑</button>
+              ${banBtn}
               ${delBtn}
             </td>
           </tr>`;
@@ -757,8 +793,121 @@ function renderUsers() {
       btn.onclick = () => showUserForm(user);
     } else if (act === 'del') {
       btn.onclick = () => deleteUser(user);
+    } else if (act === 'ban') {
+      btn.onclick = () => showBanForm(user);
+    } else if (act === 'unban') {
+      btn.onclick = () => unbanUser(user);
     }
   });
+}
+
+/* ============================ 账户封禁（R33） ============================ */
+
+/** 封禁弹窗的默认到期时间（天）。留空才是永久，故给一个真实默认值避免误触"永久" */
+const BAN_DEFAULT_DAYS = 7;
+
+/** `datetime-local` 需要的**本地**时间串（`YYYY-MM-DDTHH:mm`，刻意不含时区） */
+function localDateTimeValue(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * 封禁弹窗：**封禁原因编辑框** + **到期时间选择器**（需求 2 / 4）。
+ *
+ * 时间控件用原生 `<input type="datetime-local">`（零依赖、无第三方日期库）。
+ * ⚠️ 它的值**不带时区**（形如 `2026-10-11T12:00`），必须由这里用
+ * `new Date(v).getTime()` 按**浏览器本地时区**换算成 epoch 毫秒后再提交；
+ * 直接把那个字符串发给服务端，在「浏览器时区 ≠ 服务器时区」时必然错位
+ * （服务端会按自己的时区解释它），表现为封禁提前/延后若干小时生效。
+ */
+function showBanForm(user) {
+  if (!user) return;
+  if (!isAdmin()) { toast('仅管理员可封禁用户', { type: 'warn' }); return; }
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="form-item">
+      <label>封禁原因 <span class="req">*</span></label>
+      <textarea id="ban-reason" rows="3" maxlength="200"
+        placeholder="将展示给被封用户，例如：多次上传违规内容"></textarea>
+      <div class="hint">该原因会显示在用户登录时，请填写得具体、可理解（最多 200 字）。</div>
+    </div>
+    <div class="form-item">
+      <label>封禁到期时间</label>
+      <input type="datetime-local" id="ban-until" value="${escapeHtml(localDateTimeValue(Date.now() + BAN_DEFAULT_DAYS * 86400000))}">
+      <div class="hint">到期后<b>自动解除</b>，无需手动操作。清空此项 = <b>永久封禁</b>（须管理员手动解封）。</div>
+    </div>
+    <div id="ban-msg" class="form-msg"></div>
+  `;
+
+  const m = openModal({
+    title: `封禁用户「${user.username}」`,
+    body: wrap,
+    foot: [
+      { text: '取消', onClick: (o, close) => close() },
+      { text: '确认封禁', cls: 'danger', onClick: (o, close) => submitBan(o, close, user) },
+    ],
+  });
+  // 该弹窗没有 input[type=text]，回车提交单独绑在原因框上
+  const reasonEl = wrap.querySelector('#ban-reason');
+  if (reasonEl) reasonEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitBan(m.overlay, m.close, user); }
+  });
+}
+
+async function submitBan(overlay, close, user) {
+  const reason = ((overlay.querySelector('#ban-reason') || {}).value || '');
+  const raw = ((overlay.querySelector('#ban-until') || {}).value || '');
+  const msgEl = overlay.querySelector('#ban-msg');
+  const showMsg = (text, cls) => {
+    if (!msgEl) return;
+    msgEl.textContent = text;
+    msgEl.className = 'form-msg show ' + cls;
+  };
+
+  // 只做「必填」这一类本地校验；原因长度、时间格式、时间是否已过一律由服务端裁定
+  // （`config-store.setUserBan()` 是唯一实现点），避免两处各写一份规则后逐渐分叉。
+  if (!reason.trim()) { showMsg('请填写封禁原因', 'bad'); return; }
+
+  let until = '';
+  if (raw) {
+    const ms = new Date(raw).getTime();
+    if (!Number.isFinite(ms)) { showMsg('封禁到期时间格式不正确', 'bad'); return; }
+    until = ms; // 本地时区 → epoch 毫秒（绝对时刻），服务端按 ISO 存储
+  }
+
+  try {
+    const r = await API.banUser(user.id, { reason: reason.trim(), until });
+    close();
+    await loadUsers();
+    const revoked = (r && r.sessionsRevoked) || 0;
+    toast(revoked > 0
+      ? `已封禁「${user.username}」，其 ${revoked} 个会话已立即失效`
+      : `已封禁「${user.username}」`, { type: 'success' });
+  } catch (e) {
+    showMsg(e.message || '封禁失败', 'bad');
+  }
+}
+
+/** 立即解除封禁（需求 3）。不需要二次确认之外的任何输入 —— 解封永远可以再封回去。 */
+async function unbanUser(user) {
+  if (!user) return;
+  if (!isAdmin()) { toast('仅管理员可解除封禁', { type: 'warn' }); return; }
+  const ok = await confirmDialog({ allowHtml: true,
+    title: '解除封禁',
+    message: `确定立即解除用户「<b>${escapeHtml(user.username)}</b>」的封禁吗？<br>解除后该账户可立即正常登录。`,
+    okText: '解除封禁',
+  });
+  if (!ok) return;
+  try {
+    await API.unbanUser(user.id);
+    await loadUsers();
+    toast('已解除封禁', { type: 'success' });
+  } catch (e) {
+    toast('解除封禁失败：' + e.message, { type: 'error', duration: 6000 });
+  }
 }
 
 /**

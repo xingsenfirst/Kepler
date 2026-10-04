@@ -1,6 +1,6 @@
 /** 应用入口 —— 全局状态、工具栏、状态栏、视图调度 */
 import { API } from './api.js';
-import { toast, fmtSize, fmtTime, openModal, escapeHtml, confirmDialog, showQuotaDialog } from './util.js';
+import { toast, fmtSize, openModal, escapeHtml, confirmDialog, showQuotaDialog, banNotice } from './util.js';
 import { explorer } from './explorer.js';
 import { tree } from './tree.js';
 import { ops } from './ops.js';
@@ -472,7 +472,9 @@ async function doAuthSubmit() {
       toast(authMode === 'init' ? '管理员账户创建成功，欢迎使用' : `欢迎回来，${r.user.username}`, { type: 'success' });
     }
   } catch (e) {
-    showAuthError(e.message || '登录失败');
+    // R33：封禁是「凭据正确但无权进入」，与「用户名或密码错误」不是一回事，
+    // 提示必须分开 —— 否则被封用户只会看到一句让人反复重试密码的误导信息。
+    showAuthError(e && e.banned ? banNotice(e) : (e.message || '登录失败'));
     resetAuthCaptcha(); // token 一次性使用，失败后需重新验证
   } finally {
     submitBtn.disabled = false;

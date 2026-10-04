@@ -3383,6 +3383,180 @@ const CASES = [
       testFile: 'audit32-regressions.test.js',
       minFail: 1,
     },
+    {
+      /**
+       * R33：用户管理「封禁」功能（管理员封禁他人 + 到期时间 + 解封 + 封禁原因 +
+       * 被封者登录时可见原因与解封时间）。
+       *
+       * 这一轮的落点比上一轮散：**存储判据、路由守卫、登录顺序、前端接线**四处，
+       * 每一处都能单独做错，且做错之后的症状都极具误导性：
+       *  - 判据里漏掉到期时间 → 封禁永不到期，管理员设的「到期时间」形同虚设；
+       *  - 写入后不落盘 → 跑得好好的，重启之后封禁整体消失；
+       *  - 漏掉 requireAdmin → 任何登录用户都能封掉管理员；
+       *  - 漏掉自封禁保护 → 系统里最后一个管理员能把自己锁在门外，且没人能解开；
+       *  - 封禁后不吊销会话 → 被封者拿着旧会话继续读写对象存储最长 30 天；
+       *  - **登录判定的顺序反了**（先按用户名判封禁、再验密码）→ 响应差异重新变成
+       *    用户名枚举通道，把 R21-05 / R22-01 刚收敛掉的东西又漏开一条；
+       *  - 第二步（Windows Hello）回带 banned 的 403 → 同上，还额外多一处；
+       *  - 前端把 datetime-local 的裸字符串直接提交 → 跨时区部署时封禁错位若干小时。
+       *
+       * 十七条各自瞄准一个独立的落点（`fail>=minFail` 只说明「有东西红了」，
+       * 所以每条的期望都是「至少一条、且必须包含它指名的那个用例」）。
+       */
+      name: 'R33-01a · 封禁判据忽略到期时间（管理员设的「到期时间」永不生效）',
+      file: 'server/config-store.js',
+      anchor: '  const active = Boolean(b.active) && (permanent || t > at);',
+      replacement: '  const active = Boolean(b.active);',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-01b · 封禁写入后不落盘（重启之后封禁整体消失）',
+      file: 'server/config-store.js',
+      anchor: "  user.ban = { active: true, reason: text, until: iso };\n  user.updatedAt = new Date().toISOString();\n  persist(cfg);",
+      replacement: "  user.ban = { active: true, reason: text, until: iso };\n  user.updatedAt = new Date().toISOString();",
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-01c · 去掉「到期时间必须晚于当前时间」的校验（写下一条出生即失效的封禁却回 ok）',
+      file: 'server/config-store.js',
+      anchor: "  if (iso && Date.parse(iso) <= Date.now()) {\n    throw Object.assign(new Error('封禁到期时间必须晚于当前时间'), { status: 400 });\n  }",
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-01d · 去掉「封禁原因必填」的校验（登录页只剩一句没有信息量的"你被封了"）',
+      file: 'server/config-store.js',
+      anchor: "  if (!text) throw Object.assign(new Error('请填写封禁原因'), { status: 400 });",
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-01e · userView 不再暴露封禁状态（列表与登录页都拿不到状态与原因）',
+      file: 'server/config-store.js',
+      anchor: '    ban: banInfo(u),\n',
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-02a · 封禁路由漏挂 requireAdmin（任何登录用户都能封掉管理员）',
+      file: 'server/routes/users.js',
+      anchor: "router.post('/users/:id/ban', requireAdmin, (req, res) => {",
+      replacement: "router.post('/users/:id/ban', (req, res) => {",
+      // 判据走 audit33（真发 HTTP 断言 403），而不是 routes-surface 的静态清单：
+      // 后者守的「mustBeAdmin」机制已由 R32-01c 反向对照过，这里要证的是**行为**。
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-02b · 去掉自封禁保护（最后一个管理员能把自己锁在门外，且没人能解开）',
+      file: 'server/routes/users.js',
+      anchor: "    if (target.id === req.authUser.id) {\n      return res.status(400).json({ error: '不能封禁当前登录的账户' });\n    }\n",
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-02c · 封禁后不吊销该用户的会话（被封者拿旧会话继续用最长 30 天）',
+      file: 'server/routes/users.js',
+      anchor: "    const n = authSession.destroyUserSessions(target.id);\n    statsStore.addLog({\n      action: 'users.ban', level: 'warn',",
+      replacement: "    const n = 0;\n    statsStore.addLog({\n      action: 'users.ban', level: 'warn',",
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-02d · 去掉解封的「当前未被封禁」判据（一个永远成功的解封按钮）',
+      file: 'server/routes/users.js',
+      anchor: "    if (configStore.banInfo(target).state === 'none') {\n      return res.status(400).json({ error: '该用户当前未被封禁' });\n    }\n",
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-03a · 登录路径不判封禁（被封者凭密码照常进入系统）',
+      file: 'server/routes/auth.js',
+      anchor: '    const ban = configStore.banInfo(raw);\n    if (ban.active) {',
+      replacement: '    const ban = configStore.banInfo(raw);\n    if (ban.active && false) {',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 顺序类缺陷的可观测后果：封禁判定一旦挪到**密码校验之前**，把密码打错的人
+       * 也会先收到「该账户已被封禁 + 原因 + 解封时间」的 403 —— 登录接口于是免费
+       * 提供了一条「该用户名存在且已被封禁」的枚举通道。
+       *
+       * 用两步变异真实还原「把判定挪到前面去」：先摘掉原位置的那段，再插到
+       * `authenticateUser` 之前（并按用户名查记录）。锚点含 `${user.username}` 与反引号，
+       * 故**必须**用双引号字符串书写（模板串会把 `${}` 当插值）。
+       */
+      name: 'R33-03b · 封禁判定挪到密码校验之前（密码错也能问出"这个号被封了"→ 用户名枚举）',
+      file: 'server/routes/auth.js',
+      mutations: [
+        {
+          anchor: "    const ban = configStore.banInfo(raw);\n    if (ban.active) {\n      statsStore.addLog({\n        action: 'auth.fail', level: 'warn',\n        detail: `被封禁的账户尝试登录（用户名：${user.username}；解封时间：${ban.until || '永久'}）`,\n      });\n      return res.status(403).json({\n        error: '该账户已被封禁',\n        banned: true,\n        reason: ban.reason,\n        until: ban.until,\n      });\n    }\n\n",
+          replacement: '',
+        },
+        {
+          anchor: '    const user = await configStore.authenticateUser(username, password);',
+          replacement: "    const _earlyBan = configStore.banInfo(configStore.findUserRaw(username));\n    if (_earlyBan.active) {\n      return res.status(403).json({ error: '该账户已被封禁', banned: true, reason: _earlyBan.reason, until: _earlyBan.until });\n    }\n    const user = await configStore.authenticateUser(username, password);",
+        },
+      ],
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-03c · 登录第二步回带 banned 的 403（匿名端点重新变成"该号存在且被封"的 oracle）',
+      file: 'server/routes/auth.js',
+      anchor: "    if (configStore.banInfo(raw).active) return authFail('该账户已被封禁');",
+      replacement: "    if (configStore.banInfo(raw).active) return res.status(403).json({ error: '该账户已被封禁', banned: true });",
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-04a · 前端「封禁」按钮没接上线（点了不弹窗、不发请求）',
+      file: 'public/js/syssettings.js',
+      anchor: "    } else if (act === 'ban') {\n      btn.onclick = () => showBanForm(user);\n    }",
+      replacement: '    }',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-04b · 前端「解封」按钮没接上线（点了不发任何请求）',
+      file: 'public/js/syssettings.js',
+      anchor: "    } else if (act === 'unban') {\n      btn.onclick = () => unbanUser(user);\n    }",
+      replacement: '    }',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-04c · datetime-local 的裸字符串直接提交（跨时区部署时封禁错位若干小时）',
+      file: 'public/js/syssettings.js',
+      anchor: '    until = ms;',
+      replacement: '    until = raw;',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-04d · 登录失败不按 e.banned 分岔（被封者只看到"用户名或密码错误"，反复重试密码）',
+      file: 'public/js/main.js',
+      anchor: "    showAuthError(e && e.banned ? banNotice(e) : (e.message || '登录失败'));",
+      replacement: "    showAuthError(e.message || '登录失败');",
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R33-04e · api.js 不把 banned/reason/until 挂回错误对象（登录页拿不到原因与解封时间）',
+      file: 'public/js/api.js',
+      anchor: "    if (data && data.banned) {\n      err.banned = true;\n      err.reason = data.reason || '';\n      err.until = data.until || '';\n    }\n",
+      replacement: '',
+      testFile: 'audit33-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES };

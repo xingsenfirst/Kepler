@@ -39,6 +39,8 @@ const EXPECTED = [
   'POST /auth/logout', 'POST /auth/logout-all', 'GET /auth/me', 'POST /auth/init',
   'GET /users/me', 'PUT /users/me',
   'GET /users', 'POST /users', 'PUT /users/:id', 'DELETE /users/:id', 'POST /users/:id/logout',
+  // R33：账户封禁 / 解封（管理员在「用户管理」中的封禁按钮与本行的时间选择器）
+  'POST /users/:id/ban', 'POST /users/:id/unban',
   'GET /captcha/public', 'GET /captcha/config', 'PUT /captcha/config',
   'GET /payment/config', 'PUT /payment/config/:platform',
   'POST /payment/config/:platform/validate', 'DELETE /payment/config/:platform',
@@ -130,6 +132,8 @@ test('敏感接口均挂载 requireAdmin', () => {
     // 服务端按 role 过滤返回内容（scope: 'all' | 'self'），而非拒绝访问。
     'POST /users', 'PUT /users/:id', 'DELETE /users/:id', 'POST /users/:id/logout',
     'POST /users/:id/webauthn/disable',
+    // R33：封禁会让账户立即失去登录能力（且波及资金/数据访问），属最高一级的管理动作
+    'POST /users/:id/ban', 'POST /users/:id/unban',
     'PUT /config',
     // 连接验证会回传云端全部桶名（SEC-11 账号资产）且请求方可带 endpoint（SEC-03 SSRF）
     'POST /config/verify',

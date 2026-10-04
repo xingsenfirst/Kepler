@@ -226,7 +226,7 @@
               <h3 class="sysset-h3"><span class="sysset-tag">用户</span><span id="sysset-user-title">用户管理</span> <span id="user-count" class="lk-count"></span>
                 <button id="btn-user-add" class="mini-btn primary sysset-action">＋ 添加用户</button></h3>
               <div class="enc-warn" id="sysset-user-intro">
-                <b>简要说明</b>：管理系统登录账户与权限。管理员可添加、编辑、删除用户并配置角色权限；普通用户仅可登录使用，无法进入用户管理。系统至少保留一个管理员，且不能删除当前登录账户。
+                <b>简要说明</b>：管理系统登录账户与权限。管理员可添加、编辑、删除用户并配置角色权限；普通用户仅可登录使用，无法进入用户管理。系统至少保留一个管理员，且不能删除当前登录账户。管理员还可<b>封禁</b>用户：填写封禁原因、选择到期时间后，该账户<b>立即</b>失去登录能力（在线会话同步失效），被封用户登录时会看到封禁原因与解封时间；到期自动解除，也可随时点「解封」立即恢复。
               </div>
               <div id="user-table" class="user-table"></div>
               <div class="card-note">
@@ -234,6 +234,7 @@
                   <li>用户数据加密存储于本地配置（<code>data/config.enc</code>），密码经 scrypt 加盐哈希保存，任何接口均不回传密码哈希。</li>
                   <li>会话默认 24 小时有效，服务重启后需重新登录。</li>
                   <li>新增用户默认角色为普通用户，可随时调整；角色为「管理员」的账户可进入系统设置中的用户管理。</li>
+                  <li>封禁原因是<b>必填项</b>，会原样展示给被封用户；到期时间留空表示<b>永久封禁</b>，须手动解封。管理员不能封禁自己（避免把系统里最后一个可用管理员锁在门外）。</li>
                 </ul>
               </div>
             </div>
@@ -496,7 +497,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.2.9</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.3.0</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

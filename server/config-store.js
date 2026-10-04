@@ -287,6 +287,14 @@ function normalize(raw) {
     // Windows Hello（WebAuthn）凭据兜底：结构不完整即视为未启用，
     // 避免脏数据导致登录时校验逻辑拿到半截字段而误放行。
     u.webauthn = normalizeWebauthn(u.webauthn);
+    /**
+     * R33：`u.ban` **刻意不在这里兜底**。
+     *
+     * 封禁标记的**唯一**读取入口是 `banInfo()`，而它内部无条件跑 `normalizeBan()`
+     * （写路径也由 `setUserBan` / `clearUserBan` 保证结构规范）。因此再在加载期
+     * 归一化一次，不会产生任何调用方能观察到的差异 —— 那就会是一行**没有护栏可钉**
+     * 的代码（谁把它删掉都不会有测试变红，久而久之被当成死代码）。宁可不要。
+     */
   }
   return cfg;
 }
@@ -1735,6 +1743,134 @@ function touchWebauthn(id, signCount) {
   return userView(user);
 }
 
+/* ======================================================================== *
+ * 账户封禁（R33）
+ *
+ * 需求：管理员可封禁其他用户 —— 指定**到期时间**与**封禁原因**，可随时手动解封；
+ * 被封禁者登录时能看到封禁原因与解封时间。
+ *
+ * 存储：`user.ban = { active, reason, until }`，`until` 一律是 ISO 8601 字符串
+ * （`''` = 永久封禁）。时间点存**绝对时刻**而非「本地时间字符串」，是因为前端
+ * `<input type="datetime-local">` 产出的是**不带时区**的裸时间（`2026-10-05T12:00`），
+ * 服务端按自己的时区去解析必然在跨时区部署下错位 —— 因此由前端换算成 epoch 毫秒
+ * 再提交，这里统一转成 ISO 存储（见 `parseBanUntil` / `banInfo`）。
+ * ======================================================================== */
+
+/** 封禁原因的字符上限（超出直接拒绝：日志、登录提示、表格 title 都要塞它） */
+const BAN_REASON_MAX = 200;
+
+/** 归一化用户上的封禁标记（结构不合法一律回落到"未封禁"） */
+function normalizeBan(b) {
+  const empty = { active: false, reason: '', until: '' };
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return empty;
+  return {
+    active: Boolean(b.active),
+    reason: typeof b.reason === 'string' ? b.reason : '',
+    until: typeof b.until === 'string' ? b.until : '',
+  };
+}
+
+/**
+ * 归一化「封禁到期时间」的输入。
+ *
+ * 接受三种形态：`null` / `''` / `undefined`（= 永久封禁）；epoch 毫秒（数值或
+ * 纯数字串，前端 `new Date(localValue).getTime()` 的产出）；可被 `Date.parse`
+ * 识别的 ISO 字符串。
+ *
+ * @returns {string|null} ISO 8601 字符串（`''` = 永久）；**null 表示输入非法**
+ */
+function parseBanUntil(v) {
+  if (v === undefined || v === null || v === '') return '';
+  if (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v.trim()))) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    const d = new Date(n);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  if (typeof v !== 'string') return null;
+  const t = Date.parse(v.trim());
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+/**
+ * 封禁的**唯一判据**：该用户此刻是否处于生效中的封禁状态。
+ *
+ * ⚠️ 绝不能拿 `user.ban.active` 直接当结论 —— 它只表示"管理员设过封禁"，而
+ * 封禁可能是**已到期**的。所有需要判断"现在能不能放行"的地方（登录、用户列表
+ * 的状态列）都必须走这里，否则两处判定一旦分叉，就会出现「列表显示已解封、
+ * 登录仍被拒」这类只能靠翻代码才能解释的现象。
+ *
+ * 到期判定刻意选 **fail-closed**：`until` 缺失**或解析不出时间**一律按**永久封禁**
+ * 处理。这与 WebAuthn 的「凭据不完整即视为未启用」（fail-open，防止用户被永久
+ * 锁死在登录页）方向相反，因为两者的代价不对称 —— 误判为封禁可由管理员一键解封，
+ * 而「封禁标记因数据瑕疵被静默忽略」是安全缺陷。
+ *
+ * @param {object} user 原始用户记录（非 userView）
+ * @param {number} [now] 判定时刻（便于测试注入）
+ * @returns {{state: 'none'|'active'|'expired', active: boolean, reason: string, until: string}}
+ */
+function banInfo(user, now) {
+  const b = normalizeBan(user && user.ban);
+  const at = now === undefined ? Date.now() : now;
+  const t = b.until ? Date.parse(b.until) : NaN;
+  const permanent = !b.until || !Number.isFinite(t);
+  const active = Boolean(b.active) && (permanent || t > at);
+  return {
+    // none = 从未封禁 / active = 封禁生效中 / expired = 封禁已到期（自动失效）
+    state: !b.active ? 'none' : (active ? 'active' : 'expired'),
+    active,
+    reason: b.reason,
+    until: b.until,
+  };
+}
+
+/**
+ * 封禁用户（管理员操作）。
+ *
+ * 原因必填：需求要求「用户登录时能看到封禁原因」，允许空原因会让那条提示变成
+ * 一句没有信息量的"你被封了"。长度上限见 `BAN_REASON_MAX`。
+ * `until` 留空 = 永久封禁（需管理员手动解封）。
+ */
+function setUserBan(id, { reason, until } = {}) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  const text = String(reason == null ? '' : reason).trim();
+  if (!text) throw Object.assign(new Error('请填写封禁原因'), { status: 400 });
+  if (text.length > BAN_REASON_MAX) {
+    throw Object.assign(new Error(`封禁原因最多 ${BAN_REASON_MAX} 个字符`), { status: 400 });
+  }
+  const iso = parseBanUntil(until);
+  if (iso === null) {
+    throw Object.assign(new Error('封禁到期时间格式不正确'), { status: 400 });
+  }
+  /**
+   * 到期时间已过 ⇒ 这条封禁**写下来就已经失效**（`banInfo()` 会判 `active=false`），
+   * 而接口却回 `ok:true`、界面还弹「已封禁」—— 典型的假成功。必须在写入前拒绝。
+   *
+   * 这条规则只在这里实现（前端那个 format 检查只是提前反馈）：否则两条规则迟早
+   * 会出现「界面放行、服务端另有一套」的分叉。
+   */
+  if (iso && Date.parse(iso) <= Date.now()) {
+    throw Object.assign(new Error('封禁到期时间必须晚于当前时间'), { status: 400 });
+  }
+  user.ban = { active: true, reason: text, until: iso };
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return userView(user);
+}
+
+/** 解除封禁（管理员操作）：立即恢复登录，无需等到期时间 */
+function clearUserBan(id) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  user.ban = normalizeBan(null);
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return userView(user);
+}
+
 /** 用户安全视图：绝不回传密码哈希/盐，也不回传 WebAuthn 公钥（仅回传是否启用） */
 function userView(u) {
   const w = normalizeWebauthn(u.webauthn);
@@ -1746,6 +1882,8 @@ function userView(u) {
     // Windows Hello：仅暴露"是否启用"与注册时间，公钥/凭据 ID 一律不出服务端
     webauthnEnabled: w.enabled,
     webauthnCreatedAt: w.enabled ? w.createdAt : '',
+    // 封禁状态：只暴露判定结果与展示所需字段，`normalizeBan` 的内部结构不外泄
+    ban: banInfo(u),
     createdAt: u.createdAt || '',
     updatedAt: u.updatedAt || '',
   };
@@ -1915,5 +2053,7 @@ module.exports = {
   listUsers, getUserById, userView, addUser, updateUser, removeUser, authenticateUser,
   // Windows Hello（WebAuthn）
   isWebauthnEnabled, getWebauthn, setUserWebauthn, clearUserWebauthn, touchWebauthn,
+  // R33：账户封禁
+  BAN_REASON_MAX, banInfo, setUserBan, clearUserBan,
   findUserRaw, findUserRawById, verifyUserPassword,
 };

@@ -26,6 +26,26 @@ export function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+/**
+ * R33：账户被封禁时的登录提示文案（需求 5：登录时能看到封禁原因与解封时间）。
+ *
+ * 服务端是在**密码校验通过之后**才下发 `reason` / `until` 的（见 `server/routes/auth.js`），
+ * 因此把这两项展示出来**不会**变成「该用户名是否存在」的枚举通道。
+ * `until` 为空串表示**永久封禁**，需管理员手动解除。
+ *
+ * ⚠️ 刻意放在 util.js 而不是 main.js：main.js 是带副作用的入口模块（import 即引导
+ * 整个应用、要 DOM 要 fetch），测试里无法单独载入；这里是纯函数，能被真实断言
+ * （见 tests/audit33-regressions.test.js），以免这段"给用户看的文案"长期没有护栏。
+ */
+export function banNotice(err) {
+  const reason = String((err && err.reason) || '').trim();
+  const until = String((err && err.until) || '').trim();
+  let text = '该账户已被封禁，无法登录。';
+  if (reason) text += `封禁原因：${reason}。`;
+  text += until ? `解封时间：${fmtTime(until)}。` : '解封时间：永久封禁（需管理员手动解除）。';
+  return text;
+}
+
 /* ------------------------------ Toast ------------------------------ */
 
 export function toast(msg, opt = {}) {

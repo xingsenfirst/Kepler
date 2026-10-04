@@ -108,12 +108,42 @@ router.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: '用户名或密码错误' });
     }
 
+    /**
+     * R33：账户封禁。
+     *
+     * 位置很关键 —— 必须**在密码校验通过之后**：若在校验之前按用户名判封禁，
+     * 登录接口的响应差异本身就成了**用户名枚举**通道（"存在且被封"与"不存在"
+     * 报文不同），而这一步之前的失败分支（`401 用户名或密码错误` + 空转哈希）
+     * 正是为了抹平这种差异而存在的。
+     *
+     * 顺序：先验密码 → 再看封禁 → 最后才决定走 Windows Hello 还是直接签发会话。
+     * 若把封禁判定放到 Hello 分支之后，被封者会被先要求做一次本机验证才被告知
+     * 「你已被封禁」，既多余又容易被误解为"验证失败"。
+     *
+     * 响应刻意带上 `reason` / `until`，供登录页显示封禁原因与解封时间（需求 5）。
+     * 用 403（凭据没错，但无权进入）而非 401，并且**不**计入失败锁定 ——
+     * 凭据正确却因封禁被拒不该把账户推向锁定，否则管理员刚解封又进不来。
+     */
+    const raw = configStore.findUserRawById(user.id);
+    const ban = configStore.banInfo(raw);
+    if (ban.active) {
+      statsStore.addLog({
+        action: 'auth.fail', level: 'warn',
+        detail: `被封禁的账户尝试登录（用户名：${user.username}；解封时间：${ban.until || '永久'}）`,
+      });
+      return res.status(403).json({
+        error: '该账户已被封禁',
+        banned: true,
+        reason: ban.reason,
+        until: ban.until,
+      });
+    }
+
     // 密码正确：若该用户启用了 Windows Hello，先不签发会话，要求第二步验签
     //
     // ⚠️ 必须用**原始用户记录**判断，不能用 authenticateUser 的返回值：
     //    后者是 userView（安全视图），不含 webauthn 字段，用它判断会恒为「未启用」，
     //    从而静默绕过整个 Windows Hello 二次验证 —— 这是一个高危的失效开放（fail-open）。
-    const raw = configStore.findUserRawById(user.id);
     if (configStore.isWebauthnEnabled(raw)) {
       const ctx = webauthnContext(req);
       const challenge = webauthn.issueChallenge('login', { userId: user.id, username: user.username });
@@ -189,6 +219,17 @@ router.post('/auth/login/webauthn', (req, res) => {
     const raw = configStore.findUserRaw(username);
     if (!raw) return authFail('用户不存在');
     if (!configStore.isWebauthnEnabled(raw)) return authFail('该账户未启用 Windows Hello');
+
+    /**
+     * R33：封禁判定在这一支必须**与上面两支完全同形**（都走 `authFail`），
+     * 绝不能回一条带封禁原因的 403 —— 本端点在 `PUBLIC_API` 白名单内、匿名可达，
+     * 那样等于重新开一个「该用户名存在**且**被封禁」的 oracle，把 R21-05 / R22-01
+     * 刚刚收敛掉的三支同形又漏掉一条。
+     *
+     * 走到这里意味着挑战是在**封禁之前**签发的（否则第一步已经 403 并附上原因），
+     * 属于极窄的时序窗口；被封者想看原因，回第一步即可。
+     */
+    if (configStore.banInfo(raw).active) return authFail('该账户已被封禁');
 
     const cred = configStore.getWebauthn(raw);
     // R24-02：`ctx` 已在入口处解析（那时与用户名无关），此处直接复用 —— 不要再解析一次

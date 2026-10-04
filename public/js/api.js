@@ -39,6 +39,16 @@ async function request(method, path, body, { signal, noAuthRedirect } = {}) {
      */
     if (data && data.code) err.code = data.code;
     if (data && data.quota) err.quota = data.quota;
+    /**
+     * R33：账户封禁同样带**结构化字段**（`banned` / `reason` / `until`）。
+     * 只留那句「该账户已被封禁」的文案，登录页就无从显示"为什么被封、什么时候解封"，
+     * 而这正是需求明确要求给被封用户看的两项信息（服务端已在校验密码后才下发）。
+     */
+    if (data && data.banned) {
+      err.banned = true;
+      err.reason = data.reason || '';
+      err.until = data.until || '';
+    }
     // 401 未登录 → 派发全局事件，由 main.js 统一跳回登录界面。
     // R8-12：服务端的 401 只有两种含义，这里都必须**真是**「没有有效会话」。
     // 「当前密码不正确」（webauthn 注册/关闭）已改为 403；登录类请求用 noAuthRedirect 排除。
@@ -170,6 +180,10 @@ export const API = {
   addUser: (b) => request('POST', '/api/users', b),
   updateUser: (id, b) => request('PUT', `/api/users/${encodeURIComponent(id)}`, b),
   deleteUser: (id) => request('DELETE', `/api/users/${encodeURIComponent(id)}`),
+  // R33：账户封禁 / 解封（仅管理员）。`until` 由 datetime-local 换算成 epoch 毫秒后提交，
+  // 留空即永久封禁 —— 服务端按绝对时刻存储，跨时区不会错位。
+  banUser: (id, b) => request('POST', `/api/users/${encodeURIComponent(id)}/ban`, b),
+  unbanUser: (id) => request('POST', `/api/users/${encodeURIComponent(id)}/unban`),
   // 自助资料（普通用户亦可调用；仅允许改用户名与密码）
   myProfile: () => request('GET', '/api/users/me'),
   updateMyProfile: (b) => request('PUT', '/api/users/me', b),

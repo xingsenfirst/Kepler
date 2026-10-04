@@ -176,6 +176,69 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * 封禁用户（仅管理员，R33）。
+ *
+ * 请求体：`{ reason, until }` —— `until` 为 epoch 毫秒（前端由 `datetime-local`
+ * 换算而来），缺省 / 空 = 永久封禁。校验（原因必填、长度、时间格式）全部收在
+ * `configStore.setUserBan()` 一处，路由不另写一份 —— 否则"接口说合法、存储说非法"
+ * 这类分叉迟早会出现。
+ *
+ * 为什么**没有**「至少保留一个管理员」的保护（删除 / 降级那两处有）：
+ * 封禁不允许作用于自己（下一行的自保护），因此发起者本人必然是未被封禁的管理员，
+ * 封谁都不会让系统失去全部可用管理员。删除 / 降级则可能作用在**自己以外的**最后一个
+ * 管理员上（自己还在，但对方被删后可能只剩自己，也可能自己没有管理权限），故需保护。
+ */
+router.post('/users/:id/ban', requireAdmin, (req, res) => {
+  try {
+    const target = configStore.getUserById(req.params.id);
+    if (!target) return res.status(404).json({ error: '用户不存在' });
+    if (target.id === req.authUser.id) {
+      return res.status(400).json({ error: '不能封禁当前登录的账户' });
+    }
+    const b = req.body || {};
+    const user = configStore.setUserBan(target.id, { reason: b.reason, until: b.until });
+    /**
+     * 封禁必须**立即生效**：只写标记不清会话的话，被封者手里的会话还能继续
+     * 读写对象存储，直到会话自然过期（最长 30 天）—— 那等于没封。
+     * 与改密 / 降权 / 删除同一处置（SEC-02），复用同一个撤销入口。
+     */
+    const n = authSession.destroyUserSessions(target.id);
+    statsStore.addLog({
+      action: 'users.ban', level: 'warn',
+      detail: `管理员「${req.authUser.username}」封禁用户「${user.username}」`
+        + `（原因：${user.ban.reason}；解封时间：${user.ban.until || '永久'}），其 ${n} 个会话已失效`,
+    });
+    res.json({ ok: true, user, sessionsRevoked: n });
+  } catch (e) {
+    sendError(res, e);
+  }
+});
+
+// 解除封禁（仅管理员，R33）：立即恢复登录，无需等到期时间
+router.post('/users/:id/unban', requireAdmin, (req, res) => {
+  try {
+    const target = configStore.getUserById(req.params.id);
+    if (!target) return res.status(404).json({ error: '用户不存在' });
+    /**
+     * 「有没有被封」的唯一判据是 `banInfo()`：已到期的封禁（state='expired'）也算
+     * "封过"，允许管理员显式把标记清干净；只有从未封禁过才拒绝 —— 否则一个
+     * 永远成功的「解封」按钮会让人以为刚才那一下真的解开了什么。
+     */
+    if (configStore.banInfo(target).state === 'none') {
+      return res.status(400).json({ error: '该用户当前未被封禁' });
+    }
+    const user = configStore.clearUserBan(target.id);
+    statsStore.addLog({
+      action: 'users.unban', level: 'warn',
+      detail: `管理员「${req.authUser.username}」解除了用户「${user.username}」的封禁`,
+    });
+    res.json({ ok: true, user });
+  } catch (e) {
+    sendError(res, e);
+  }
+});
+
 // 删除用户（禁止删除自己；系统至少保留一个管理员）
 router.delete('/users/:id', requireAdmin, (req, res) => {
   try {

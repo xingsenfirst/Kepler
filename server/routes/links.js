@@ -5,6 +5,7 @@
 const { express, configStore, statsStore, shareStore, paymentProviders, paymentRules } = require('./_context');
 const { getClient, p, normalizeKey, badRequest } = require('../cos');
 const { roleOf, requireConfig, baseName } = require('./_shared');
+const { parseSpeedLimitInput } = require('../limits');
 const router = express.Router();
 
 /** 当前支付能力快照（开关 + 凭证完整 + 可用渠道） */
@@ -33,7 +34,7 @@ function paidWarning(paid) {
   return '';
 }
 
-/** 校验并规范化链接参数，返回 {expiresHours, maxDownloads, password} 或抛出 badRequest */
+/** 校验并规范化链接参数，返回 {expiresHours, maxDownloads, password, speedLimit} 或抛出 badRequest */
 function parseLinkParams(b) {
   const out = {};
   if (b.expiresHours !== undefined) {
@@ -77,6 +78,21 @@ function parseLinkParams(b) {
     // required=false 时金额仍会保留，便于下次直接打开开关
     out.paid = { required: required && amountFen > 0, amountFen, currency: paymentRules.CURRENCY };
   }
+  /**
+   * R37：下载限速（字节/秒；0 = 不限）。
+   *
+   * ⚠️ 这里**只判合法性，不判「是否被上层限制」**。上层（API Key / 存储桶 /
+   * 用户管理）设了更小的值时，本字段照常保存 —— 实际生效速率由
+   * `server/throttle.js` 的 `resolveLimit()` 在下载时取各层最小值。
+   * 前端会先调 `GET /throttle/ceiling` 拿到上层下限并给出提示（需求里的
+   * 「已在 API Key 管理中设置限速为 xx MB/S」），但那是**提示**而不是拦截：
+   * 若在这里硬拒，用户就没法先在分享层填好值、等管理员放宽上层后再生效。
+   */
+  if (b.speedLimit !== undefined) {
+    const r = parseSpeedLimitInput(b.speedLimit);
+    if (!r.ok) throw badRequest(r.error);
+    out.speedLimit = r.value;
+  }
   return out;
 }
 
@@ -110,6 +126,7 @@ router.post('/links', async (req, res) => {
       maxDownloads: params.maxDownloads === undefined ? 0 : params.maxDownloads,
       password: params.password === undefined ? null : params.password,
       paid: params.paid,
+      speedLimit: params.speedLimit, // R37：未传 = 0（不限速）
       createdBy: (req.authUser && req.authUser.username) || '',
     });
     statsStore.addLog({

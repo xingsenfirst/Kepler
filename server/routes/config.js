@@ -8,6 +8,8 @@ const { requireAdmin, roleOf, credentialsFor, validateCredentialFormat, asyncHan
 const { assertSafeEndpoint } = require('../endpoint-guard');
 // R25：按 API Key 的配额用量（负载均衡卡片）与写入闸门同源
 const bucketStats = require('../bucket-stats');
+// R37：限速入参合法性的唯一判据（与配额一样，非法值绝不能静默归一化成 0 = 不限速）
+const { parseSpeedLimitInput } = require('../limits');
 
 const router = express.Router();
 
@@ -95,8 +97,15 @@ router.post('/credentials', requireAdmin, (req, res) => {
     if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
     quotaBytes = Math.floor(q);
   }
+  // R37：密钥级下载限速（字节/秒；0 = 不限速）——同款前置校验（见 limits.parseSpeedLimitInput）
+  let speedLimit;
+  if (b.speedLimit !== undefined) {
+    const r = parseSpeedLimitInput(b.speedLimit);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    speedLimit = r.value;
+  }
   try {
-    const cred = configStore.addCredential({ provider: b.provider, secretId, secretKey, remark: b.remark, endpoint: b.endpoint, quotaBytes, visibleToUsers: b.visibleToUsers, enabled: b.enabled });
+    const cred = configStore.addCredential({ provider: b.provider, secretId, secretKey, remark: b.remark, endpoint: b.endpoint, quotaBytes, visibleToUsers: b.visibleToUsers, enabled: b.enabled, speedLimit });
     // FUN-06：同上，新增密钥由本管理员接口显式设为当前（存储层不再自动改写）
     configStore.setActiveCredential(cred.id);
     statsStore.addLog({ action: 'config.save', detail: '保存访问密钥 ' + cred.secretIdMasked, level: 'info' });
@@ -151,6 +160,12 @@ router.put('/credentials/:id', requireAdmin, (req, res) => {
       const q = Number(b.quotaBytes);
       if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
       b.quotaBytes = Math.floor(q);
+    }
+    // R37：密钥级下载限速（0 = 不限速）。同上，「填了非法值」必须 400 而不是被归一化成 0。
+    if (b.speedLimit !== undefined) {
+      const r = parseSpeedLimitInput(b.speedLimit);
+      if (!r.ok) return res.status(400).json({ error: r.error });
+      b.speedLimit = r.value;
     }
     if (!configStore.updateCredential(req.params.id, b)) {
       return res.status(404).json({ error: '密钥不存在' });

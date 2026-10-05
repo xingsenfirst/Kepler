@@ -370,6 +370,12 @@ function makeFeSandbox(realFiles) {
   // 四张卡片都 import './listdialog.js'；组件本身也必须拷**真实**的那一份
   // （见文件头：写进 util.js 就会被桩掉，只能证明自洽）
   if (!realFiles.includes('listdialog.js')) fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
+  // R37：四张卡片还都 import './speedlimit.js'（「限速」列 + 限速对话框）。
+  // ESM 的**具名导入在链接期校验**：沙箱里少这个文件，四张卡片的**所有**用例会一起
+  // 报 ERR_MODULE_NOT_FOUND —— 红的原因与它们各自要守的东西毫无关系。
+  // 同样必须是**真实**的那一份（它只从 util.js 取 openModal / escapeHtml / toast 三个原语，
+  // 于是真实的对话框逻辑能跑在桩化的弹窗原语上）。
+  if (!realFiles.includes('speedlimit.js')) fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
   return dir;
 }
 

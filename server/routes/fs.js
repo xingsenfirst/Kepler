@@ -32,6 +32,8 @@ const security = require('../security'); // SEC-09：直链签发需记录来源
 const listCache = require('../list-cache'); // 目录列举短缓存（写操作由 cos.p 统一失效）
 const candidates = require('../search-candidates'); // 搜索候选集（带 TTL，写操作由 cos.p 统一失效）
 const { singleFlight } = require('../coalesce'); // R14-12：同目录并发请求合并（唯一实现点）
+// R37：下载限速的**唯一入口**（解析五层生效值 + 造出限速环节），三处出口共用
+const { makeThrottle } = require('../throttle');
 
 const router = express.Router();
 
@@ -978,7 +980,22 @@ router.get('/fs/download', async (req, res) => {
         throw e;
       }
     }
-    await streamDownload({ cos: client, bucket: cfg.bucket, region: cfg.region, key, fileName: baseName(key), encMeta, req, res, traffic });
+    await streamDownload({
+      cos: client, bucket: cfg.bucket, region: cfg.region, key, fileName: baseName(key), encMeta, req, res, traffic,
+      /**
+       * R37：下载限速。四层上下文全部来自**已经解析好的** `cfg`（`credentialId` /
+       * `bucketId` 由 `effective()` 一并给出），不再自己推导一次密钥或桶 ——
+       * 「本次下载实际用哪把密钥、哪个桶」只有一处判据，限速的层归属才能与它同源。
+       * 用户层取登录用户 id；链接层不适用（这不是分享下载）。
+       */
+      throttle: makeThrottle({
+        ip: security.clientIp(req),
+        method: req.method,
+        credentialId: cfg.credentialId,
+        bucketId: cfg.bucketId,
+        userId: (req.authUser && req.authUser.id) || '',
+      }),
+    });
     statsStore.addLog({ action: 'fs.download', detail: `下载 ${key}（${traffic.bytesDown} 字节${encLogSuffix(cfg.bucket, key)}）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
@@ -1018,6 +1035,15 @@ router.get('/fs/thumb', async (req, res) => {
  *
  * ⚠️ 是否需要进一步**限管理员**属于产品决策：前端「创建分享链接 → 直链」是对所有
  *    登录用户开放的既定功能，收口会改变普通用户的可用能力，故此处先做可观测 + 收敛窗口。
+ *
+ * ⚠️ **R37 补充：预签名直链是「下载限速」的已知旁路，且无法在本进程内堵住。**
+ *
+ * 直链把数据通路交给了对象存储：客户端拿到 URL 后**直接连云端**，字节根本不经过本服务，
+ * 因此限速环节（`throttle.createThrottleTransform()`）没有任何插入点 —— 这与 SEC-09
+ * 记录的「直链绕过分享链接全部限制」是同一个根因，属于同一个已知缺口的又一面。
+ * 可选的做法只有「禁掉直链」或「改用代理下发（放弃直连的带宽与成本优势）」，都是产品决策，
+ * 故这里如实记录而不是假装覆盖了。真正被限速覆盖的是三个**流经本服务**的出口：
+ * `GET /fs/download`、`GET /s/:id/dl`、WebDAV `GET`。
  */
 const MAX_PRESIGN_EXPIRES = 24 * 3600;
 

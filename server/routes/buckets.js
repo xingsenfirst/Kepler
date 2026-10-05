@@ -17,6 +17,8 @@ const {
 const gateway = require('../fs-gateway');
 // R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
 const { adjustStorageCache } = require('./stats');
+// R37：限速入参合法性的唯一判据（非法值绝不能静默归一化成 0 = 不限速）
+const { parseSpeedLimitInput } = require('../limits');
 
 const router = express.Router();
 
@@ -86,6 +88,13 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
   let region = String(b.region || '').trim();
   const q = b.quotaBytes !== undefined ? Number(b.quotaBytes) : 0;
   if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
+  // R37：桶级下载限速（字节/秒；0 = 不限速）
+  let speedLimit = 0;
+  if (b.speedLimit !== undefined) {
+    const r = parseSpeedLimitInput(b.speedLimit);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    speedLimit = r.value;
+  }
   try {
     // 从所选密钥推导服务商（桶的 provider 必须与密钥一致，否则后续操作用错 SDK）
     let provider;
@@ -160,6 +169,7 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
       quotaBytes: Math.floor(q),
       credentialId: b.credentialId,
       visibleToUsers: b.visibleToUsers, // 未传时由 addBucket 默认（对普通用户可见）
+      speedLimit, // R37：桶级下载限速（0 = 不限速）
     });
     // FUN-06：addBucket 不再自动改写全局默认桶，这里显式切换以保留原有 UX。
     // 走 setActiveBucket(id, {token, role}) —— 它按 FUN-15 语义处理：
@@ -179,6 +189,19 @@ router.put('/buckets/local/:id', (req, res) => {
     const q = Number(b.quotaBytes);
     if (!Number.isFinite(q) || q < 0) return res.status(400).json({ error: '配额容量不能为负数（0 表示无限制）' });
     b.quotaBytes = Math.floor(q);
+  }
+  /**
+   * R37：桶级下载限速（0 = 不限速）。
+   *
+   * 与 `quotaBytes`（R28-02）同样**只允许管理员设置**：下面的白名单会把非管理员的
+   * 一切字段（除 remark）删掉，因此普通用户改不动它。
+   * 这不是疏漏而是刻意 —— 限速是**被强制执行的限额**，若被约束方能自行调大，
+   * 闸门就等于自带一个「解除限制」按钮（与配额的自绕过是同一个问题）。
+   */
+  if (b.speedLimit !== undefined) {
+    const r = parseSpeedLimitInput(b.speedLimit);
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    b.speedLimit = r.value;
   }
   try {
     /**
@@ -385,6 +408,10 @@ router.get('/buckets/stats', async (req, res) => {
         credentialId: b.credentialId || '', // R25：负载均衡卡片据此把桶归到 API Key 下
         enabled: b.enabled !== false,
         blockOverseasIP: b.blockOverseasIP === true,
+        // R37：桶级下载限速（0 = 不限速）。这里**逐字段列出**返回结构，
+        // 新增字段必须同步加进来 —— 否则「存储桶管理」卡片的「限速」列会恒显示「不限速」，
+        // 而已设置的值只在对话框打开时才看得到（界面自相矛盾，且极难被发现）。
+        speedLimit: b.speedLimit || 0,
         active: b.id === activeBucketId,
         stats: { sizeBytes: null, objectCount: null, estimated: false, upBytes: c.up || 0, downBytes: c.down || 0, requests: c.req || 0, fragmentCount: null },
         error: '',

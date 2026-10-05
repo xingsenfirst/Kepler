@@ -393,6 +393,13 @@ function load() {
     r.bucketIds = r.bucketIds.map((x) => String(x || '').trim()).filter(Boolean);
     delete r.bucketId;
   }
+  // R37：历史规则没有 kind 字段 —— 它们**全部**是「拦截」规则，缺省即 block。
+  // 显式补上而不是靠 `undefined !== 'speed'` 隐式成立：隐式判据一旦有人写成
+  // `r.kind === 'block'` 就会把历史规则整批放行（本项目反复出现的一类失效）。
+  for (const r of guard.rules) {
+    r.kind = normalizeKind(r.kind);
+    r.speedLimit = coerceSpeedLimit(r.speedLimit);
+  }
   // 预解析每条规则的 target → _parsed，避免每次 evaluate 都重复 parseTarget（性能 #1）
   //
   // R28-01：判据不能只看 `text`。历史落盘里可能带着**已经被 JSON 破坏**的缓存
@@ -488,7 +495,36 @@ function normalizeBucketIds(bucketIds) {
 /** 作用范围签名（用于去重比较）：'' = 全局；'id1,id2,…' = 桶集合 */
 function scopeKey(ids) { return [...(ids || [])].sort().join(','); }
 
-function addRule({ target, remark, methods, bucketIds }) {
+/**
+ * 规则的两种用途（R37）：
+ *  - `'block'`（缺省，历史规则全是它）→ 命中即**拦截**；
+ *  - `'speed'`                      → 命中即**限速**（不拦截）。
+ *
+ * ⚠️ 两者共用同一张规则表、同一套 CIDR / 作用域 / 方法语义，但**判定必须互斥**：
+ * `matchRules()` 只认 `block`，`speedLimitFor()` 只认 `speed`。若 `matchRules` 忘了
+ * 过滤，一条「限速规则」会顺带把流量**拦死**——限速功能的误用形态里最严重的一种。
+ */
+const RULE_KINDS = ['block', 'speed'];
+
+function normalizeKind(k) {
+  return RULE_KINDS.includes(String(k)) ? String(k) : 'block';
+}
+
+/**
+ * 限速值的**粗存**：非数字一律归 0（0 = 不限速）。
+ *
+ * 这里刻意只做「粗存」，真正的判据（有限正数 → 向下取整，其余归 0）收敛在
+ * `server/throttle.js` 的 `normalizeSpeedLimit()` —— 它在限速生效的**唯一出口**
+ * （`pickEffective()`）上再归一化一次，因此本文件存进来的任何脏值都造不出
+ * 一个非法的生效速率。ip-guard 不能 require throttle（throttle 反过来 require
+ * 本模块，会成环），故这里不做完整归一化。
+ */
+function coerceSpeedLimit(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function addRule({ target, remark, methods, bucketIds, kind, speedLimit }) {
   const t = parseTarget(target);
   if (!t) { const e = new Error('IP 或 CIDR 格式不正确（示例：1.2.3.4 或 10.0.0.0/8）'); e.status = 400; throw e; }
   const bids = normalizeBucketIds(bucketIds);
@@ -500,6 +536,8 @@ function addRule({ target, remark, methods, bucketIds }) {
   const rule = {
     id: newId(), target: t.text, _parsed: t,
     remark: String(remark || '').slice(0, 100),
+    kind: normalizeKind(kind),
+    speedLimit: coerceSpeedLimit(speedLimit),
     methods: normalizeMethods(methods), bucketIds: bids, enabled: true,
     createdAt: new Date().toISOString(), hits: 0,
   };
@@ -514,11 +552,13 @@ function normalizeMethods(methods) {
     .filter((m) => ALLOWED_METHODS.includes(m));
 }
 
-function updateRule(id, { target, remark, methods, bucketIds }) {
+function updateRule(id, { target, remark, methods, bucketIds, kind, speedLimit }) {
   const g = load();
   const r = g.rules.find((x) => x.id === id);
   if (!r) { const e = new Error('规则不存在'); e.status = 404; throw e; }
   if (bucketIds !== undefined) r.bucketIds = normalizeBucketIds(bucketIds);
+  if (kind !== undefined) r.kind = normalizeKind(kind);
+  if (speedLimit !== undefined) r.speedLimit = coerceSpeedLimit(speedLimit);
   if (target !== undefined) {
     const t = parseTarget(target);
     if (!t) { const e = new Error('IP 或 CIDR 格式不正确'); e.status = 400; throw e; }
@@ -753,6 +793,9 @@ function matchRules(rules, ipInfo, method) {
   if (!ipInfo) return null;
   for (const r of rules) {
     if (!r.enabled) continue;
+    // R37：**限速规则绝不拦截**。两条判据必须互斥（见 RULE_KINDS 注释）：
+    // 少了这一行，「IP 地址限速」一加就把命中的 IP 直接挡在门外。
+    if (r.kind === 'speed') continue;
     // 用预解析缓存（load 或 addRule/updateRule 时计算），未缓存则惰性解析
     const t = r._parsed || parseTarget(r.target);
     if (!t || !cidrMatch(ipInfo, t)) continue;
@@ -760,6 +803,47 @@ function matchRules(rules, ipInfo, method) {
     return r;
   }
   return null;
+}
+
+/**
+ * 找出对 `ip` 生效的**限速**规则（R37），返回最严的一条。
+ *
+ * 与 `matchRules` 的分工：本函数只认 `kind === 'speed'` 且 `speedLimit > 0`，
+ * 不参与拦截判定。作用域语义与屏蔽规则一致：桶级规则只在 `bucketId` 命中时
+ * 参与，全局规则对所有请求生效。
+ *
+ * 多段同时命中时取**最小速率**（最严）—— 与五层之间「取最小值」同一口径：
+ * 一条宽网段给 10MB/s、其中又有一条 /32 给 1MB/s，来自那个 /32 的请求应当按 1 走。
+ *
+ * ⚠️ 入参与同文件的 {@link evaluate} 一致：**原始 IP 字符串**（内部自己
+ * `parseIpInfo`），不是 `security.clientIpInfo(req)` 那个 `{ip, fromForwarded}` 包装。
+ * 传错形状不会抛错 —— `cidrMatch` 读到 `undefined` 的 `ip`/`bytes` 只会恒不命中，
+ * 于是「IP 限速静默失效」。这正是本项目最忌讳的「改一处漏一处却全绿」，
+ * 故形状与同类函数**保持一致**，并对不可解析的地址返回 `null`（限速**放行**：
+ * 它是资源管理手段，不是安全边界，不该因为一个畸形地址把所有人限住）。
+ *
+ * @param {string} ip 客户端 IP（来自 `security.clientIp(req)`）
+ * @returns {{target: string, bytesPerSec: number}|null}
+ */
+function speedLimitFor(ip, method, bucketId) {
+  const info = parseIpInfo(ip);
+  if (!info) return null;
+  const m = String(method || 'GET').toUpperCase();
+  const g = load();
+  let best = null;
+  for (const r of g.rules) {
+    if (!r.enabled) continue;
+    if (r.kind !== 'speed') continue;                 // 屏蔽规则不参与限速
+    if (!(Number(r.speedLimit) > 0)) continue;        // 未填速率 = 这条规则不起作用
+    const t = r._parsed || parseTarget(r.target);
+    if (!t || !cidrMatch(info, t)) continue;
+    if (r.methods.length && !r.methods.includes(m)) continue;
+    const bids = Array.isArray(r.bucketIds) ? r.bucketIds : [];
+    if (bids.length && !(bucketId && bids.includes(bucketId))) continue; // 桶级规则只在目标桶命中时生效
+    const rate = Number(r.speedLimit);
+    if (!best || rate < best.bytesPerSec) best = { target: r.target, bytesPerSec: rate };
+  }
+  return best;
 }
 
 /**
@@ -925,6 +1009,8 @@ module.exports = {
   blockTip,
   listRules, addRule, updateRule, removeRule, setRuleEnabled, setBucketOverseas, removeRulesForBucket,
   invalidateOverseasCache,
+  // R37：IP 地址限速（kind='speed' 的规则）—— 只参与限速判定，绝不参与拦截
+  speedLimitFor, RULE_KINDS, normalizeKind,
   isChinaIP, isPrivateIP, isPrivateIPv6, parseTarget, parseIpInfo,
   ipv4ToInt, ipv6ToBytes, ipv6ToString, canonicalIpLiteral, cidrContains, cidrContainsV6, cidrMatch,
   buildIntervals, normalizeRanges,     // FUN-08：可在测试中直接验证归一化性质

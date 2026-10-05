@@ -814,6 +814,49 @@ input.full { width: 100%; }
 .ipg-test-ok { color: #16a34a; }
 .ipg-test-bad { color: var(--danger); }
 
+/* ---------------------- R37：下载限速 / IP 地址管理 ---------------------- */
+
+/* 「限速」列：数值徽章 + 「限速」按钮同行。四张列表卡片（用户 / 访问密钥 /
+   存储桶 / 分享链接）与它们各自的「显示全部」对话框共用 `speedlimit.speedCellHtml()`
+   这一个渲染器，所以只需要一条规则。 */
+.lk-speed { white-space: nowrap; }
+.lk-speed .mini-btn { margin-left: 6px; }
+
+/* IP 地址管理页的规则表：目标列是单个 IP / CIDR，等宽字体便于核对位数；
+   整行不折行（列多，折行会把「操作」列挤到看不清）。 */
+.ipg-table { min-width: 900px; }
+.ipg-table .lk-file { font-family: Consolas, "Courier New", monospace; }
+.ipg-table th, .ipg-table td { white-space: nowrap; }
+
+/* 规则弹窗里的「作用范围」穿梭框容器（内容复用 listdialog.buildTransferBox） */
+.ipg-scope-box { margin-top: 4px; }
+
+/* 预检结果里「命中限速但不拦截」的那一段：与「会被屏蔽」必须一眼可分 */
+.ipg-test-warn { color: #b45309; }
+
+/* 下载限速对话框（speedlimit.js）。
+   内容只有「实体名 + 一个数字输入框 + 说明」，刻意做窄（默认 480px 会显得空）。
+   上层提示行按需求原文句式渲染（「已在 X 中设置限速为 N MB/S」），用暖色底与
+   说明文字区分 —— 它是**提示**而非错误，但比普通说明更需要被看到。 */
+.dialog.speedlimit-dialog { width: min(420px, 94vw); }
+.sl-form { display: flex; flex-direction: column; gap: 10px; padding: 2px 0 4px; }
+.sl-line { display: flex; align-items: center; gap: 8px; }
+.sl-name { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-sub { font-size: 12px; color: var(--text-2); }
+.sl-input {
+  width: 130px; height: 34px; padding: 0 10px; font-size: 14px; text-align: right;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: #fff; color: var(--text);
+}
+.sl-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.sl-unit { font-size: 13px; color: var(--text-2); }
+.sl-note { font-size: 12px; line-height: 1.6; color: var(--text-2); }
+.sl-note b { color: var(--text); }
+.sl-ceil {
+  font-size: 12px; line-height: 1.6; color: #b45309; background: #fff7ed;
+  border: 1px solid #fde3c0; border-radius: 6px; padding: 6px 10px;
+}
+.sl-err { font-size: 12px; color: var(--danger); }
+
 /* ------------------------- WebDAV 服务 ------------------------- */
 .wd-url-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .wd-url {

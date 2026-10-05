@@ -3,6 +3,8 @@ import { API } from './api.js';
 import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
 import { openListDialog, bucketSelectOptions } from './listdialog.js';
 import { STATUS_META, statusOf, isDead } from './share-status.js';
+// R37：「限速」列（四张列表卡片共用的唯一实现点）
+import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
 
 let linksCache = [];
 let wired = false;
@@ -102,7 +104,7 @@ function render() {
 function linkTableHtml(links) {
   return `<table class="lk-table">
     <thead><tr>
-      <th>文件</th><th>分享者</th><th>存储桶</th><th>状态</th><th>有效期至</th><th>下载次数</th><th>密码</th><th>付费</th><th>创建时间</th><th style="width:150px">操作</th>
+      <th>文件</th><th>分享者</th><th>存储桶</th><th>状态</th><th>有效期至</th><th>下载次数</th><th>密码</th><th>付费</th><th>限速</th><th>创建时间</th><th style="width:150px">操作</th>
     </tr></thead>
     <tbody>
       ${links.map((l) => {
@@ -120,6 +122,7 @@ function linkTableHtml(links) {
           <td${dim}>${escapeHtml(fmtCount(l))}</td>
           <td${dim}>${l.hasPassword ? '🔒 已启用' : '—'}</td>
           <td${dim}>${fmtPaid(l)}</td>
+          <td${dim}>${speedCellHtml('link', l.id, l.speedLimit, true)}</td>
           <td${dim}>${escapeHtml(fmtTime(l.createdAt))}</td>
           <td class="lk-acts">
             <button class="mini-btn" data-act="copy" data-id="${escapeHtml(l.id)}">复制</button>
@@ -143,6 +146,16 @@ function bindLinkRowActions(root, links) {
     btn.onclick = () => {
       if (act === 'copy') copyUrl(l);
       else if (act === 'edit') openEditDialog(l);
+      /**
+       * R37：链接的限速。「文件分享」（创建链接对话框）与「链接管理」是同一条记录上的
+       * **同一个字段**，所以这里改的就是需求里「两者之间可随意修改」的那一处。
+       * 列表能看到的链接本来就都是自己创建的（普通用户）或全部（管理员），
+       * 与「编辑 / 删除」按钮同一口径，故 `canEdit` 恒为真。
+       */
+      else if (act === 'speed') openSpeedLimitDialog({
+        scope: 'link', id: l.id, name: l.fileName || l.key,
+        current: l.speedLimit, onSaved: refresh,
+      });
       else if (act === 'del') removeLink(l);
     };
   });

@@ -79,7 +79,8 @@
         <div class="side-foot">
           <button id="side-buckets" class="side-link">🪣 存储桶管理</button>
           <button id="side-links" class="side-link">🔗 链接管理</button>
-        <button id="side-orders" class="side-link">💰 订单管理</button>
+          <button id="side-orders" class="side-link">💰 订单管理</button>
+          <button id="side-ipmgr" class="side-link">🌐 IP 地址管理</button>
           <button id="side-dashboard" class="side-link">📊 监控仪表盘</button>
           <button id="side-logs" class="side-link">🗒️ 操作日志</button>
           <button id="side-settings" class="side-link">🔑 密钥设置</button>
@@ -122,29 +123,6 @@
             <div class="card-note">卡片列表<b>最多显示前 10 个</b>存储桶，更多时点「显示全部」打开对话框 —— 那里可按<b>服务商</b>筛选、用一个搜索框同时搜<b>存储桶名称与备注</b>，操作按钮与卡片完全一致。<br>已用容量按对象列表实时扫描统计（最多扫描 5000 个对象，超出为估算，缓存 5 分钟）；累计上传 / 下载流量与请求数为本系统经手操作的累计值。「清空文件」与「彻底删除」需手动输入完整存储桶名称确认；「解绑」仅移除本地记录。彻底删除要求桶内文件已清空且无分片上传碎片。</div>
           </div>
 
-            <!-- IP 访问屏蔽：规则的增删改与预检均为管理员专属（规则含其它用户的来源 IP），
-                 普通用户整卡隐藏（JS 在角色权威渲染点统一赋值，且不发起规则列表请求） -->
-            <div class="dash-card wide" id="ipguard-card">
-            <h3>IP 访问屏蔽 <span id="ipguard-count" class="lk-count"></span>
-              <button id="btn-ipguard-refresh" class="mini-btn">刷新</button>
-              <button id="btn-ipguard-add" class="mini-btn primary">＋ 添加屏蔽规则</button></h3>
-            <div class="ipguard-test-row">
-              <span class="bk-sub">规则预检：</span>
-              <input type="text" id="ipguard-test-ip" placeholder="输入 IP（如 8.8.8.8）" autocomplete="off" spellcheck="false">
-              <select id="ipguard-test-method" class="mini-select">
-                <option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option>
-                <option value="DELETE">DELETE</option><option value="HEAD">HEAD</option>
-              </select>
-              <select id="ipguard-test-scope" class="mini-select" title="按哪个作用范围预检">
-                <option value="">全局（无桶上下文）</option>
-                <option value="active">当前激活桶</option>
-              </select>
-              <button id="btn-ipguard-test" class="mini-btn">检测</button>
-              <span id="ipguard-test-result"></span>
-            </div>
-            <div id="ipguard-table"></div>
-            <div class="card-note">规则支持单个 IP（如 1.2.3.4）与 IP 段 CIDR（如 10.0.0.0/8）；「请求方法」留空表示屏蔽全部方法，也可只屏蔽指定方法（如仅屏蔽写操作 PUT/POST/DELETE 而放行读操作 GET/HEAD）。「作用范围」支持全局（对所有存储桶生效）与桶级（一个或多个存储桶，穿梭框选择）两级：桶级规则仅当访问目标为所选桶之一时参与判定（文件操作按当前激活桶、分享链接按其所属桶、桶管理操作按 URL 指定的桶）；判定时桶级规则优先、全局规则其次，两者独立配置、叠加生效——任一级别命中即屏蔽，全部未命中才放行。「屏蔽海外 IP」功能已迁移到「存储桶管理」列表中，可针对每个桶单独开启。存储桶被解绑或彻底删除时，仅作用于该桶的规则将被删除，多桶规则自动移除该桶引用。</div>
-          </div>
           </div>
         </section>
 
@@ -174,6 +152,42 @@
               <button id="btn-orders-clean" class="mini-btn danger" title="删除全部处于「支付失败」状态的订单；「已支付」「已退款」以及对账所需的在途订单不会删除。">删除失效订单</button></h3>
             <div id="ordermgr-table"></div>
             <div class="card-note">记录所有「需付费下载」链接产生的支付订单。文件名在创建订单时已快照保存，因此分享链接被删除后仍能核对款项对应的文件；「是否已下载」仅在下载<b>传输完成后</b>才标记，传输中途失败不会计入。支付结果由服务端向支付网关主动查单确认，页面上的状态随查单结果更新。<br><b>退款</b>仅对「已支付」的订单可用：本系统<b>不代持资金</b>，标记为已退款只是记账动作（该订单的支付凭证立即失效、金额不再计入「已收」），实际退款请在对应支付渠道后台完成。<br>「删除失效订单」只清理<b>支付失败</b>的流水：<b>已支付</b>与<b>已退款</b>是款项往来过的对账凭据，正在支付中或超出下单有效期的订单也不会被删除。</div>
+          </div>
+          </div>
+        </section>
+
+        <!-- IP 地址管理（R37：从「存储桶管理」页迁入 IP 访问屏蔽，并新增 IP 地址限速） -->
+        <section id="ipmgr" class="card-view" hidden>
+          <div class="dash-grid">
+            <!-- IP 访问屏蔽：规则的增删改与预检均为管理员专属（规则含其它用户的来源 IP），
+                 普通用户整卡隐藏（JS 在角色权威渲染点统一赋值，且不发起规则列表请求） -->
+            <div class="dash-card wide" id="ipguard-card">
+            <h3>IP 访问屏蔽 <span id="ipguard-count" class="lk-count"></span>
+              <button id="btn-ipguard-refresh" class="mini-btn">刷新</button>
+              <button id="btn-ipguard-add" class="mini-btn primary">＋ 添加屏蔽规则</button></h3>
+            <div class="ipguard-test-row">
+              <span class="bk-sub">规则预检：</span>
+              <input type="text" id="ipguard-test-ip" placeholder="输入 IP（如 8.8.8.8）" autocomplete="off" spellcheck="false">
+              <select id="ipguard-test-method" class="mini-select">
+                <option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option>
+                <option value="DELETE">DELETE</option><option value="HEAD">HEAD</option>
+              </select>
+              <select id="ipguard-test-scope" class="mini-select" title="按哪个作用范围预检">
+                <option value="">全局（无桶上下文）</option>
+                <option value="active">当前激活桶</option>
+              </select>
+              <button id="btn-ipguard-test" class="mini-btn">检测</button>
+              <span id="ipguard-test-result"></span>
+            </div>
+            <div id="ipguard-table"></div>
+            <div class="card-note">规则支持单个 IP（如 1.2.3.4）与 IP 段 CIDR（如 10.0.0.0/8）；「请求方法」留空表示屏蔽全部方法，也可只屏蔽指定方法（如仅屏蔽写操作 PUT/POST/DELETE 而放行读操作 GET/HEAD）。「作用范围」支持全局（对所有存储桶生效）与桶级（一个或多个存储桶，穿梭框选择）两级：桶级规则仅当访问目标为所选桶之一时参与判定（文件操作按当前激活桶、分享链接按其所属桶、桶管理操作按 URL 指定的桶）；判定时桶级规则优先、全局规则其次，两者独立配置、叠加生效——任一级别命中即屏蔽，全部未命中才放行。「屏蔽海外 IP」功能已迁移到「存储桶管理」列表中，可针对每个桶单独开启。存储桶被解绑或彻底删除时，仅作用于该桶的规则将被删除，多桶规则自动移除该桶引用。<br>只想「让它慢一点」而不想禁掉它？用下方的「IP 地址限速」卡片 —— 两者规则写法完全一致，但限速<b>不会拦截</b>请求。</div>
+          </div>
+            <div class="dash-card wide" id="ipspeed-card">
+            <h3>IP 地址限速 <span id="ipspeed-count" class="lk-count"></span>
+              <button id="btn-ipspeed-refresh" class="mini-btn">刷新</button>
+              <button id="btn-ipspeed-add" class="mini-btn primary">＋ 添加限速规则</button></h3>
+            <div id="ipspeed-table"></div>
+            <div class="card-note">对<b>固定 IP 或 CIDR 地址段</b>限制<b>下载速率</b>（规则写法与上面的屏蔽规则完全一致），适合给下载器 / 爬虫 / 合作方单独排队，而不必整个禁掉它。<br>限速按<b>地址段聚合</b>：一个 /24 段内的所有设备共享这份带宽，因此「每台 1 MB/s」要按段内设备数换算总量。命中限速规则的下载<b>不会被拒绝</b>，只是慢一些；它同样支持<b>全局 / 桶级</b>两级作用范围与<b>请求方法</b>过滤（下载走 GET / HEAD）。<br>本页限速与「API Key 管理 / 存储桶管理 / 用户管理 / 分享链接」里的限速<b>取最小值</b>生效：任何一处设了更小的值，实际速率就按那个更小的走。</div>
           </div>
           </div>
         </section>
@@ -510,7 +524,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.5.1</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.6.0</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

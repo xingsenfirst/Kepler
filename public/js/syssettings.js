@@ -2,6 +2,8 @@
 import { API } from './api.js';
 import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState } from './util.js';
 import { openListDialog } from './listdialog.js';
+// R37：「限速」列（四张列表卡片共用的唯一实现点）
+import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
@@ -798,7 +800,7 @@ function userTableHtml(users, currentId) {
   return `
     <table class="lk-table user-tbl">
       <thead><tr>
-        <th>用户名</th><th>角色</th><th>状态</th><th>Windows Hello</th><th>创建时间</th><th>最后更新</th><th style="width:210px;text-align:right">操作</th>
+        <th>用户名</th><th>角色</th><th>状态</th><th>Windows Hello</th><th>限速</th><th>创建时间</th><th>最后更新</th><th style="width:210px;text-align:right">操作</th>
       </tr></thead>
       <tbody>
         ${users.map((u) => {
@@ -826,6 +828,7 @@ function userTableHtml(users, currentId) {
             <td>${roleBadge}</td>
             <td>${banBadge(u)}</td>
             <td>${helloBadge}</td>
+            <td class="lk-speed">${speedCellHtml('user', u.id, u.speedLimit, true)}</td>
             <td class="bk-sub">${fmtTime(u.createdAt)}</td>
             <td class="bk-sub">${fmtTime(u.updatedAt)}</td>
             <td class="lk-acts" style="text-align:right">
@@ -860,6 +863,12 @@ function bindUserRowActions(root, users) {
       btn.onclick = () => showBanForm(user);
     } else if (act === 'unban') {
       btn.onclick = () => unbanUser(user);
+    } else if (act === 'speed') {
+      // R37：用户级下载限速。本卡片仅管理员可见，故 `canEdit` 恒为真
+      btn.onclick = () => openSpeedLimitDialog({
+        scope: 'user', id: user.id, name: user.username,
+        current: user.speedLimit, onSaved: loadUsers,
+      });
     }
   });
 }

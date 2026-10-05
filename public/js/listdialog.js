@@ -1,5 +1,10 @@
 /**
- * 通用「列表预览 + 显示全部对话框」组件（R36）
+ * 通用对话框组件（R36 起）
+ *
+ * 三个导出都是**可复用的界面组件**，与具体卡片无关：
+ *   - `openListDialog()`       「显示全部」对话框（带搜索 + 下拉筛选 + 滚动列表）
+ *   - `providerSelectOptions()` / `bucketSelectOptions()`  下拉选项推导
+ *   - `buildTransferBox()`      穿梭框（存储桶可见性 / IP 规则作用范围共用，R37 迁入）
  *
  * 背景：R35 为「用户管理」卡片做了「卡片只显示前 N 条 + 显示全部对话框（带搜索/滚动）」，
  * R36 要把同一套交互复制到访问密钥 / 存储桶 / 分享链接三张卡片。四份各写一遍必然分叉
@@ -157,4 +162,141 @@ export function bucketSelectOptions(rows, allText) {
   });
   return [{ value: '', text: allText || '全部存储桶' }]
     .concat(seen.map((b) => ({ value: b, text: b })));
+}
+
+/**
+ * 通用穿梭框（左列 = 未选集合，右列 = 已选集合）。
+ *
+ * R37：从 `bucketmgr.js` 迁到这里 —— 它原本只服务「存储桶可见性」与「IP 屏蔽规则 ·
+ * 作用范围」两处，而 IP 规则整体迁去 `ipmgr.js` 之后就成了**跨模块共用件**。
+ * 留在任一侧都会让另一侧 import 一个"管理页"模块（并牵出 main.js 的循环依赖），
+ * 因此与 `openListDialog` 一起放在本模块：两者都是「可复用的对话框组件」。
+ *
+ * @param {object} o
+ *  - items: [{ id, label, sub?, active? }]
+ *  - selectedIds: 初始选中 id 数组
+ *  - leftTitle / rightTitle: 列标题（可含徽标 HTML）
+ *  - filterLabels: { all, left, right } 筛选按钮文案
+ *  - hint / hintHtml: 顶部提示（默认按纯文本转义；显式传 `*Html` 才按可信 HTML 处理）
+ *  - countText: (total, selCount) => string 底部计数文案
+ * @returns {{ wrap: HTMLElement, getSelected: () => string[] }}
+ */
+export function buildTransferBox(o) {
+  const items = o.items || [];
+  const selected = new Set(o.selectedIds || []);
+  const fl = o.filterLabels || { all: '全部', left: '未选', right: '已选' };
+  // 安全默认：标题/hint 按纯文本转义渲染；仅显式传 *Html 才按可信 HTML 处理。
+  // （历史实现为原始 HTML 拼接，若将来传入桶名/备注等用户可控数据即成 XSS 注入点）
+  const hintHtml = o.hintHtml !== undefined ? String(o.hintHtml) : escapeHtml(o.hint || '');
+  const leftTitleHtml = o.leftTitleHtml !== undefined ? String(o.leftTitleHtml) : escapeHtml(o.leftTitle || '');
+  const rightTitleHtml = o.rightTitleHtml !== undefined ? String(o.rightTitleHtml) : escapeHtml(o.rightTitle || '');
+  const wrap = document.createElement('div');
+  wrap.className = 'perm-transfer';
+  wrap.innerHTML = `
+    <div class="perm-toolbar">
+      <div class="perm-search">
+        <input type="text" class="perm-q" placeholder="搜索…" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="perm-filter seg">
+        <button data-f="all" class="on">${escapeHtml(fl.all)}</button>
+        <button data-f="left">${escapeHtml(fl.left)}</button>
+        <button data-f="right">${escapeHtml(fl.right)}</button>
+      </div>
+    </div>
+    ${hintHtml ? `<div class="perm-hint bk-sub">${hintHtml}</div>` : ''}
+    <div class="perm-body">
+      <div class="perm-col">
+        <div class="perm-col-head">${leftTitleHtml}
+          <label class="perm-checkall" title="勾选本列全部（受搜索/筛选影响）"><input type="checkbox" class="perm-check-left"> 全选</label>
+        </div>
+        <ul class="perm-list perm-list-left"></ul>
+      </div>
+      <div class="perm-switch">
+        <button class="mini-btn" data-mv="right" title="将选中项移到右列">›</button>
+        <button class="mini-btn" data-mv="all-right" title="全部移到右列">»</button>
+        <button class="mini-btn" data-mv="left" title="将选中项移到左列">‹</button>
+        <button class="mini-btn" data-mv="all-left" title="全部移到左列">«</button>
+      </div>
+      <div class="perm-col">
+        <div class="perm-col-head">${rightTitleHtml}
+          <label class="perm-checkall" title="勾选本列全部（受搜索/筛选影响）"><input type="checkbox" class="perm-check-right"> 全选</label>
+        </div>
+        <ul class="perm-list perm-list-right"></ul>
+      </div>
+    </div>
+    <div class="perm-foot"><span class="bk-sub perm-count"></span></div>`;
+
+  const q = wrap.querySelector('.perm-q');
+  const filterBtns = wrap.querySelectorAll('.perm-filter button');
+  const leftUl = wrap.querySelector('.perm-list-left');
+  const rightUl = wrap.querySelector('.perm-list-right');
+  const checkLeft = wrap.querySelector('.perm-check-left');
+  const checkRight = wrap.querySelector('.perm-check-right');
+  const countEl = wrap.querySelector('.perm-count');
+  let filter = 'all'; // all | left | right
+
+  const itemLabel = (b) => (b.sub && b.sub !== b.label ? `${b.label}（${b.sub}）` : b.label);
+
+  function matches(b) {
+    const kw = q.value.trim().toLowerCase();
+    if (kw && !itemLabel(b).toLowerCase().includes(kw)) return false;
+    if (filter === 'left' && selected.has(b.id)) return false;
+    if (filter === 'right' && !selected.has(b.id)) return false;
+    return true;
+  }
+
+  function renderItem(b) {
+    const li = document.createElement('li');
+    li.className = 'perm-item';
+    li.dataset.id = b.id;
+    li.innerHTML = `
+      <input type="checkbox">
+      <span class="perm-itembody">
+        <b>${escapeHtml(b.label)}${b.active ? '<span class="perm-active" title="当前激活桶">当前</span>' : ''}</b>
+        <i class="bk-sub">${escapeHtml(b.sub || '')}</i>
+      </span>`;
+    li.querySelector('input').onchange = (e) => li.classList.toggle('checked', e.target.checked);
+    return li;
+  }
+
+  function render() {
+    leftUl.innerHTML = '';
+    rightUl.innerHTML = '';
+    for (const b of items.filter(matches)) {
+      (selected.has(b.id) ? rightUl : leftUl).appendChild(renderItem(b));
+    }
+    checkLeft.checked = false;
+    checkRight.checked = false;
+    countEl.textContent = o.countText(items.length, selected.size);
+  }
+
+  const checkedIds = (ul) => [...ul.querySelectorAll('.perm-item.checked')].map((li) => li.dataset.id);
+  const setCheckedAll = (ul, checked) => ul.querySelectorAll('.perm-item').forEach((li) => {
+    li.classList.toggle('checked', checked);
+    const cb = li.querySelector('input');
+    if (cb) cb.checked = checked;
+  });
+  const moveTo = (ids, side) => {
+    ids.forEach((id) => (side === 'right' ? selected.add(id) : selected.delete(id)));
+    render();
+  };
+
+  q.addEventListener('input', render);
+  filterBtns.forEach((btn) => {
+    btn.onclick = () => {
+      filterBtns.forEach((x) => x.classList.remove('on'));
+      btn.classList.add('on');
+      filter = btn.dataset.f;
+      render();
+    };
+  });
+  wrap.querySelector('[data-mv="right"]').onclick = () => moveTo(checkedIds(leftUl), 'right');
+  wrap.querySelector('[data-mv="all-right"]').onclick = () => moveTo([...leftUl.querySelectorAll('.perm-item')].map((li) => li.dataset.id), 'right');
+  wrap.querySelector('[data-mv="left"]').onclick = () => moveTo(checkedIds(rightUl), 'left');
+  wrap.querySelector('[data-mv="all-left"]').onclick = () => moveTo([...rightUl.querySelectorAll('.perm-item')].map((li) => li.dataset.id), 'left');
+  checkLeft.onchange = (e) => setCheckedAll(leftUl, e.target.checked);
+  checkRight.onchange = (e) => setCheckedAll(rightUl, e.target.checked);
+
+  render();
+  return { wrap, getSelected: () => [...selected] };
 }

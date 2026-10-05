@@ -26,6 +26,8 @@ const path = require('path');
 const providers = require('./providers');
 const paymentProviders = require('./payment-providers');
 const { assertSafeEndpoint } = require('./endpoint-guard');
+// R37：限速值的归一化判据（叶子模块，不会成环）
+const { normalizeSpeedLimit } = require('./limits');
 
 /**
  * R12-01：此前这里是全库唯一一处**硬编码**的 data 目录
@@ -248,6 +250,8 @@ function normalize(raw) {
     if (!providers.get(c.provider)) c.provider = providers.DEFAULT_PROVIDER_ID;
     if (typeof c.endpoint !== 'string') c.endpoint = '';
     c.quotaBytes = normalizeQuotaBytes(c.quotaBytes); // R25：凭据级配额兜底（历史记录 = 0 = 无限制）
+    // R37：历史密钥没有限速字段 → 0 = 不限速（**默认不限**，与本功能引入前的行为一致）
+    c.speedLimit = normalizeSpeedLimit(c.speedLimit);
   }
   // 桶记录兜底：历史桶默认启用（enabled 向后兼容）；blockOverseasIP 默认关闭（按桶屏蔽海外 IP，向后兼容）
   for (const b of cfg.buckets) {
@@ -256,6 +260,12 @@ function normalize(raw) {
     if (typeof b.endpoint !== 'string') b.endpoint = '';
     if (b.enabled === undefined) b.enabled = true;
     if (typeof b.blockOverseasIP !== 'boolean') b.blockOverseasIP = false;
+    b.speedLimit = normalizeSpeedLimit(b.speedLimit); // R37：桶级下载限速（0 = 不限）
+  }
+  // 用户记录兜底（R37：用户级下载限速）
+  for (const u of (Array.isArray(cfg.users) ? cfg.users : [])) {
+    if (!u || typeof u !== 'object') continue;
+    u.speedLimit = normalizeSpeedLimit(u.speedLimit);
   }
   if (!cfg.domains || typeof cfg.domains !== 'object') cfg.domains = { primary: '', backup: '' };
   if (!cfg.prefs || typeof cfg.prefs !== 'object') cfg.prefs = { aclReminderDisabled: false };
@@ -676,6 +686,7 @@ function credentialView(c) {
     secretIdMasked: maskSecretId(c.secretId),
     remark: c.remark || '',
     quotaBytes: normalizeQuotaBytes(c.quotaBytes), // R25：凭据级配额（0 = 无限制）
+    speedLimit: normalizeSpeedLimit(c.speedLimit), // R37：密钥级下载限速（0 = 不限）
     visibleToUsers: c.visibleToUsers !== false, // 对普通用户可见（默认 true，历史密钥向后兼容）
     enabled: c.enabled !== false, // 启用/停用（默认 true，历史密钥向后兼容）
     createdAt: c.createdAt || '',
@@ -741,7 +752,7 @@ function assertEndpointProvided(pid, endpoint) {
   throw err;
 }
 
-function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaBytes, visibleToUsers, enabled }) {
+function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaBytes, visibleToUsers, enabled, speedLimit }) {
   const cfg = requireStore();
   const now = new Date().toISOString();
   const pid = providers.get(provider) ? provider : providers.DEFAULT_PROVIDER_ID;
@@ -788,6 +799,7 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaB
     }
     if (remark !== undefined) exist.remark = String(remark || '');
     if (quotaBytes !== undefined) exist.quotaBytes = normalizeQuotaBytes(quotaBytes); // R25
+    if (speedLimit !== undefined) exist.speedLimit = normalizeSpeedLimit(speedLimit); // R37：未传即保持
     if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
     if (enabled !== undefined) exist.enabled = enabled !== false;
     // FUN-06：不再顺手改写全局 activeCredentialId。
@@ -806,6 +818,7 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaB
     remark: String(remark || ''),
     endpoint: ep,
     quotaBytes: normalizeQuotaBytes(quotaBytes), // R25：凭据级配额（0 = 无限制）
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：密钥级下载限速（0 = 不限）
     visibleToUsers: visibleToUsers !== false, // 默认对普通用户可见
     enabled: enabled !== false, // 默认启用（历史密钥向后兼容）
     createdAt: now,
@@ -873,6 +886,8 @@ function updateCredential(id, patch) {
   if (patch.remark !== undefined) c.remark = String(patch.remark || '');
   // R25：凭据级配额（0 = 无限制）。与桶配额同款归一化，负数/非法值一律落回 0。
   if (patch.quotaBytes !== undefined) c.quotaBytes = normalizeQuotaBytes(patch.quotaBytes);
+  // R37：密钥级下载限速（0 = 不限）。与配额同款「未传即保持」。
+  if (patch.speedLimit !== undefined) c.speedLimit = normalizeSpeedLimit(patch.speedLimit);
   if (patch.visibleToUsers !== undefined) c.visibleToUsers = patch.visibleToUsers !== false;
   if (patch.enabled !== undefined) {
     c.enabled = patch.enabled !== false;
@@ -898,6 +913,7 @@ function bucketView(b) {
     visibleToUsers: b.visibleToUsers !== false, // 对普通用户可见（默认 true，历史桶向后兼容）
     enabled: b.enabled !== false, // 启用/停用（默认 true，历史桶向后兼容）
     blockOverseasIP: b.blockOverseasIP === true, // 仅屏蔽海外 IP（按桶生效，默认 false）
+    speedLimit: normalizeSpeedLimit(b.speedLimit), // R37：桶级下载限速（0 = 不限）
     createdAt: b.createdAt || '',
   };
 }
@@ -1031,7 +1047,7 @@ function setBucketsVisibility(visibleIds) {
   return { ok: true, visibleCount };
 }
 
-function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId, visibleToUsers, enabled, blockOverseasIP }) {
+function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId, visibleToUsers, enabled, blockOverseasIP, speedLimit }) {
   const cfg = requireStore();
   const now = new Date().toISOString();
   // 服务商推导：绑定密钥的 provider 优先（桶必须与密钥同厂商，否则用错 SDK）；
@@ -1061,6 +1077,7 @@ function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId,
     if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
     if (enabled !== undefined) exist.enabled = enabled !== false;
     if (blockOverseasIP !== undefined) exist.blockOverseasIP = blockOverseasIP === true;
+    if (speedLimit !== undefined) exist.speedLimit = normalizeSpeedLimit(speedLimit); // R37
     // FUN-06：不再顺手改写全局 activeBucketId。
     //
     // FUN-15 已把「当前桶」变成会话级状态，setActiveBucket() 会区分
@@ -1082,6 +1099,7 @@ function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId,
     visibleToUsers: visibleToUsers !== false, // 默认对普通用户可见
     enabled: true, // 启用/停用（默认启用）
     blockOverseasIP: blockOverseasIP === true, // 按桶屏蔽海外 IP（默认关闭）
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：桶级下载限速（0 = 不限）
     createdAt: now,
   };
   cfg.buckets.push(b);
@@ -1104,6 +1122,9 @@ function updateBucket(id, patch) {
   if (patch.credentialId !== undefined) b.credentialId = String(patch.credentialId || '');
   if (patch.visibleToUsers !== undefined) b.visibleToUsers = patch.visibleToUsers !== false;
   if (patch.blockOverseasIP !== undefined) b.blockOverseasIP = patch.blockOverseasIP === true;
+  // R37：桶级下载限速（0 = 不限速）。未传即保持 —— 与配额/备注同款约定，
+  // 否则「只改备注」的请求会把限额悄悄清零。
+  if (patch.speedLimit !== undefined) b.speedLimit = normalizeSpeedLimit(patch.speedLimit);
   if (patch.enabled !== undefined) {
     b.enabled = patch.enabled !== false;
     // 停用时自动设为对普通用户不可见（与密钥停用一致）
@@ -1884,6 +1905,8 @@ function userView(u) {
     webauthnCreatedAt: w.enabled ? w.createdAt : '',
     // 封禁状态：只暴露判定结果与展示所需字段，`normalizeBan` 的内部结构不外泄
     ban: banInfo(u),
+    // R37：用户级下载限速（0 = 不限）。放在这里是因为「用户管理」卡片要按它显示限速按钮状态
+    speedLimit: normalizeSpeedLimit(u.speedLimit),
     createdAt: u.createdAt || '',
     updatedAt: u.updatedAt || '',
   };
@@ -1906,7 +1929,7 @@ function adminCount(cfg) {
   return (cfg.users || []).filter((u) => u.role === 'admin').length;
 }
 
-async function addUser({ username, password, role, permissions }) {
+async function addUser({ username, password, role, permissions, speedLimit }) {
   const name = normalizeUsername(username);
   assertPasswordPolicy(password);
   // R14-04：先把异步工作做完（scrypt 约 50~100ms），再取 store 并**同步**完成全部修改。
@@ -1931,6 +1954,7 @@ async function addUser({ username, password, role, permissions }) {
     permissions: normalizePermissions(permissions),
     // 新用户默认未启用 Windows Hello；启用须走"注册并验证凭据"的完整流程
     webauthn: normalizeWebauthn(null),
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：用户级下载限速（0 = 不限）
     createdAt: now,
     updatedAt: now,
   };
@@ -1974,6 +1998,7 @@ async function updateUser(id, patch) {
   if (patch.permissions !== undefined) {
     user.permissions = normalizePermissions(patch.permissions);
   }
+  if (patch.speedLimit !== undefined) user.speedLimit = normalizeSpeedLimit(patch.speedLimit); // R37：未传即保持
   user.updatedAt = now;
   persist(cfg);
   return userView(user);

@@ -28,6 +28,20 @@ const gateway = require('./fs-gateway');
  */
 const bucketStats = require('./bucket-stats');
 const ipGuard = require('./ip-guard');
+/**
+ * R37：下载限速的唯一入口。
+ *
+ * 客户端 IP 一律取 `security.clientIp(req)` 返回的**原始 IP 字符串** ——
+ * 与 `ipGuard.evaluate(ip, …)` / `speedLimitFor(ip, …)` 同形状；**不要**传
+ * `security.clientIpInfo(req)` 那个 `{ip, fromForwarded}` 包装对象（CIDR 匹配
+ * 会读到 `undefined`，于是「限速配好了却静默不生效」）。
+ *
+ * ⚠️ WebDAV 的 GET 是一条**独立的下发路径**（`r.stream.pipe(res)`），
+ * 不经过 `download-stream.streamDownload()`，因此**必须单独接线** ——
+ * 否则「主站下载被限速、WebDAV 挂载照样全速」，限速形同虚设（要求⑤）。
+ * 复用的是同一个工厂函数，不是另写一份限速逻辑。
+ */
+const { makeThrottle } = require('./throttle');
 const { LIMITS } = require('./limits');
 const { getSelfSignedCert } = require('./local-cert');
 
@@ -783,9 +797,33 @@ function buildApp() {
       if (r.lastModified) res.setHeader('Last-Modified', r.lastModified);
       if (r.etag) res.setHeader('ETag', r.etag);
       res.status(r.rangeServed ? 206 : 200);
-      r.stream.pipe(res);
+      /**
+       * R37：下载限速（复用与主站同一个限速环节）。
+       *
+       * 三处出口（`/fs/download`、`/s/:id/dl`、本处）都必须接线，任何一处漏掉
+       * 都是一个「不限速的旁路」—— 而 WebDAV 恰恰是最容易漏的那个：它的路径、
+       * 认证、响应头全部独立于 `download-stream.js`。
+       *
+       * ⚠️ **WebDAV 只覆盖 IP / API Key / 存储桶三层，没有「用户管理」层。**
+       * `req.webdavUser` 是 `cfg.webdav.accounts` 里的**应用凭据**
+       * （`{ id, appName, username }`），与系统用户表**没有关联字段**，无法可靠地
+       * 映射到某个系统用户。这里刻意**不猜**（按用户名同名去匹配会是个静默的错误归属），
+       * 因此 WebDAV 通道不受「用户管理」里的下载限速约束 —— 这是已知且写在文档里的缺口。
+       */
+      const throttle = makeThrottle({
+        ip: security.clientIp(req),
+        method: req.method,
+        credentialId: cfg.credentialId,
+        bucketId: cfg.bucketId,
+      });
+      r.stream.pipe(throttle || res);
+      if (throttle) throttle.pipe(res);
       r.stream.on('error', () => { try { res.destroy(); } catch (e2) { /* ignore */ } });
-      res.on('close', () => { try { r.stream.destroy(); } catch (e2) { /* ignore */ } });
+      res.on('close', () => {
+        try { r.stream.destroy(); } catch (e2) { /* ignore */ }
+        // 限速环节也要销毁：否则它内部的节拍定时器会残留（同 download-stream 的 teardown）
+        if (throttle) { try { throttle.destroy(); } catch (e2) { /* ignore */ } }
+      });
     } catch (e) {
       if (!res.headersSent) {
         /**

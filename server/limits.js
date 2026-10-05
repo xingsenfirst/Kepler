@@ -94,4 +94,61 @@ function resolveCap(requested, dflt) {
   return clamp(requested);
 }
 
-module.exports = { LIMITS, resolveCap, HARD_MAX };
+/* ============================ 下载限速（R37） ============================ */
+
+/**
+ * UI 的 MB 与字节的换算基数。
+ *
+ * 取 1024 而非 1000：与 `public/js/util.js` 的 `fmtSize()` 同基数 —— 界面上
+ * 「文件大小」与「限速」用两套基数，用户会算不平（1.5 MB/s 传输 150 MB 文件
+ * 到底要 100 秒还是 150 秒）。
+ */
+const MB = 1024 * 1024;
+
+/**
+ * 归一化限速值 → **非负整数字节/秒**；`0` = 不限速。
+ *
+ * 这是「什么是合法的限速值」的**唯一判据**，放在本文件（无任何 require 的叶子
+ * 模块）而不是 `throttle.js`：`config-store` / `share-store` 写盘时要用它归一化，
+ * 而 `throttle.js` 反过来要 require 它们 —— 判据若住在 `throttle.js` 就会成环。
+ *
+ * 约定与 `normalizeQuotaBytes` 一致：非有限数 / 非正数一律归 0（不限），
+ * 正数向下取整（速率是字节/秒，小数没有意义）。
+ */
+function normalizeSpeedLimit(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+/** 字节/秒 → MB/s（展示用，保留一位小数；0 = 不限速） */
+function toMBps(bytesPerSec) {
+  const n = normalizeSpeedLimit(bytesPerSec);
+  if (!n) return 0;
+  return Math.round((n / MB) * 10) / 10;
+}
+
+/**
+ * 校验**接口入参**里用户填的限速值 —— 四个设置入口（API Key / 存储桶 / 用户 /
+ * 分享链接）共用的**唯一实现点**。
+ *
+ * 为什么不能直接把 `b.speedLimit` 丢给 `normalizeSpeedLimit`：
+ * 它与配额（R25 的 `quotaBytes`）是同一个陷阱 —— 界面填 `-1` / `abc` 会被
+ * 归一化成 `0`，而 `0` 的语义是「**不限速**」。于是用户以为设置了限制，
+ * 实际把限制**完全放开**了（正好反了）。所以入参必须先判定合法性，
+ * 非法一律 400 让用户看见，而不是静默改写成「更宽松」的值。
+ *
+ * @param {*} v 原始入参
+ * @returns {{ok: true, value: number} | {ok: false, error: string}}
+ *          `value` 为向下取整的字节/秒；`0` = 不限速
+ */
+function parseSpeedLimitInput(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return { ok: false, error: '限速值不能为负数（0 表示不限速）' };
+  return { ok: true, value: Math.floor(n) };
+}
+
+module.exports = {
+  LIMITS, resolveCap, HARD_MAX,
+  MB, normalizeSpeedLimit, toMBps, parseSpeedLimitInput,
+};

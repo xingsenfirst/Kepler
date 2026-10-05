@@ -253,6 +253,10 @@ export const API = {
   deleteIpRule: (id) => request('DELETE', `/api/ipguard/rules/${encodeURIComponent(id)}`),
   testIpRule: (ip, method, bucketId) => request('GET', '/api/ipguard/test?' + qs({ ip, method, bucketId })),
 
+  // R37：下载限速的「上层下限」查询（`{ scope, id }` 或 `{ scope:'link', bucket }`）。
+  // 设置限速本身走各实体既有的 PUT（见 speedlimit.js 的 SAVE_BY_SCOPE），不另开写接口。
+  throttleCeiling: (p) => request('GET', '/api/throttle/ceiling?' + qs(p)),
+
   list: (p) => request('GET', '/api/fs/list?' + qs(p)),
   // opt.signal：供调用方取消在途搜索（服务端据此停止后续翻页，不再白扫）
   search: (p, opt) => request('GET', '/api/fs/search?' + qs(p), undefined, opt),

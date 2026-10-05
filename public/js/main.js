@@ -13,6 +13,7 @@ import * as ordermgr from './ordermgr.js';
 import * as bucketmgr from './bucketmgr.js';
 import * as syssettings from './syssettings.js';
 import * as credmgr from './credmgr.js';
+import * as ipmgr from './ipmgr.js';
 import { verifyWindowsHello, webauthnSupported } from './webauthn.js';
 import { providerMeta } from './provider-logos.js';
 import { openProfileDialog } from './profile.js';
@@ -549,10 +550,18 @@ function renderUserMenu() {
   const sideOrders = document.getElementById('side-orders');
   if (sideOrders) sideOrders.hidden = !isAdmin;
 
-  // IP 屏蔽规则的增删改与预检全部为管理员专属（规则详情含其它用户的来源 IP），
-  // 普通用户整卡隐藏；bucketmgr 会据此跳过规则列表请求，避免无谓 403。
+  // IP 地址管理（含「IP 访问屏蔽」+「IP 地址限速」两张卡）：规则详情含其它用户的
+  // 来源 IP，增删改与预检全部为管理员专属 —— 侧栏入口与整个页面一并隐藏。
+  // 普通用户既看不到入口，也进不去页面；ipmgr 会据此跳过规则列表请求，避免无谓 403。
+  const sideIpmgr = document.getElementById('side-ipmgr');
+  if (sideIpmgr) sideIpmgr.hidden = !isAdmin;
+  const ipmgrPage = document.getElementById('ipmgr');
+  if (ipmgrPage && !isAdmin) ipmgrPage.hidden = true;
+  // 卡片自身也按角色赋值：页面一旦被误切到，普通用户仍看不到规则表。
   const ipCard = document.getElementById('ipguard-card');
   if (ipCard) ipCard.hidden = !isAdmin;
+  const ipSpeedCard = document.getElementById('ipspeed-card');
+  if (ipSpeedCard) ipSpeedCard.hidden = !isAdmin;
 
   // 自定义请求域名：保存走 PUT /api/config（管理员专属），且是全局生效的共享设置。
   // 普通用户整卡隐藏；credmgr 据此跳过域名回填。
@@ -1066,6 +1075,7 @@ function bindToolbar() {
   $('side-buckets').onclick = () => { switchMainView('bucketmgr'); closeSidebar(); };
   $('side-links').onclick = () => { switchMainView('linkmgr'); closeSidebar(); };
   $('side-orders').onclick = () => { switchMainView('ordermgr'); closeSidebar(); };
+  $('side-ipmgr').onclick = () => { switchMainView('ipmgr'); closeSidebar(); };
   $('side-dashboard').onclick = () => { switchMainView('dashboard'); closeSidebar(); };
   $('side-logs').onclick = () => { switchMainView('dashboard'); dashboard.showLogs(); closeSidebar(); };
   $('side-settings').onclick = () => { switchMainView('credmgr'); closeSidebar(); };
@@ -1126,7 +1136,7 @@ function toggleSidebar(force) {
 }
 function closeSidebar() { toggleSidebar(false); }
 
-const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'bucketmgr', 'systemsettings', 'credmgr'];
+const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'ipmgr', 'bucketmgr', 'systemsettings', 'credmgr'];
 
 function switchMainView(v) {
   for (const id of MAIN_VIEWS) {
@@ -1136,6 +1146,7 @@ function switchMainView(v) {
   if (v === 'dashboard') dashboard.refresh();
   else if (v === 'linkmgr') linkmgr.refresh();
   else if (v === 'ordermgr') ordermgr.refresh();
+  else if (v === 'ipmgr') ipmgr.refresh();
   else if (v === 'bucketmgr') bucketmgr.refresh();
   else if (v === 'systemsettings') syssettings.refresh();
   else if (v === 'credmgr') credmgr.refresh();
@@ -1160,6 +1171,8 @@ function resetMainView() {
   }
   // 订单列表属于上一个账号的对账数据，换账号必须丢弃
   ordermgr.reset();
+  // IP 规则详情含其它用户的来源 IP，跨会话同样必须丢弃
+  ipmgr.reset();
   closeSidebar();
   // 关闭可能残留的浮层，避免跨会话泄漏上一账号的上下文
   const drawer = document.getElementById('upload-drawer');

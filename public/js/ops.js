@@ -3,6 +3,10 @@ import { API } from './api.js';
 import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime } from './util.js';
 import { App } from './main.js';
 import { openDownload } from './enc.js';
+// R37：文件分享的「下载限速」与「链接管理」是**同一份字段**（同一条分享记录上的
+// `speedLimit`），因此单位换算、入参校验、上层提示文案都复用同一个实现点，
+// 避免两个入口各写一套（最典型的分叉是「一边允许负号、另一边拦住」）。
+import { parseMbpsInput, ceilingText, fetchCeiling, toMBps } from './speedlimit.js';
 
 export const ops = {
   needConfig() {
@@ -184,6 +188,13 @@ export const ops = {
             <input id="lk-paid-amount" type="number" min="0.01" step="0.01" value="1.00" placeholder="1.00">
             <div class="hint">当前仅支持人民币（CNY），最低 <b>0.01</b> 元。下载者完成支付后方可取得下载权限；未支付、支付中或支付失败时会被拦截并给出提示。</div>
           </div></div>
+        <div class="form-item"><label>下载限速</label>
+          <div class="sl-line" style="margin-top:2px">
+            <input id="lk-speed" class="sl-input" type="number" min="0" step="0.1" placeholder="0" value="" autocomplete="off">
+            <span class="sl-unit">MB/s</span>
+          </div>
+          <div class="hint">填 <b>0</b> 或留空表示<b>不限速</b>。限速按<b>链接聚合</b>：这条链接上的并发下载共享这一份带宽。上层（API Key / 存储桶 / 用户）若已设了更小的值，实际按那个更小的走。</div>
+          <div class="sl-ceil" id="lk-speed-ceil" hidden></div></div>
       </div>`;
 
     const expiresSel = wrap.querySelector('#lk-expires');
@@ -194,6 +205,8 @@ export const ops = {
     const paidRow = wrap.querySelector('#lk-paid-row');
     const paidAmount = wrap.querySelector('#lk-paid-amount');
     const managedFields = wrap.querySelector('#lk-managed-fields');
+    const speedInput = wrap.querySelector('#lk-speed');
+    const speedCeil = wrap.querySelector('#lk-speed-ceil');
     pwOn.addEventListener('change', () => { pwInput.disabled = !pwOn.checked; if (pwOn.checked) pwInput.focus(); });
     paidOn.addEventListener('change', () => {
       paidRow.style.display = paidOn.checked ? '' : 'none';
@@ -207,6 +220,30 @@ export const ops = {
         expiresSel.querySelector('option[value="0"]').disabled = direct;
       });
     });
+
+    // R37：上层限速提示。需求原文：在「文件分享」里设限速时，若 API Key 管理已设了
+    // 更小的值，要提示「已在 API Key 管理中设置限速为 xx MB/S」。
+    //
+    // 「这个桶归哪把密钥」的归属判据**只在服务端**（`config-store.activeCredential`），
+    // 所以提示值一律向 `/throttle/ceiling` 要 —— 在浏览器里重写一份归属推导，
+    // 必然与下载时真正生效的那份分叉（前端算出一个数、实际按另一个数跑）。
+    // 异步查、失败降级为「无提示」：提示不能成为保存的前置条件。
+    // 此刻链接还不存在，因此按「当前生效桶」查；创建者就是当前登录用户。
+    let ceilData = null;
+    const refreshCeil = () => {
+      const r = parseMbpsInput(speedInput.value);
+      const txt = ceilingText(ceilData, r.ok ? r.bytes : 0);
+      speedCeil.hidden = !txt;
+      speedCeil.textContent = txt;
+    };
+    speedInput.addEventListener('input', refreshCeil);
+    refreshCeil();
+    (async () => {
+      const bucketName = (App.state.config && App.state.config.bucket) || App.state.bucket || '';
+      if (!bucketName) return;
+      ceilData = await fetchCeiling({ scope: 'link', bucket: bucketName });
+      refreshCeil();
+    })();
 
     const modal = openModal({
       title: '创建分享链接', body: wrap,
@@ -254,6 +291,13 @@ export const ops = {
               }
               body.paid = { required: true, amount };
             }
+            // 下载限速（R37）：0 / 留空 = 不限速。判据与服务端 `limits.parseSpeedLimitInput`
+            // 完全一致（前端这一层只为当场给出看得懂的提示，服务端仍会再校验一次）。
+            // 刻意**不**因「超过上层限制」而拒绝保存 —— 允许多层配置里先把下层配好、
+            // 等上层放宽后自然生效；实际速率由服务端取各层最小值。
+            const sp = parseMbpsInput(speedInput.value);
+            if (!sp.ok) return toast(sp.error, { type: 'error' });
+            body.speedLimit = sp.bytes;
             const r = await API.createLink(body);
             close();
             const url = location.origin + '/s/' + r.id;
@@ -277,7 +321,10 @@ function showLinkResult(url, opt = {}) {
     ? ''
     : `有效期：${opt.hours ? (opt.hours >= 24 ? (opt.hours / 24) + ' 天' : opt.hours + ' 小时') : '永久'} · `
       + `下载次数：${opt.maxDownloads > 0 ? opt.maxDownloads + ' 次' : '不限制'} · 密码：${opt.hasPassword ? '已启用' : '无'}`
-      + paidTxt;
+      + paidTxt
+      // R37：如实回显本条链接自己的限速设置（可能是 0 = 不限速）。实际生效值可能
+      // 更小（上层更严），这里只陈述「这条记录上写了什么」，不冒充生效值。
+      + ` · 限速：${(opt.link && opt.link.speedLimit) ? toMBps(opt.link.speedLimit) + ' MB/s' : '不限速'}`;
   const wrap = document.createElement('div');
   wrap.innerHTML = `
     <div class="ok-note">链接创建成功</div>

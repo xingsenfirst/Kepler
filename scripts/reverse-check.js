@@ -4177,6 +4177,159 @@ const CASES = [
       testFile: 'audit36-regressions.test.js',
       minFail: 1,
     },
+
+    /* ---------------- R37 · 下载限速（五层取最小）+ IP 地址管理页 ----------------
+     * 本轮是**功能需求**，且它的失效方式有一个共同特征：**看起来全都配好了、实际一点没限**。
+     * 因此对照分四类：
+     *  ① 多层取最小 / 层聚合的语义（取成最大、把 0 当有效值、IP 层传错形状）；
+     *  ② 节拍器本身（限速失效、写间隔无上界、并发不公平）—— 这一层**只有计时能证伪**；
+     *  ③ 两类 IP 规则互斥（屏蔽不产生限速、限速不拦截、禁用/0 速率不生效）；
+     *  ④ 接线与迁移（三个下载出口漏一个、接口表字段半路流失、卡片搬回去）。
+     */
+    {
+      // 「各层取最小值」写反成取最大值 = 限速整体失效（用户以为设了 5MB/s，实际按最大的那层走）。
+      name: 'R37-01a · pickEffective 改成取**最大值**（多层限速的语义反了）',
+      file: 'server/throttle.js',
+      anchor: '    if (l.bytesPerSec < best.bytesPerSec) best = l; // 严格小于：同值保持更高优先层',
+      replacement: '    if (l.bytesPerSec > best.bytesPerSec) best = l; // 变异：取最大',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 0 = 「这一层没设」，必须先从候选里剔掉；否则取最小值会得到 0，
+      // 表现是「一设限速就完全下不动」——而且是在**别的层**设的限速把它压死的。
+      name: 'R37-01b · pickEffective 把 0 当作有效限速参与取最小（下载被压成 0）',
+      file: 'server/throttle.js',
+      anchor: '    .filter((l) => l && normalizeSpeedLimit(l.bytesPerSec) > 0)',
+      replacement: '    .filter((l) => Boolean(l))',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 本轮的**头号静默失效**：`speedLimitFor` 只接受原始 IP 字符串，传
+      // `{ip, fromForwarded}` 包装对象时 CIDR 匹配读到 `undefined`，恒不命中 ——
+      // IP 限速「配好了、保存成功、界面显示生效」，实际全速下载。
+      name: 'R37-01c · resolveLimit 给 speedLimitFor 传包装对象（IP 限速静默失效）',
+      file: 'server/throttle.js',
+      anchor: "  const ipHit = ipGuard.speedLimitFor(ctx.ip, ctx.method || 'GET', ctx.bucketId);",
+      replacement: "  const ipHit = ipGuard.speedLimitFor({ ip: ctx.ip, fromForwarded: false }, ctx.method || 'GET', ctx.bucketId);",
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 退回朴素的「攒够一整块、等够这一块的时间、再整块放行」实现：平均速率看着是对的，
+      // 但**写间隔没有任何上界**（1KB/s + 64KB 分块 = 64 秒静默），
+      // `res.setTimeout(10min)` 这个**无活动**超时会把正常下载判死。
+      // 这是本轮唯一只有计时类断言能证伪的形态。
+      name: 'R37-02a · 节拍器退回「攒够一整块再放行」（写间隔无上界 → 无活动超时误杀）',
+      file: 'server/throttle.js',
+      anchor: '    if (!timer && !t.destroyed) timer = setTimeout(pump, SLICE_MS);',
+      replacement: '    if (!timer && !t.destroyed) timer = setTimeout(pump, Math.max(SLICE_MS, Math.floor((buf ? buf.length : 1) / Math.max(1, b.rate / 1000))));',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 同一实体上的并发下载不按连接数均分每拍额度：总量看着没超，但**分配极不公平**
+      // （先到的把每一拍吃满，后到的长期排队）。实测过的原始症状是 2×/1×，即 `active` 未参与。
+      name: 'R37-02b · 节拍器不按并发数均分额度（同一实体的两条下载严重不公平）',
+      file: 'server/throttle.js',
+      anchor: '    const perTick = Math.max(1, Math.floor(b.cap / Math.max(1, b.active || 1)));',
+      replacement: '    const perTick = Math.max(1, b.cap);',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 接口层的入参校验若漏掉负数，`-1` 会被存成 0 = **不限速**：
+      // 用户以为设了限速、实际全速（与 `quotaBytes` 踩过的坑同型）。
+      name: 'R37-03a · parseSpeedLimitInput 接受负数（静默变成「不限速」）',
+      file: 'server/limits.js',
+      anchor: "  if (!Number.isFinite(n) || n < 0) return { ok: false, error: '限速值不能为负数（0 表示不限速）' };",
+      replacement: '  if (!Number.isFinite(n)) return { ok: false, error: "请输入数字" };',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 屏蔽判定若不跳过 `kind === 'speed'` 的规则，一条「限速」规则会把请求直接 403 ——
+      // 需求写明限速**只慢不拦**，这种错法用户完全无法理解（"我明明设的是限速"）。
+      name: 'R37-04a · matchRules 不再跳过限速规则（限速规则把请求 403 掉）',
+      file: 'server/ip-guard.js',
+      anchor: "    if (r.kind === 'speed') continue;",
+      replacement: '    if (false) continue;',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「禁用」按钮对限速规则必须同样有效：漏掉 enabled 判定之后，界面上写着「已禁用」、
+      // 实际仍在限速，用户唯一的自救手段是删掉规则。
+      // ⚠️ 锚点必须**跨行**：单行 `if (!r.enabled) continue;` 在本文件里有两处
+      //（matchRules 与本函数各一处），而 `String.replace` 只替首处 —— 会打到无关分支上。
+      name: 'R37-04b · speedLimitFor 不再检查 enabled（已禁用的限速规则仍在限速）',
+      file: 'server/ip-guard.js',
+      anchor: "    if (!r.enabled) continue;\n    if (r.kind !== 'speed') continue;                 // 屏蔽规则不参与限速\n    if (!(Number(r.speedLimit) > 0)) continue;        // 未填速率 = 这条规则不起作用",
+      replacement: "    if (r.kind !== 'speed') continue;                 // 屏蔽规则不参与限速\n    if (!(Number(r.speedLimit) > 0)) continue;        // 未填速率 = 这条规则不起作用",
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 速率为 0 的限速规则必须等价于「没设」。若拿 0 当有效速率，命中它的下载会被
+      // 卡在 1 字节/秒的下限上 —— 表现是「下载永远不动」，比屏蔽还难排查。
+      name: 'R37-04c · speedLimitFor 接受 0 速率（命中后下载几乎停滞）',
+      file: 'server/ip-guard.js',
+      anchor: "    if (!(Number(r.speedLimit) > 0)) continue;        // 未填速率 = 这条规则不起作用",
+      replacement: "    if (!(Number(r.speedLimit) >= 0)) continue;       // 变异：0 也算有效速率",
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 节拍器插错位置（放在计量**之后**）：traffic / statsStore 记的与实际下发不一致，
+      // 且解密后的明文字节不再是被计量的那一份，「今天下载了多少」从此对不上账。
+      name: 'R37-05a · download-stream 把节拍器插在计量环节之后（计量口径与限速不一致）',
+      file: 'server/download-stream.js',
+      anchor: '  const stages = throttle ? [out, throttle, meter, res] : [out, meter, res];',
+      replacement: '  const stages = throttle ? [out, meter, throttle, res] : [out, meter, res];',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // WebDAV 的 GET 是完全独立的下发路径：漏掉这一处接线，主站限速生效、挂载盘全速 ——
+      // 「限速」成了一个可以被换条路绕过的摆设。这是本轮最容易漏的一处。
+      name: 'R37-05b · WebDAV 下载出口漏接限速（挂载盘成了全速旁路）',
+      file: 'server/webdav-server.js',
+      anchor: '      const throttle = makeThrottle({\n        ip: security.clientIp(req),\n        method: req.method,\n        credentialId: cfg.credentialId,\n        bucketId: cfg.bucketId,\n      });',
+      replacement: '      const throttle = null;',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      // 前端把限速值拼进请求体这一步若丢掉，用户在「文件分享」里填了限速、界面提示保存成功，
+      // 而记录上仍是 0（= 不限速）——「填了不生效」是最难被用户定位的一类失效。
+      name: 'R37-06a · 文件分享对话框不再提交 speedLimit（填了不生效）',
+      file: 'public/js/ops.js',
+      anchor: '            body.speedLimit = sp.bytes;',
+      replacement: '',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「文件分享」与「链接管理」是**同一条记录上的同一个字段**（已与用户确认）。
+      // create 不落这个字段 → 在文件分享里设的限速不会被保存。
+      name: 'R37-06b · share-store.create 不落 speedLimit（文件分享设的限速丢失）',
+      file: 'server/share-store.js',
+      anchor: '    speedLimit: normalizeSpeedLimit(speedLimit), // R37：链接级下载限速（0 = 不限）',
+      replacement: '',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 迁移若做成「复制一份回桶页」，就会出现两张卡片各自渲染、各自请求同一份规则表
+      // （同一状态两条读路径），而且用户会以为改了一个另一个也跟着变。
+      name: 'R37-07a · IP 屏蔽卡片被复制回存储桶页（迁移退化成两份）',
+      file: 'public/index.html',
+      anchor: '        <section id="bucketmgr" class="card-view" hidden>',
+      replacement: '        <section id="bucketmgr" class="card-view" hidden>\n          <div class="dash-card wide" id="ipguard-card"><div id="ipguard-table"></div></div>',
+      testFile: 'audit37-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

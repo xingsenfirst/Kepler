@@ -14,6 +14,7 @@
  *   routes/config.js    系统配置 / 访问密钥 / 连接验证
  *   routes/buckets.js   存储桶管理 / 容量统计 / 清空销毁 / ACL 检查
  *   routes/ipguard.js   IP 访问屏蔽（全局 + 桶级）
+ *   routes/throttle.js  下载限速的「上层下限」查询（R37，设置入口的提示文案用）
  *   routes/enc.js       文件加密设置 / 上传排除设置
  *   routes/webdav.js    WebDAV 服务设置
  *   routes/links.js     分享链接管理
@@ -41,6 +42,10 @@ router.use(require('./routes/webauthn'));
 router.use(require('./routes/config'));
 router.use(require('./routes/buckets'));
 router.use(require('./routes/ipguard'));
+// R37：下载限速的只读查询（`GET /throttle/ceiling`）。挂在这里只是就近 ——
+// 它不注册任何参数路由，与前后模块不存在路径歧义。
+// 不挂 requireAdmin：普通用户在「创建分享链接」时要能看到自己被上层限到多少。
+router.use(require('./routes/throttle'));
 router.use(require('./routes/enc'));
 router.use(require('./routes/webdav'));
 router.use(require('./routes/links'));

@@ -166,6 +166,9 @@ function makeSandbox({ withSyssettings = false } = {}) {
     // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）—— 沙箱缺了它
     // 会在 ESM **链接期**直接失败，本文件所有 import syssettings 的用例整片变红。
     fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
+    // R37：syssettings.js 又 import 了 './speedlimit.js'（「限速」列 + 限速对话框）——
+    // 同一条链接期规则；必须拷**真实**的那一份（它只从 util.js 取三个原语）。
+    fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
   } else {
     w('payment-logos.js', PAYLOGOS_STUB);
     fs.copyFileSync(JS('paysettings.js'), path.join(dir, 'paysettings.js'));

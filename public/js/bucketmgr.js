@@ -1,14 +1,20 @@
-/** 存储桶管理页 —— 添加 / 清空文件 / 碎片清理 / 彻底删除 / 存储统计 / IP 访问屏蔽 */
+/**
+ * 存储桶管理页 —— 添加 / 清空文件 / 碎片清理 / 彻底删除 / 存储统计
+ *
+ * R37：「IP 访问屏蔽」卡片整体迁往独立的「IP 地址管理」页（`ipmgr.js`），
+ * 本页只保留存储桶自身的「屏蔽海外 IP」开关列（那是**桶的属性**，不是 IP 规则）。
+ */
 import { API } from './api.js';
 import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
-import { openListDialog, providerSelectOptions } from './listdialog.js';
+import { openListDialog, providerSelectOptions, buildTransferBox } from './listdialog.js';
+// R37：「限速」列（四张列表卡片共用的唯一实现点）
+import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
 import { App } from './main.js';
 import { providerMeta } from './provider-logos.js';
 
 let wired = false;
 let timer = null;
 let cache = []; // [{ id, bucket, region, remark, quotaBytes, active, stats, error }]
-let ipCache = null; // { rules, chinaRangeCount, methods }
 
 /**
  * 「存储桶管理」卡片列表的**预览条数上限**（R36 需求 2①）。
@@ -83,7 +89,6 @@ export function refresh() {
     if (seq !== statsSeq) return;
     box.innerHTML = `<div class="lk-empty">加载失败：${escapeHtml(e.message)}</div>`;
   });
-  refreshIpGuard();
 }
 
 function wire() {
@@ -116,13 +121,6 @@ function wire() {
     const sec = document.getElementById('bucketmgr');
     if (sec && !sec.hidden) refresh();
   });
-  // IP 屏蔽
-  const rfIp = document.getElementById('btn-ipguard-refresh');
-  if (rfIp) rfIp.onclick = () => refreshIpGuard();
-  const addIp = document.getElementById('btn-ipguard-add');
-  if (addIp) addIp.onclick = () => openIpRuleDialog(null);
-  const testBtn = document.getElementById('btn-ipguard-test');
-  if (testBtn) testBtn.onclick = testIpBlocked;
   const all = document.getElementById('btn-bucket-all');
   if (all) all.onclick = showAllBuckets;
 }
@@ -169,7 +167,7 @@ function bucketTableHtml(rows, all) {
   const enabledCount = total.filter((x) => x.enabled !== false).length;
   return `<table class="lk-table bm-table">
     <thead><tr>
-      <th>服务商</th><th>存储桶</th><th>地域</th><th>已用容量</th><th>累计上传</th><th>累计下载</th><th>请求数</th><th>碎片</th>
+      <th>服务商</th><th>存储桶</th><th>地域</th><th>已用容量</th><th>累计上传</th><th>累计下载</th><th>请求数</th><th>碎片</th><th style="width:170px">限速</th>
       ${isAdmin() ? '<th style="width:90px">屏蔽海外 IP</th>' : ''}
       ${isAdmin() ? '<th style="width:320px">操作</th>' : ''}
     </tr></thead>
@@ -207,6 +205,7 @@ function bucketTableHtml(rows, all) {
           <td>↓ ${statText(st.downBytes)}</td>
           <td>${st.requests != null ? String(st.requests) : '—'}</td>
           <td>${fragCell}</td>
+          <td class="lk-speed">${speedCellHtml('bucket', row.id, row.speedLimit, isAdmin())}</td>
           ${isAdmin() ? `<td class="bm-oversea-cell">${overseaCell}</td>` : ''}
           ${isAdmin() ? `<td class="lk-acts">
             ${toggleBtn}
@@ -236,6 +235,12 @@ function bindBucketRowActions(root, rows) {
       else if (act === 'en') toggleBucketEnabled(row, true);
       else if (act === 'dis') toggleBucketEnabled(row, false);
       else if (act === 'block-overseas') toggleBlockOverseas(row, btn.checked);
+      // R37：桶级下载限速。与 `quotaBytes` 同为「由管理员设置、对写入者强制生效」的限额，
+      // 因此服务端与配额同款：非管理员的该字段会在白名单处被丢弃（见 routes/buckets.js）。
+      else if (act === 'speed') openSpeedLimitDialog({
+        scope: 'bucket', id: row.id, name: row.remark || row.bucket,
+        current: row.speedLimit, onSaved: refresh,
+      });
     };
   });
 }
@@ -412,142 +417,9 @@ function afterBucketMutated(row) {
   if (row && row.active) App.refreshStorage();
 }
 
-/* ------------------------------ 通用穿梭框组件 ------------------------------ */
 
 /**
- * 通用穿梭框（左列 = 未选集合，右列 = 已选集合）。
- * 供「存储桶可见性权限」与「IP 屏蔽规则 · 作用范围」复用，保证交互一致。
- * @param {object} o
- *  - items: [{ id, label, sub?, active? }]
- *  - selectedIds: 初始选中 id 数组
- *  - leftTitle / rightTitle: 列标题（可含徽标 HTML）
- *  - filterLabels: { all, left, right } 筛选按钮文案
- *  - hint: 顶部提示（HTML，可空）
- *  - countText: (total, selCount) => string 底部计数文案
- * @returns {{ wrap: HTMLElement, getSelected: () => string[] }}
- */
-function buildTransferBox(o) {
-  const items = o.items || [];
-  const selected = new Set(o.selectedIds || []);
-  const fl = o.filterLabels || { all: '全部', left: '未选', right: '已选' };
-  // 安全默认：标题/hint 按纯文本转义渲染；仅显式传 *Html 才按可信 HTML 处理。
-  // （历史实现为原始 HTML 拼接，若将来传入桶名/备注等用户可控数据即成 XSS 注入点）
-  const hintHtml = o.hintHtml !== undefined ? String(o.hintHtml) : escapeHtml(o.hint || '');
-  const leftTitleHtml = o.leftTitleHtml !== undefined ? String(o.leftTitleHtml) : escapeHtml(o.leftTitle || '');
-  const rightTitleHtml = o.rightTitleHtml !== undefined ? String(o.rightTitleHtml) : escapeHtml(o.rightTitle || '');
-  const wrap = document.createElement('div');
-  wrap.className = 'perm-transfer';
-  wrap.innerHTML = `
-    <div class="perm-toolbar">
-      <div class="perm-search">
-        <input type="text" class="perm-q" placeholder="搜索…" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="perm-filter seg">
-        <button data-f="all" class="on">${escapeHtml(fl.all)}</button>
-        <button data-f="left">${escapeHtml(fl.left)}</button>
-        <button data-f="right">${escapeHtml(fl.right)}</button>
-      </div>
-    </div>
-    ${hintHtml ? `<div class="perm-hint bk-sub">${hintHtml}</div>` : ''}
-    <div class="perm-body">
-      <div class="perm-col">
-        <div class="perm-col-head">${leftTitleHtml}
-          <label class="perm-checkall" title="勾选本列全部（受搜索/筛选影响）"><input type="checkbox" class="perm-check-left"> 全选</label>
-        </div>
-        <ul class="perm-list perm-list-left"></ul>
-      </div>
-      <div class="perm-switch">
-        <button class="mini-btn" data-mv="right" title="将选中项移到右列">›</button>
-        <button class="mini-btn" data-mv="all-right" title="全部移到右列">»</button>
-        <button class="mini-btn" data-mv="left" title="将选中项移到左列">‹</button>
-        <button class="mini-btn" data-mv="all-left" title="全部移到左列">«</button>
-      </div>
-      <div class="perm-col">
-        <div class="perm-col-head">${rightTitleHtml}
-          <label class="perm-checkall" title="勾选本列全部（受搜索/筛选影响）"><input type="checkbox" class="perm-check-right"> 全选</label>
-        </div>
-        <ul class="perm-list perm-list-right"></ul>
-      </div>
-    </div>
-    <div class="perm-foot"><span class="bk-sub perm-count"></span></div>`;
-
-  const q = wrap.querySelector('.perm-q');
-  const filterBtns = wrap.querySelectorAll('.perm-filter button');
-  const leftUl = wrap.querySelector('.perm-list-left');
-  const rightUl = wrap.querySelector('.perm-list-right');
-  const checkLeft = wrap.querySelector('.perm-check-left');
-  const checkRight = wrap.querySelector('.perm-check-right');
-  const countEl = wrap.querySelector('.perm-count');
-  let filter = 'all'; // all | left | right
-
-  const itemLabel = (b) => (b.sub && b.sub !== b.label ? `${b.label}（${b.sub}）` : b.label);
-
-  function matches(b) {
-    const kw = q.value.trim().toLowerCase();
-    if (kw && !itemLabel(b).toLowerCase().includes(kw)) return false;
-    if (filter === 'left' && selected.has(b.id)) return false;
-    if (filter === 'right' && !selected.has(b.id)) return false;
-    return true;
-  }
-
-  function renderItem(b) {
-    const li = document.createElement('li');
-    li.className = 'perm-item';
-    li.dataset.id = b.id;
-    li.innerHTML = `
-      <input type="checkbox">
-      <span class="perm-itembody">
-        <b>${escapeHtml(b.label)}${b.active ? '<span class="perm-active" title="当前激活桶">当前</span>' : ''}</b>
-        <i class="bk-sub">${escapeHtml(b.sub || '')}</i>
-      </span>`;
-    li.querySelector('input').onchange = (e) => li.classList.toggle('checked', e.target.checked);
-    return li;
-  }
-
-  function render() {
-    leftUl.innerHTML = '';
-    rightUl.innerHTML = '';
-    for (const b of items.filter(matches)) {
-      (selected.has(b.id) ? rightUl : leftUl).appendChild(renderItem(b));
-    }
-    checkLeft.checked = false;
-    checkRight.checked = false;
-    countEl.textContent = o.countText(items.length, selected.size);
-  }
-
-  const checkedIds = (ul) => [...ul.querySelectorAll('.perm-item.checked')].map((li) => li.dataset.id);
-  const setCheckedAll = (ul, checked) => ul.querySelectorAll('.perm-item').forEach((li) => {
-    li.classList.toggle('checked', checked);
-    const cb = li.querySelector('input');
-    if (cb) cb.checked = checked;
-  });
-  const moveTo = (ids, side) => {
-    ids.forEach((id) => (side === 'right' ? selected.add(id) : selected.delete(id)));
-    render();
-  };
-
-  q.addEventListener('input', render);
-  filterBtns.forEach((btn) => {
-    btn.onclick = () => {
-      filterBtns.forEach((x) => x.classList.remove('on'));
-      btn.classList.add('on');
-      filter = btn.dataset.f;
-      render();
-    };
-  });
-  wrap.querySelector('[data-mv="right"]').onclick = () => moveTo(checkedIds(leftUl), 'right');
-  wrap.querySelector('[data-mv="all-right"]').onclick = () => moveTo([...leftUl.querySelectorAll('.perm-item')].map((li) => li.dataset.id), 'right');
-  wrap.querySelector('[data-mv="left"]').onclick = () => moveTo(checkedIds(rightUl), 'left');
-  wrap.querySelector('[data-mv="all-left"]').onclick = () => moveTo([...rightUl.querySelectorAll('.perm-item')].map((li) => li.dataset.id), 'left');
-  checkLeft.onchange = (e) => setCheckedAll(leftUl, e.target.checked);
-  checkRight.onchange = (e) => setCheckedAll(rightUl, e.target.checked);
-
-  render();
-  return { wrap, getSelected: () => [...selected] };
-}
-
-/**
- * 打开"存储桶可见性"配置弹窗（buildTransferBox 复用）：
+ * 打开"存储桶可见性"配置弹窗（`listdialog.buildTransferBox` 复用，R37 起组件已迁出本文件）：
  *  右列 = 对普通用户可见的桶；点「保存」才提交（PUT /buckets/visibility），取消/关闭丢弃改动。
  */
 async function openVisibilityDialog(_row) {
@@ -714,219 +586,5 @@ async function unbind(row) {
     App.onConfigChanged(); // 内部触发 buckets-changed → 本页刷新
   } catch (e) {
     toast('解绑失败：' + e.message, { type: 'error' });
-  }
-}
-
-/* ============================== IP 访问屏蔽 ============================== */
-
-/** 本地已绑定存储桶列表（用于作用范围下拉框） */
-function boundBuckets() {
-  return (App.state.config && App.state.config.buckets) || [];
-}
-
-/** 生成存储桶 <option> 列表 */
-function bucketOptionsHtml(selectedId) {
-  return boundBuckets().map((b) =>
-    `<option value="${escapeHtml(b.id)}" ${b.id === selectedId ? 'selected' : ''}>${escapeHtml(b.remark || b.bucket)}${b.remark ? `（${escapeHtml(b.bucket)}）` : ''}</option>`).join('');
-}
-
-/** 规则作用范围列的展示（多桶） */
-function scopeCell(r) {
-  const bids = r.bucketIds || [];
-  if (!bids.length) return '<span class="lk-badge">全局</span>';
-  const names = (r.bucketNames && r.bucketNames.length) ? r.bucketNames : bids;
-  const shown = names.length > 2 ? `${names.slice(0, 2).join('、')} 等 ${names.length} 个桶` : names.join('、');
-  const badge = r.bucketMissing ? '<span class="lk-badge warn">桶级 · 含已解绑</span>' : '<span class="lk-badge ok">桶级</span>';
-  return `${badge} <span title="${escapeHtml(names.join('、'))}">${escapeHtml(shown)}</span>`;
-}
-
-/** 重建预检行的作用范围下拉（保留当前选中） */
-function rebuildTestScope() {
-  const sel = document.getElementById('ipguard-test-scope');
-  if (!sel) return;
-  const cur = sel.value;
-  sel.innerHTML = `<option value="">全局（无桶上下文）</option><option value="active">当前激活桶</option>${bucketOptionsHtml('')}`;
-  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
-}
-
-async function refreshIpGuard() {
-  const box = document.getElementById('ipguard-table');
-  if (!box) return;
-  // 规则接口为管理员专属：卡片已隐藏时既不渲染也不发请求（与"界面不展示"保持一致）
-  const card = document.getElementById('ipguard-card');
-  if (card && card.hidden) return;
-  rebuildTestScope();
-  let d;
-  try {
-    d = await API.ipGuard();
-  } catch (e) {
-    box.innerHTML = `<div class="lk-empty">IP 屏蔽规则加载失败：${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  ipCache = d;
-  const count = document.getElementById('ipguard-count');
-  if (count) count.textContent = d.rules.length ? `（${d.rules.length} 条规则）` : '';
-
-  if (!d.rules.length) {
-    box.innerHTML = `<div class="lk-empty">尚无屏蔽规则。点击右上角「＋ 添加屏蔽规则」。按桶屏蔽海外 IP 请在上方「存储桶管理」表格中勾选对应列。</div>`;
-    return;
-  }
-  box.innerHTML = `<table class="lk-table ipg-table">
-    <thead><tr>
-      <th>IP / IP 段</th><th>作用范围</th><th>请求方法</th><th>备注</th><th>状态</th><th>命中</th><th>创建时间</th><th style="width:190px">操作</th>
-    </tr></thead>
-    <tbody>
-      ${d.rules.map((r) => `<tr data-id="${escapeHtml(r.id)}">
-        <td class="lk-file" style="font-family:Consolas,monospace">${escapeHtml(r.target)}</td>
-        <td>${scopeCell(r)}</td>
-        <td>${r.methods && r.methods.length ? r.methods.map((m) => `<span class="ipg-method${['PUT', 'POST', 'DELETE'].includes(m) ? ' m-write' : ''}">${m}</span>`).join(' ') : '<span class="bk-sub">全部方法</span>'}</td>
-        <td>${escapeHtml(r.remark || '')}</td>
-        <td>${r.enabled ? '<span class="lk-badge ok">生效中</span>' : '<span class="lk-badge">已禁用</span>'}</td>
-        <td>${r.hits || 0}</td>
-        <td>${r.createdAt ? fmtTime(r.createdAt) : '—'}</td>
-        <td class="lk-acts">
-          <button class="mini-btn" data-act="toggle">${r.enabled ? '禁用' : '启用'}</button>
-          <button class="mini-btn" data-act="edit">编辑</button>
-          <button class="mini-btn danger" data-act="del">删除</button>
-        </td>
-      </tr>`).join('')}
-    </tbody></table>`;
-
-  box.querySelectorAll('tr[data-id]').forEach((tr) => {
-    const rule = d.rules.find((x) => x.id === tr.dataset.id);
-    if (!rule) return;
-    tr.querySelectorAll('[data-act]').forEach((btn) => {
-      btn.onclick = () => {
-        const act = btn.dataset.act;
-        if (act === 'toggle') toggleIpRule(rule);
-        else if (act === 'edit') openIpRuleDialog(rule);
-        else if (act === 'del') deleteIpRule(rule);
-      };
-    });
-  });
-}
-
-async function toggleIpRule(rule) {
-  try {
-    await API.toggleIpRule(rule.id, !rule.enabled);
-    toast(`规则 ${rule.target} 已${rule.enabled ? '禁用' : '启用'}`, { type: 'success' });
-    refreshIpGuard();
-  } catch (e) { toast('操作失败：' + e.message, { type: 'error' }); }
-}
-
-async function deleteIpRule(rule) {
-  const ok = await confirmDialog({ allowHtml: true,
-    title: '删除屏蔽规则',
-    message: `确定删除屏蔽规则 <b style="font-family:Consolas,monospace">${escapeHtml(rule.target)}</b> 吗？<br><span style="color:var(--text-2)">删除后该 IP / IP 段将不再被此规则屏蔽（若被桶级「屏蔽海外 IP」或其他规则覆盖则仍会被屏蔽）。</span>`,
-    okText: '删除', danger: true,
-  });
-  if (!ok) return;
-  try {
-    await API.deleteIpRule(rule.id);
-    toast('规则已删除', { type: 'success' });
-    refreshIpGuard();
-  } catch (e) { toast('删除失败：' + e.message, { type: 'error' }); }
-}
-
-/** 添加 / 编辑屏蔽规则弹窗（作用范围用穿梭框多选桶；右列留空 = 全局） */
-function openIpRuleDialog(existing) {
-  const methods = (existing && existing.methods) || [];
-  const existingBids = (existing && existing.bucketIds) || [];
-  const wrap = document.createElement('div');
-  wrap.innerHTML = `
-    <div class="form-item">
-      <label>IP 地址或 IP 段（CIDR） *</label>
-      <input type="text" id="ipg-target" class="full" placeholder="如 1.2.3.4（单个 IP）或 10.0.0.0/8（IP 段）" value="${escapeHtml(existing ? existing.target : '')}" autocomplete="off" spellcheck="false">
-      <div class="hint">单 IP 示例：<code>203.0.113.7</code>；IP 段示例：<code>203.0.113.0/24</code>（屏蔽该段全部 256 个地址）。</div>
-    </div>
-    <div class="form-item">
-      <label>作用范围 *</label>
-      <div class="ipg-scope-box"></div>
-      <div class="hint">右侧<b>留空 = 全局</b>（对该服务接收到的所有请求生效）；把桶移到右侧 = 仅当访问目标为这些桶时生效（可多选）。桶级规则优先、全局规则其次，任一命中即屏蔽。</div>
-    </div>
-    <div class="form-item">
-      <label>屏蔽的请求方法（不勾选 = 屏蔽全部方法）</label>
-      <div class="ipg-methods">
-        ${['GET', 'HEAD', 'POST', 'PUT', 'DELETE'].map((m) => `
-          <label class="check-line"><input type="checkbox" value="${m}" ${methods.includes(m) ? 'checked' : ''}>${m}</label>`).join('')}
-      </div>
-      <div class="hint">例如仅勾选 PUT / POST / DELETE → 屏蔽该 IP 的写操作，但放行其读取与下载。</div>
-    </div>
-    <div class="form-item">
-      <label>备注（可选）</label>
-      <input type="text" id="ipg-remark" class="full" placeholder="如：恶意刷量来源" value="${escapeHtml(existing ? existing.remark || '' : '')}" maxlength="100">
-    </div>`;
-
-  // 穿梭框：候选 = 本地已绑定桶 +（编辑时）已解绑的幽灵项，避免静默丢弃引用
-  const bound = boundBuckets();
-  const activeId = (App.state.config && App.state.config.activeBucketId) || '';
-  const boundIds = new Set(bound.map((b) => b.id));
-  const items = bound.map((b) => ({ id: b.id, label: b.remark || b.bucket, sub: b.remark ? b.bucket : b.region, active: b.id === activeId }))
-    .concat(existingBids.filter((id) => !boundIds.has(id)).map((id) => ({ id, label: '(已解绑的存储桶)', sub: '' })));
-  const box = buildTransferBox({
-    items,
-    selectedIds: existingBids,
-    leftTitle: '未选存储桶',
-    rightTitle: '规则生效的存储桶',
-    filterLabels: { all: '全部', left: '未选', right: '已选' },
-    countText: (total, sel) => sel
-      ? `共 ${total} 个桶，规则作用于 ${sel} 个`
-      : `共 ${total} 个桶，当前为全局范围（作用于所有存储桶）`,
-  });
-  wrap.querySelector('.ipg-scope-box').appendChild(box.wrap);
-
-  openModal({
-    title: existing ? `编辑屏蔽规则 — ${existing.target}` : '添加 IP 屏蔽规则',
-    body: wrap,
-    wide: true,
-    foot: [
-      { text: '取消' },
-      { text: existing ? '保存修改' : '添加规则', cls: 'primary', onClick: async (o, close) => {
-        const target = wrap.querySelector('#ipg-target').value.trim();
-        const remark = wrap.querySelector('#ipg-remark').value.trim();
-        const bucketIds = box.getSelected();
-        const sel = [...wrap.querySelectorAll('.ipg-methods input:checked')].map((x) => x.value);
-        if (!target) return toast('请填写 IP 地址或 IP 段', { type: 'warn' });
-        try {
-          if (existing) await API.updateIpRule(existing.id, { target, remark, methods: sel, bucketIds });
-          else await API.addIpRule({ target, remark, methods: sel, bucketIds });
-          toast(existing ? '规则已更新' : '规则已添加并生效', { type: 'success' });
-          close();
-          refreshIpGuard();
-        } catch (e) {
-          toast('保存失败：' + e.message, { type: 'error' });
-        }
-      } },
-    ],
-  });
-  setTimeout(() => wrap.querySelector('#ipg-target').focus(), 50);
-}
-
-/** 规则预检：检测某 IP + 方法 + 作用范围是否会被屏蔽 */
-async function testIpBlocked() {
-  const ipInput = document.getElementById('ipguard-test-ip');
-  const methodSel = document.getElementById('ipguard-test-method');
-  const scopeSel = document.getElementById('ipguard-test-scope');
-  const out = document.getElementById('ipguard-test-result');
-  const ip = (ipInput.value || '').trim();
-  if (!ip) { out.textContent = '请输入 IP'; out.className = 'bk-sub'; return; }
-  out.textContent = '检测中…'; out.className = 'bk-sub';
-  try {
-    const r = await API.testIpRule(ip, methodSel.value, scopeSel ? scopeSel.value : '');
-    if (r.allowed) {
-      out.textContent = `✓ ${ip}（${r.method}）未被屏蔽，可正常访问`;
-      out.className = 'ipg-test-ok';
-    } else if (r.reason === 'overseas') {
-      out.textContent = `✗ ${ip}（${r.method}）为海外 IP，被「仅放行国内 IP」模式屏蔽`;
-      out.className = 'ipg-test-bad';
-    } else {
-      const m = r.matchedRule;
-      const scope = (m.bucketIds && m.bucketIds.length) ? '桶级规则' : '全局规则';
-      out.textContent = `✗ ${ip}（${r.method}）被${scope}屏蔽：${m.target}${m.methods && m.methods.length ? '（' + m.methods.join('/') + '）' : ''}`;
-      out.className = 'ipg-test-bad';
-    }
-  } catch (e) {
-    out.textContent = '检测失败：' + e.message;
-    out.className = 'ipg-test-bad';
   }
 }

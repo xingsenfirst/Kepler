@@ -13,17 +13,27 @@
  *    passwordSalt, passwordHash,       // scrypt 哈希；无则未启用密码
  *    missingAt,                        // ISO 时间；非空 = 云端对象已不存在（见下方「对象缺失标记」）
  *    paid: { required, amountFen, currency },  // 付费下载配置（分享者意图，永远原样保留）
+ *    speedLimit,                       // R37：下载限速（字节/秒；0 = 不限）。见下方「下载限速」
  *  }
  *
  * ⚠️ `paid` 只表达**分享者的意图**，不代表当前一定收费。是否真的收费由
  * `server/payment-rules.js` 的 `resolvePaidState()` 在读取时计算 ——
  * 停用支付功能后链接自动转免费，重新启用又自然恢复，全程不需要改动本文件的数据。
+ *
+ * ⚠️ R37：「文件分享」与「链接管理」是**同一条记录上的同一个字段**（不是两份配置）——
+ * 分享方在创建时填的限速，与链接管理列表里改的限速，读写的是同一个 `speedLimit`。
+ * 这也是需求里「两者之间可随意修改」的落地方式。它与其它层的关系（取最小值、
+ * 上层能否被下层放宽）由 `server/throttle.js` 的 `resolveLimit()` 单独判定，
+ * 本文件只负责**存**这个值。
  */
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const configStore = require('./config-store');
 const secureStore = require('./secure-store');
+// R37：限速值的唯一判据在 limits.js（无 require 的叶子模块）——
+// share-store 与 config-store 都要用它写盘，而 throttle.js 反过来要 require 两者。
+const { normalizeSpeedLimit } = require('./limits');
 
 // COS_DATA_DIR：与 payment-orders / enc-store / stats-store / upload-sessions
 // 一致的测试隔离开关（此前缺失，用例只能写真实 data/links.json）
@@ -108,6 +118,8 @@ function view(l) {
       amountFen: Number(l.paid && l.paid.amountFen) || 0,
       currency: (l.paid && l.paid.currency) || 'CNY',
     },
+    // R37：链接级下载限速（0 = 不限）。历史记录无此字段 → 归一化为 0，等价于旧行为
+    speedLimit: normalizeSpeedLimit(l.speedLimit),
   };
 }
 
@@ -165,7 +177,7 @@ function normalizePaid(paid) {
   return { required: required && amountFen > 0, amountFen, currency: 'CNY' };
 }
 
-async function create({ key, bucket, region, fileName, size, expiresHours, maxDownloads, password, createdBy, paid }) {
+async function create({ key, bucket, region, fileName, size, expiresHours, maxDownloads, password, createdBy, paid, speedLimit }) {
   const links = load().links;
   const l = {
     id: newId(),
@@ -181,6 +193,7 @@ async function create({ key, bucket, region, fileName, size, expiresHours, maxDo
     downloads: 0,
     lastDownloadAt: null,
     paid: normalizePaid(paid),
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：链接级下载限速（0 = 不限）
   };
   if (password) {
     const salt = crypto.randomBytes(16).toString('hex');
@@ -215,6 +228,7 @@ async function update(id, patch) {
     l.lastDownloadAt = null;
   }
   if (patch.paid !== undefined) l.paid = normalizePaid(patch.paid);
+  if (patch.speedLimit !== undefined) l.speedLimit = normalizeSpeedLimit(patch.speedLimit); // R37：未传即保持
   persist();
   return view(l);
 }

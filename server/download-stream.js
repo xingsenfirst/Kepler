@@ -25,7 +25,7 @@ const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const STATS_FLUSH_MS = 1000;
 
 /**
- * 将对象存储对象流式转发到 HTTP 响应（可选透明解密），含流量统计/背压/超时。
+ * 将对象存储对象流式转发到 HTTP 响应（可选透明解密、可选限速），含流量统计/背压/超时。
  * @param {object} params
  *  - cos: 对象存储客户端
  *  - bucket, region, key
@@ -33,9 +33,12 @@ const STATS_FLUSH_MS = 1000;
  *  - encMeta: 可选加密元数据（null 表示明文）
  *  - req, res: Express 请求/响应
  *  - traffic: { bytesDown } 统计对象
+ *  - [throttle]: R37 限速 Transform（`throttle.createThrottleTransform()` 的产物；
+ *                `null` = 不限速）。**必须由调用方先解析出生效限速**（见 `throttle.resolveLimit`），
+ *                本函数不做任何限速判定 —— 判定只有一处，就在这里挂载。
  *  - [timeoutMs]: 默认 10 分钟
  */
-async function streamDownload({ cos, bucket, region, key, fileName, encMeta, req, res, traffic, timeoutMs = DOWNLOAD_TIMEOUT_MS }) {
+async function streamDownload({ cos, bucket, region, key, fileName, encMeta, req, res, traffic, throttle, timeoutMs = DOWNLOAD_TIMEOUT_MS }) {
   const head = await p(cos, 'headObject', { Bucket: bucket, Region: region, Key: key });
   const size = Number(head.headers['content-length']) || 0;
   const contentType = head.headers['content-type'] || 'application/octet-stream';
@@ -91,11 +94,25 @@ async function streamDownload({ cos, bucket, region, key, fileName, encMeta, req
       if (done) return;
       done = true;
       try { out.destroy(); } catch (e) { /* ignore */ }
+      // R37：限速环节同样要销毁，否则它内部的节拍定时器会一直留着（见 throttle.js）
+      if (throttle) { try { throttle.destroy(); } catch (e) { /* ignore */ } }
       if (err) { try { res.destroy(); } catch (e) { /* ignore */ } }
     };
   })();
 
-  pipeline(out, meter, res, (err) => teardown(err));
+  /**
+   * R37：限速环节插在**解密之后、统计之前**。
+   *
+   * - 放在 `out`（解密流）之后 ⇒ 令牌桶数的是**明文字节**，与用户看到的
+   *   「已下载 xx MB / 限速 xx MB/s」同一口径。若放在解密之前，加密对象的
+   *   （略大的）密文字节会被计费，用户算不平 —— 这是要求④明确选定的口径。
+   * - 放在 `meter` 之前 ⇒ `traffic.bytesDown` 与 `statsStore` 的计数口径与限速**无关**，
+   *   加不加限速都得到同一个总量（限速只改变到达时间，不改变字节数）。
+   * - 三者同在**一条** `pipeline` 里：背压沿 `res ← meter ← throttle ← out` 逐级向上
+   *   传导，不另挂 `data` 监听（要求②）。
+   */
+  const stages = throttle ? [out, throttle, meter, res] : [out, meter, res];
+  pipeline(...stages, (err) => teardown(err));
   res.on('close', () => teardown(null));
   out.on('error', () => teardown(null));
 

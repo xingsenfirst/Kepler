@@ -307,3 +307,93 @@ test('R34 · 前端沙箱的 util 桩必须覆盖其拷入的每个真实模块�
     + `而红的原因与它们各自要守的东西无关。需要补的：\n${offenders.join('\n')}`);
 });
 
+/**
+ * 沙箱**缺文件**的同步护栏（与上一条同源，但抓的是另一种红法）。
+ *
+ * 上一条查的是「桩里少一个**导出**」，这一条查的是「沙箱里整个**文件**都不在」——
+ * 症状同样是链接期报错，但文案是 `ERR_MODULE_NOT_FOUND`，而且同样是"该文件里所有
+ * 用例一起红"。
+ *
+ * 触发它的典型改动是**把某个共享组件从 A 模块抽成独立文件**：
+ * R36 从 `syssettings.js` 抽出 `listdialog.js` 时撞过一次；R37 给四张卡片的
+ * 「限速」列抽出 `speedlimit.js` 时又撞了一次（audit36 里 12 条无关用例整片变红）。
+ * 两次都是"补一处拷贝"就修好 —— 但**没有人会记得下一次**，所以登记成护栏。
+ *
+ * 判据：对每个"有沙箱"的测试文件，从它拷入的模块出发追**本地依赖闭包**
+ * （副本自己还会 import 别的），每一层依赖都必须在该文件里找到"提供方式"三者之一：
+ *   ① 在 `makeXxxSandbox([...])` 的名单里；
+ *   ② 被显式 `writeFileSync(path.join(dir,'x.js'), 桩)`；
+ *   ③ 被显式 `copyFileSync(JS('x.js'), …)`。
+ */
+test('R34 · 前端沙箱必须为被拷入模块的每个本地依赖提供桩或副本（否则链接期 ERR_MODULE_NOT_FOUND）', () => {
+  const JS_FILE_RE = /^[\w.-]+\.js$/;
+  /** 该测试文件拷进沙箱的模块名单（两种写法，与上一条同源） */
+  function sandboxedModules(src) {
+    const out = new Set();
+    for (const m of src.matchAll(/make\w*Sandbox\(\s*\[([^\]]*)\]/g)) {
+      for (const s of m[1].split(',')) {
+        const name = s.trim().replace(/['"]/g, '');
+        if (JS_FILE_RE.test(name)) out.add(name);
+      }
+    }
+    for (const m of src.matchAll(/copyFileSync\(\s*JS\(\s*'([^']+\.js)'\s*\)/g)) out.add(m[1]);
+    return [...out];
+  }
+  /** 某模块从 `'./x.js'` 形式导入的本地依赖 */
+  function localImportsOf(name) {
+    const src = fs.readFileSync(JS(name), 'utf8');
+    return [...src.matchAll(/from\s+'\.\/([\w.-]+\.js)'/g)].map((m) => m[1]);
+  }
+
+  const files = fs.readdirSync(path.join(ROOT, 'tests')).filter((f) => f.endsWith('.test.js'));
+  const offenders = [];
+  let checked = 0;
+  for (const f of files) {
+    const t = fs.readFileSync(path.join(ROOT, 'tests', f), 'utf8');
+    if (!/export\s+const\s+toast\b/.test(t)) continue; // 该文件没有沙箱（无 util 桩），不涉及
+    const mods = sandboxedModules(t);
+    if (!mods.length) continue;
+    const esc = (n) => n.replace(/\./g, '\\.');
+    /**
+     * 该文件"怎么提供"这个模块：`'copy'`（真文件）/ `'stub'`（桩）/ `''`（没提供）。
+     *
+     * ⚠️ 必须区分两者，否则护栏自己会出错：桩**整体替换**了真模块，它的依赖与沙箱无关。
+     * 若对桩也递归，就会去读真实 `main.js` 的 import 列表（它有十几个页面级依赖），
+     * 报出一串纯属虚构的"缺失"——audit29 把 `main.js` 整个换成桩，正是这种情况。
+     */
+    const providedBy = (n) => {
+      // 名单里的与 copyFileSync 的都是「真文件」（名单成员由 `for (const f of realFiles) copyFileSync(…)` 拷入）
+      if (mods.includes(n)) return 'copy';
+      if (new RegExp(`copyFileSync\\([^)]*'${esc(n)}'`).test(t)) return 'copy';
+      // 显式写入：writeFileSync(path.join(dir, 'x.js'), 桩)
+      if (new RegExp(`writeFileSync\\(\\s*path\\.join\\([^,]+,\\s*'${esc(n)}'`).test(t)) return 'stub';
+      // 本文件的小助手写入：`const w = (n, s) => fs.writeFileSync(…); w('x.js', 桩)`
+      //（audit29 / audit31 用的是这种写法，上一条抓不到）
+      if (new RegExp(`^\\s*\\w+\\(\\s*'${esc(n)}'\\s*,`, 'm').test(t)) return 'stub';
+      return '';
+    };
+    const seen = new Set();
+    const queue = [...mods];
+    while (queue.length) {
+      const cur = queue.shift();
+      if (seen.has(cur) || !fs.existsSync(JS(cur))) continue;
+      seen.add(cur);
+      for (const dep of localImportsOf(cur)) {
+        checked += 1;
+        const how = providedBy(dep);
+        if (!how) {
+          offenders.push(`${f}：${cur} 依赖 ${dep}，但沙箱里既没有它的桩、也没有副本，也没列进沙箱名单`);
+        } else if (how === 'copy' && !seen.has(dep)) {
+          queue.push(dep); // 真副本自身还会 import 别的，继续追
+        }
+      }
+    }
+  }
+
+  assert(checked >= 12,
+    `只校验到 ${checked} 条本地依赖 —— 少于 12 说明沙箱写法已变、本护栏正在空转`);
+  assertEqual(offenders.join('\n'), '',
+    '沙箱里缺一个本地依赖文件，该测试文件所有相关用例会在**链接期**一起报 ERR_MODULE_NOT_FOUND，'
+    + `红的原因与它们各自要守的东西毫无关系。需要补的：\n${offenders.join('\n')}`);
+});
+

@@ -66,6 +66,9 @@ const EXPECTED = [
   'GET /acl-check', 'PUT /acl-check/disabled',
   'GET /ipguard', 'POST /ipguard/rules', 'PUT /ipguard/rules/:id',
   'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
+  // R37：查「上层已经设了多小的下载限速」——四个设置入口的提示文案用它。
+  // 不挂 requireAdmin（普通用户在「创建分享链接」时也要能看到自己的上限）。
+  'GET /throttle/ceiling',
   'GET /enc/settings', 'PUT /enc/settings', 'POST /enc/unlock',
   // R8-14：只回 `{ passwordSet }`（不含 mode / 魔数）的只读端点，普通用户也可访问
   // —— 前端 `ensureUnlocked()` 靠它判断「要不要弹查看密码框」。见下方 selfServe。

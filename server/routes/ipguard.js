@@ -31,9 +31,10 @@ router.get('/ipguard', requireAdmin, (req, res) => {
 router.post('/ipguard/rules', requireAdmin, (req, res) => {
   try {
     const b = req.body || {};
-    const rule = ipGuard.addRule({ target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds });
+    const rule = ipGuard.addRule({ target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: b.speedLimit });
     const scope = (rule.bucketIds && rule.bucketIds.length) ? '桶级' : '全局';
-    statsStore.addLog({ action: 'ipguard.add', detail: `新增${scope} IP 屏蔽规则 ${rule.target}${rule.methods.length ? '（' + rule.methods.join('/') + '）' : '（全部方法）'}` });
+    const what = rule.kind === 'speed' ? `IP 限速规则 ${rule.target}（${Math.round(rule.speedLimit / 1024 / 1024 * 10) / 10} MB/s）` : `IP 屏蔽规则 ${rule.target}`;
+    statsStore.addLog({ action: 'ipguard.add', detail: `新增${scope} ${what}${rule.kind === 'speed' ? '' : (rule.methods.length ? '（' + rule.methods.join('/') + '）' : '（全部方法）')}` });
     res.json({ ok: true, rule });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
@@ -41,8 +42,8 @@ router.post('/ipguard/rules', requireAdmin, (req, res) => {
 router.put('/ipguard/rules/:id', requireAdmin, (req, res) => {
   try {
     const b = req.body || {};
-    const rule = ipGuard.updateRule(req.params.id, { target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds });
-    statsStore.addLog({ action: 'ipguard.update', detail: `修改 IP 屏蔽规则 ${rule.target}` });
+    const rule = ipGuard.updateRule(req.params.id, { target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: b.speedLimit });
+    statsStore.addLog({ action: 'ipguard.update', detail: `修改 ${rule.kind === 'speed' ? 'IP 限速' : 'IP 屏蔽'}规则 ${rule.target}` });
     res.json({ ok: true, rule });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
@@ -51,7 +52,9 @@ router.put('/ipguard/rules/:id/enabled', requireAdmin, (req, res) => {
   try {
     const enabled = !!(req.body || {}).enabled;
     const rule = ipGuard.setRuleEnabled(req.params.id, enabled);
-    statsStore.addLog({ action: 'ipguard.toggle', detail: `${enabled ? '启用' : '禁用'} IP 屏蔽规则 ${rule.target}` });
+    // R37：文案必须区分「屏蔽」与「限速」—— 同一条规则表里两种类型共存，
+    // 日志写死「IP 屏蔽规则」会让「我刚把限速规则禁用了」在日志里查不到。
+    statsStore.addLog({ action: 'ipguard.toggle', detail: `${enabled ? '启用' : '禁用'} ${rule.kind === 'speed' ? 'IP 限速' : 'IP 屏蔽'}规则 ${rule.target}` });
     res.json({ ok: true, rule });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
@@ -59,7 +62,7 @@ router.put('/ipguard/rules/:id/enabled', requireAdmin, (req, res) => {
 router.delete('/ipguard/rules/:id', requireAdmin, (req, res) => {
   try {
     const removed = ipGuard.removeRule(req.params.id);
-    statsStore.addLog({ action: 'ipguard.delete', detail: `删除 IP 屏蔽规则 ${removed.target}` });
+    statsStore.addLog({ action: 'ipguard.delete', detail: `删除 ${removed.kind === 'speed' ? 'IP 限速' : 'IP 屏蔽'}规则 ${removed.target}` });
     res.json({ ok: true });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
@@ -89,7 +92,19 @@ router.get('/ipguard/test', requireAdmin, (req, res) => {
     bucketId = lb.activeBucketId || '';
   }
   const v = ipGuard.evaluate(ip, method, bucketId || null);
-  res.json({ ok: true, ip, method, bucketId: bucketId || null, allowed: v.ok, reason: v.reason || null, matchedRule: v.rule || null });
+  /**
+   * R37：预检同时报告**限速**规则。
+   *
+   * 「不会被屏蔽」与「不会被限速」是两件事：屏蔽规则与限速规则刻意互斥
+   * （见 `RULE_KINDS`），所以一次预检要同时回答两个问题，否则管理员加了一条
+   * 限速规则后来预检，看到「可正常访问」会以为规则没生效。
+   */
+  const sp = ipGuard.speedLimitFor(ip, method, bucketId || null);
+  res.json({
+    ok: true, ip, method, bucketId: bucketId || null,
+    allowed: v.ok, reason: v.reason || null, matchedRule: v.rule || null,
+    speedRule: sp ? { target: sp.target, bytesPerSec: sp.bytesPerSec } : null,
+  });
 });
 
 module.exports = router;

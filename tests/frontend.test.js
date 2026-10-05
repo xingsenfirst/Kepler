@@ -36,13 +36,15 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 25, `public/js 模块数应为 25，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  assertEqual(MODULES.length, 27, `public/js 模块数应为 27，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
   assert(MODULES.includes('share-status.js'), '应包含 share-status.js（分享链接状态判定，与服务端 status() 同序）');
   assert(MODULES.includes('pay-poll.js'), '应包含 pay-poll.js（分享页支付轮询，R8-07 从内联脚本抽出）');
   assert(MODULES.includes('listdialog.js'), '应包含 listdialog.js（四张列表卡片共用的「显示全部」对话框骨架，R36 独立成模块）');
+  assert(MODULES.includes('speedlimit.js'), '应包含 speedlimit.js（下载限速对话框与 MB/s 换算，R37 独立成模块）');
+  assert(MODULES.includes('ipmgr.js'), '应包含 ipmgr.js（「IP 地址管理」页，R37 从 bucketmgr 迁出）');
 });
 
 for (const f of MODULES) {
@@ -270,31 +272,57 @@ test('index.html 用户管理卡片与「编辑资料」菜单项就位', () => 
 });
 
 /* ==================================================================
- * 管理员专属卡片：界面整卡隐藏 + 不发请求
+ * 管理员专属页面：界面整页隐藏 + 不发请求
  *
- * 「IP 访问屏蔽」的增删改与预检全部是管理员专属，规则详情还含其它用户的来源 IP。
- * 只隐藏按钮是不够的 —— 普通用户仍会看到空卡片，且列表请求必然 403。
- * 约定：卡片自身带 id，在**角色权威渲染点**（main.js renderUserMenu）统一 hidden，
- * 数据侧（bucketmgr.refreshIpGuard）发现卡片已隐藏就直接返回，不发请求。
+ * 「IP 地址管理」（含「IP 访问屏蔽」与「IP 地址限速」两张卡）的增删改与预检
+ * 全部是管理员专属，规则详情还含其它用户的来源 IP。只隐藏按钮是不够的 ——
+ * 普通用户仍会看到空卡片，且列表请求必然 403。
+ *
+ * 约定：导航入口、整页与两张卡片都带 id，在**角色权威渲染点**（main.js
+ * renderUserMenu）统一 hidden；数据侧（ipmgr.refreshIpGuard）发现卡片已隐藏
+ * 就直接返回，不发请求。
+ *
+ * ⚠️ R37 起规则渲染与请求入口从 `bucketmgr.js` **整体迁到 `ipmgr.js`**
+ *（「IP 访问屏蔽」按需求搬进了新页面）——因此断言锚点也随之迁移。若只改代码
+ * 不改这里，护栏会一直对着 bucketmgr.js 里已不存在的函数，永远「找不到 = 红」；
+ * 反之若只把这里删掉，就成了「代码搬走了但没人看着」。
  * ================================================================== */
-test('IP 屏蔽卡片对普通用户整卡隐藏，且不发起规则请求', () => {
+test('IP 地址管理页对普通用户整页隐藏，且不发起规则请求', () => {
   const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
   const main = fs.readFileSync(path.join(JS_DIR, 'main.js'), 'utf8');
-  const bm = fs.readFileSync(path.join(JS_DIR, 'bucketmgr.js'), 'utf8');
+  const ipm = fs.readFileSync(path.join(JS_DIR, 'ipmgr.js'), 'utf8');
 
   assert(/id="ipguard-card"/.test(html), 'IP 屏蔽卡片应有 id 供整卡显隐');
+  assert(/id="ipspeed-card"/.test(html), 'IP 限速卡片应有 id 供整卡显隐');
+  assert(/id="side-ipmgr"/.test(html), '侧栏应有 IP 地址管理入口（带 id 供按角色显隐）');
+  assert(/id="ipmgr"/.test(html), 'IP 地址管理应有独立 section（带 id 供整页显隐）');
 
-  // ① 在角色权威渲染点按角色赋值（换账号不残留）
+  // ① 在角色权威渲染点按角色赋值（换账号不残留）：入口、整页、两张卡片四者都要覆盖
   const fn = /function renderUserMenu\(\)\s*\{([\s\S]*?)\n\}/.exec(main);
   assert(fn, 'main.js 应存在 renderUserMenu（角色权威渲染点）');
-  assert(/ipguard-card[\s\S]{0,200}?hidden\s*=\s*!isAdmin/.test(fn[1]),
+  const body = fn[1];
+  assert(/side-ipmgr[\s\S]{0,200}?hidden\s*=\s*!isAdmin/.test(body),
+    'renderUserMenu 应按角色隐藏 IP 地址管理入口');
+  assert(/getElementById\('ipmgr'\)[\s\S]{0,200}?hidden\s*=\s*true/.test(body),
+    'renderUserMenu 应对普通用户整页隐藏 #ipmgr');
+  assert(/ipguard-card[\s\S]{0,200}?hidden\s*=\s*!isAdmin/.test(body),
     'renderUserMenu 应按角色设置 IP 屏蔽卡片的 hidden');
+  assert(/ipspeed-card[\s\S]{0,200}?hidden\s*=\s*!isAdmin/.test(body),
+    'renderUserMenu 应按角色设置 IP 限速卡片的 hidden');
 
   // ② 数据侧：卡片隐藏时直接返回，不发请求（否则必有 403 噪音与错误提示）
-  const rf = /async function refreshIpGuard\(\)\s*\{([\s\S]*?)\n\}/.exec(bm);
-  assert(rf, 'bucketmgr.js 应存在 refreshIpGuard');
+  const rf = /async function refreshIpGuard\(\)\s*\{([\s\S]*?)\n\}/.exec(ipm);
+  assert(rf, 'ipmgr.js 应存在 refreshIpGuard');
   assert(/ipguard-card/.test(rf[1]) && /card\.hidden\)\s*return/.test(rf[1]),
     'refreshIpGuard 应在卡片隐藏时直接返回，避免无谓请求');
+  // 角色不符时也不发请求：hidden 判据只在「卡片被人为显示」时才拦得住，角色才是权威
+  assert(/!isAdmin\(\)\)\s*return/.test(rf[1]),
+    'refreshIpGuard 应在非管理员时直接返回（角色权威，先于 DOM 判据）');
+
+  // ③ 页面已接进应用外壳，否则 section 永远显示不出来（迁移后最常见的漏改）
+  assert(/ipmgr\.refresh\(\)/.test(main), 'switchMainView 应调用 ipmgr.refresh()');
+  assert(/ipmgr\.reset\(\)/.test(main), 'resetMainView 应调用 ipmgr.reset()（丢弃含他人 IP 的规则缓存）');
+  assert(/'ipmgr'/.test(main), 'MAIN_VIEWS 应包含 ipmgr');
 });
 
 /* ==================================================================

@@ -11,6 +11,8 @@
  */
 const { express, configStore, statsStore, authSession } = require('./_context');
 const { requireAdmin, sendError } = require('./_shared');
+// R37：限速入参合法性的唯一判据（与配额同款——非法值必须 400，不能被归一化成 0 = 不限速）
+const { parseSpeedLimitInput } = require('../limits');
 
 const router = express.Router();
 
@@ -75,6 +77,9 @@ router.put('/users/me', async (req, res) => {
     // 显式拒绝越权字段，避免"默默忽略"造成的语义误解
     if (b.role !== undefined) return res.status(403).json({ error: '不能修改自己的角色' });
     if (b.permissions !== undefined) return res.status(403).json({ error: '不能修改自己的权限' });
+    // R37：下载限速属于「被强制执行的限额」，由管理员在用户管理中设定。
+    // 若允许用户自行修改，就等于给受限方一个「解除限制」按钮（与配额自绕过同一个问题）。
+    if (b.speedLimit !== undefined) return res.status(403).json({ error: '不能修改自己的下载限速' });
 
     const user = await configStore.updateUser(me.id, patch);
 
@@ -123,11 +128,19 @@ router.post('/users', requireAdmin, async (req, res) => {
     if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password || '')) {
       return res.status(400).json({ error: '两次输入的密码不一致' });
     }
+    // R37：用户级下载限速（字节/秒；0 = 不限速）——与配额/密钥同款前置校验
+    let speedLimit = 0;
+    if (b.speedLimit !== undefined) {
+      const r = parseSpeedLimitInput(b.speedLimit);
+      if (!r.ok) return res.status(400).json({ error: r.error });
+      speedLimit = r.value;
+    }
     const user = await configStore.addUser({
       username: b.username,
       password: b.password,
       role: b.role,
       permissions: b.permissions,
+      speedLimit,
     });
     statsStore.addLog({ action: 'users.create', detail: `管理员「${req.authUser.username}」新增用户「${user.username}」（${user.role === 'admin' ? '管理员' : '普通用户'}）` });
     res.json({ ok: true, user });
@@ -149,12 +162,19 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     if (b.password !== undefined && b.password !== '') patch.password = b.password;
     if (b.role !== undefined) patch.role = b.role;
     if (b.permissions !== undefined) patch.permissions = b.permissions;
+    // R37：用户级下载限速（0 = 不限速）
+    if (b.speedLimit !== undefined) {
+      const r = parseSpeedLimitInput(b.speedLimit);
+      if (!r.ok) return res.status(400).json({ error: r.error });
+      patch.speedLimit = r.value;
+    }
     const user = await configStore.updateUser(req.params.id, patch);
     const parts = [];
     if (patch.username) parts.push('修改用户名');
     if (patch.role) parts.push(`调整为${user.role === 'admin' ? '管理员' : '普通用户'}`);
     if (patch.permissions) parts.push('更新权限');
     if (patch.password) parts.push('重置密码');
+    if (patch.speedLimit !== undefined) parts.push(patch.speedLimit ? '设置下载限速' : '取消下载限速');
     statsStore.addLog({ action: 'users.update', detail: `管理员「${req.authUser.username}」编辑用户「${user.username}」（${parts.join('，') || '无变更'}）` });
 
     // SEC-02：凡改变「身份 / 权限 / 凭据」的编辑，都必须让该用户的既有会话立即失效。

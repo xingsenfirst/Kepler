@@ -2,6 +2,8 @@
 import { API } from './api.js';
 import { toast, confirmDialog, openModal, escapeHtml, matchesQuery, previewMoreState } from './util.js';
 import { openListDialog, providerSelectOptions } from './listdialog.js';
+// R37：「限速」列的渲染与对话框（四张列表卡片共用同一实现点）
+import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
 import { App } from './main.js';
 import { providerList, providerLogo, providerMeta } from './provider-logos.js';
 
@@ -109,7 +111,7 @@ function credTableHtml(creds) {
   return `
     <table class="lk-table bm-table">
       <thead><tr>
-        <th>服务商</th><th>密钥</th><th>访问密钥 ID</th><th>对普通用户</th><th>状态</th><th style="width:${isAdmin() ? 300 : 120}px">操作</th>
+        <th>服务商</th><th>密钥</th><th>访问密钥 ID</th><th>对普通用户</th><th>状态</th><th style="width:170px">限速</th><th style="width:${isAdmin() ? 300 : 100}px">操作</th>
       </tr></thead>
       <tbody>
         ${creds.map((c) => {
@@ -123,6 +125,7 @@ function credTableHtml(creds) {
             <td style="font-family:Consolas,monospace">${escapeHtml(c.secretIdMasked)}</td>
             <td>${c.visibleToUsers !== false ? '<span class="lk-badge ok">可见</span>' : '<span class="lk-badge">仅管理员</span>'}</td>
             <td>${disabled ? '<span class="lk-badge warn">已停用</span>' : '<span class="lk-badge ok">使用中</span>'}</td>
+            <td class="lk-speed">${speedCellHtml('credential', c.id, c.speedLimit, isAdmin())}</td>
             <td class="lk-acts">
               ${isAdmin() ? `<button class="mini-btn" data-act="${disabled ? 'en' : 'dis'}" data-id="${escapeHtml(c.id)}">${disabled ? '启用' : '停用'}</button>` : ''}
               ${isAdmin() ? `<button class="mini-btn" data-act="vis" data-id="${escapeHtml(c.id)}">${c.visibleToUsers !== false ? '设为不可见' : '设为可见'}</button>
@@ -152,6 +155,10 @@ function bindCredRowActions(root, creds) {
       else if (act === 'en') toggleEnabled(cred, true);
       else if (act === 'dis') toggleEnabled(cred, false);
       else if (act === 'edit') editRemark(cred);
+      else if (act === 'speed') openSpeedLimitDialog({
+        scope: 'credential', id: cred.id, name: cred.remark || cred.secretIdMasked,
+        current: cred.speedLimit, onSaved: refresh,
+      });
       else if (act === 'del') deleteCredential(cred);
     };
   });

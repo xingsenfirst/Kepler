@@ -174,6 +174,9 @@ function makeFeSandbox(realFiles) {
   // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）——
   // 沙箱缺了它会在 ESM 链接期直接失败，所有 import syssettings 的用例整片变红。
   fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
+  // R37：syssettings.js 现在 import './speedlimit.js'（「限速」列 + 限速对话框）——
+  // 同一条链接期规则，缺文件则本文件所有 import syssettings 的用例一起红。
+  fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
   return dir;
 }
 

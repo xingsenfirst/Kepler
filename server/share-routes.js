@@ -20,6 +20,8 @@ const paymentOrders = require('./payment-orders');
 const paymentGateway = require('./payment-gateway');
 const { getClient, p, tracked } = require('./cos');
 const { streamDownload } = require('./download-stream');
+// R37：下载限速的唯一入口（与 /fs/download、WebDAV 共用同一份判定）
+const { makeThrottle } = require('./throttle');
 const { classifyDownloadSource } = require('./share-origin');
 const { singleFlight } = require('./coalesce'); // R14-10：并发合并读（唯一实现点）
 const { asyncHandler } = require('./routes/_shared'); // R17-04：async 抛错交回统一错误中间件
@@ -1429,7 +1431,23 @@ router.get('/s/:id/dl', async (req, res) => {
     const traffic = { bytesDown: 0 };
     const encMeta = encStore.getMeta(l.bucket, l.key); // 密文对象：解密后下发（分享密码即为权限验证）
     await tracked('download', async () => {
-      await streamDownload({ cos, bucket: l.bucket, region, key: l.key, fileName: l.fileName, encMeta, req, res, traffic });
+      await streamDownload({
+        cos, bucket: l.bucket, region, key: l.key, fileName: l.fileName, encMeta, req, res, traffic,
+        /**
+         * R37：下载限速。匿名访客没有系统账户，**用户层按分享创建者判**：
+         * 限额挂在资源/归属人身上，于是「分享者自己设的限额」对匿名下载同样成立
+         * （否则任何人都能靠拿一条分享链接绕开自己那层的限额）。
+         * 链接层用 `l.id`，与链接管理列表里改的是同一条记录（「文件分享 = 链接管理」）。
+         */
+        throttle: makeThrottle({
+          ip: security.clientIp(req),
+          method: req.method,
+          credentialId: cfg.credentialId,
+          bucketId: cfg.bucketId,
+          userName: l.createdBy, // 链接只快照了用户名，没有 id
+          linkId: l.id,
+        }),
+      });
     }, traffic);
     // 传输**结束后**才标记已下载：传输中途失败若提前标记，
     // 管理页会显示"已下载"而用户其实没拿到文件，对账就失真了。

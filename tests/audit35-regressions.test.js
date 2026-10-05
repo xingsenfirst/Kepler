@@ -126,7 +126,7 @@ export const API = new Proxy({}, {
 function utilShim() {
   const real = pathToFileURL(JS('util.js')).href;
   return `
-export { escapeHtml, fmtTime, fmtSize, updateNotice, filterUsersByName, USER_PREVIEW_LIMIT } from '${real}';
+export { escapeHtml, fmtTime, fmtSize, updateNotice, filterUsersByName, USER_PREVIEW_LIMIT, previewMoreState } from '${real}';
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);
@@ -171,6 +171,9 @@ function makeFeSandbox(realFiles) {
   fs.writeFileSync(path.join(dir, 'webauthn.js'), WEBAUTHN_STUB);
   fs.writeFileSync(path.join(dir, 'paysettings.js'), PAYSETTINGS_STUB);
   for (const f of realFiles) fs.copyFileSync(JS(f), path.join(dir, f));
+  // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）——
+  // 沙箱缺了它会在 ESM 链接期直接失败，所有 import syssettings 的用例整片变红。
+  fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
   return dir;
 }
 
@@ -489,7 +492,10 @@ test('R35 · 样式：滚动容器 / 吸顶表头 / 专属宽度，以及 flex �
   assert(/overflow:\s*auto/.test(bodyOf('.user-all-bar')) === false,
     '搜索栏本身不该滚动（滚动只发生在下面的列表里，否则筛完还得把列表往上滚回来）');
 
-  assert(/display:\s*none/.test(bodyOf('.user-more[hidden]')),
+  // R36：`.user-more` 已泛化为四张卡片共用的 `.list-more`（组件与样式都下沉到
+  // `listdialog.js` 的 `openListDialog()` + 通用 CSS 规则），断言随之改名 ——
+  // 这条测的行为（flex 容器上的 hidden 必须显式声明）一个字没变。
+  assert(/display:\s*none/.test(bodyOf('.list-more[hidden]')),
     '「显示全部」的容器是 display:flex —— 必须显式写 [hidden]{display:none}，'
     + '否则 hidden 属性对 flex 容器**完全无效**，10 位以内也会一直露着这个按钮');
 

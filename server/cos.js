@@ -432,6 +432,42 @@ function badRequest(msg) {
   return e;
 }
 
+/**
+ * 对象元数据里记录「上传者 / 创建者」的**唯一实现点**（R36）。
+ *
+ * 三家的自定义元数据头在上层统一用 `x-cos-meta-*` 命名，由各适配器翻译成厂商自己的
+ * 前缀（`s3-client` → `x-amz-meta-*`、`azure-client` → `x-ms-meta-*`），读取时再统一
+ * 映射回 `x-cos-meta-*` —— 于是这里只需写一个名字、读一个名字，不必按厂商分叉。
+ *
+ * ⚠️ 必须写在**建对象的那一刻**（直传 / 分片 init / 建文件夹 / WebDAV 写），
+ * 而不是上传完成后补写：S3 与 COS 的对象元数据只能在创建时指定
+ * （`CompleteMultipartUpload` 不接受元数据头）。Azure 是唯一例外 ——
+ * 它的块列表提交（Put Block List）仍接受 `x-ms-meta-*`，故 complete 也会带上，
+ * 对 S3/COS 而言多传的那一个头是被忽略的，不会覆盖创建时写入的值。
+ *
+ * 历史对象没有这个头 → 属性面板显示「—」，**不做任何猜测**（不拿「当前登录用户」
+ * 或「最后一个操作者」冒充上传者 —— 那是在编造数据）。
+ */
+const UPLOADER_META = 'x-cos-meta-uploader';
+
+/** 生成「记录上传者」的请求头；用户名为空时返回空对象（不写空值元数据） */
+function uploaderMeta(username) {
+  const u = String(username == null ? '' : username).trim();
+  return u ? { [UPLOADER_META]: u } : {};
+}
+
+/**
+ * 从对象响应头里读出上传者（没有则空串）—— `uploaderMeta()` 的**读取端**。
+ *
+ * 与写入端成对放在这里，是为了让「元数据的名字」只出现在本文件：
+ * 上游若各自拼 `headers['x-cos-meta-uploader']`，改名字时必然漏掉一处，
+ * 而漏掉的表现在界面上只是「某一处显示 — 」，几乎不可能被 review 发现。
+ */
+function readUploader(headers) {
+  const h = headers || {};
+  return String(h[UPLOADER_META] || '').trim();
+}
+
 /** CopySource 的 Key 需逐段百分号编码（保留 '/' 作分隔符） */
 function encodeCopyPath(key) {
   return String(key).split('/').map(encodeURIComponent).join('/');
@@ -459,4 +495,5 @@ module.exports = {
   getClient, createClient, providerOf, p, tracked, translateError,
   listAll, listAllInfo, listAllExact, listPage, LIMITS, normalizeKey, badRequest,
   copySource, encodeCopyPath, deleteMultipleConfirmed,
+  UPLOADER_META, uploaderMeta, readUploader,
 };

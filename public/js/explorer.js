@@ -1,6 +1,6 @@
 /** 资源管理器核心 —— 目录列表 / 分页 / 多视图 / 排序 / 多选 / 右键菜单 / 拖拽 / 搜索 */
 import { API } from './api.js';
-import { escapeHtml, fmtSize, fmtTime, toast, confirmDialog, openModal, iconHtml } from './util.js';
+import { escapeHtml, fmtSize, fmtTime, toast, confirmDialog, openModal, iconHtml, propertyBodyHtml } from './util.js';
 import { App } from './main.js';
 import { uploadMgr } from './upload.js';
 import { ops } from './ops.js';
@@ -643,32 +643,22 @@ function showContextMenu(x, y, key) {
 
 /* ------------------------- 属性面板 ------------------------- */
 
-/** 右键「属性」：文件 → 名称/创建时间/大小；文件夹 → 名称/创建时间/对象总数 */
+/**
+ * 右键「属性」。
+ *
+ * R36：正文渲染（含「文件夹 → 创建者 / 文件 → 上传者」的标签规则）下沉到
+ * `util.propertyBodyHtml()` —— 它是**纯函数**，因此这条需求能被真实断言驱动，
+ * 而不是只能对着源码找字样；两个 `if` 分支各写一遍同名的行，也只会在那儿出现一次。
+ */
 async function showProperties(item) {
   const m = openModal({
     title: (item.isFolder ? '文件夹属性' : '属性') + ' — ' + item.name,
     body: '<div class="prop-loading"><div class="loading-spin"></div><p>正在获取属性…</p></div>',
     foot: [{ text: '关闭' }],
   });
-  const row = (label, value) =>
-    `<div class="prop-row"><span class="prop-label">${label}</span><span class="prop-value">${value}</span></div>`;
   try {
     const st = await API.stat(item.key);
-    const fullPath = `<div class="prop-path" title="${escapeHtml(st.key)}">${escapeHtml(st.key)}</div>`;
-    if (st.isFolder) {
-      m.bodyEl.innerHTML = fullPath +
-        row('名称', escapeHtml(st.name)) +
-        row('类型', '文件夹') +
-        row('创建时间', st.lastModified ? fmtTime(st.lastModified) : '—') +
-        row('对象总数', st.reachedCap ? `≥ ${st.objectCount}（已达统计上限）` : String(st.objectCount));
-    } else {
-      m.bodyEl.innerHTML = fullPath +
-        row('名称', escapeHtml(st.name)) +
-        row('类型', typeLabel(item.type)) +
-        row('创建时间', st.lastModified ? fmtTime(st.lastModified) : '—') +
-        row('大小', `${fmtSize(st.size)}（${Number(st.size).toLocaleString()} 字节）`) +
-        (st.encrypted ? row('加密', '已加密（云端存储为密文，此为解密后大小）') : '');
-    }
+    m.bodyEl.innerHTML = propertyBodyHtml(st, typeLabel(item.type));
   } catch (e) {
     m.bodyEl.innerHTML = `<div class="prop-loading"><p style="color:var(--danger)">获取属性失败：${escapeHtml(e.message)}</p></div>`;
   }

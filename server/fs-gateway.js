@@ -21,7 +21,7 @@ const configStore = require('./config-store');
 const encStore = require('./enc-store');
 const statsStore = require('./stats-store');
 const shareStore = require('./share-store'); // R7-03：删对象必须同步标记分享链接
-const { getClient, p, translateError, listAllInfo, listAllExact, LIMITS, normalizeKey, copySource } = require('./cos');
+const { getClient, p, translateError, listAllInfo, listAllExact, LIMITS, normalizeKey, copySource, uploaderMeta, readUploader } = require('./cos');
 const { deleteMultipleConfirmed } = require('./cos'); // R10-03：批量删除的白名单判据（共用）
 const providers = require('./providers');
 
@@ -365,15 +365,15 @@ function parseRange(range, total) {
  * 槽位必须从「开始缓冲」一直持到「整个函数返回」—— 明文 Buffer 与 `encryptBuffer`
  * 产出的密文副本都活到那时；只在缓冲结束时释放等于没限住峰值内存。
  */
-async function writeObject(bucket, key, data, contentType, auditAction, auditPrefix) {
+async function writeObject(bucket, key, data, contentType, auditAction, auditPrefix, uploader) {
   if (Buffer.isBuffer(data) || typeof data === 'string') {
-    return writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix);
+    return writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix, uploader);
   }
   await acquireWriteStream(); // 排队发生在**缓冲之前**，否则内存早就吃满了
   const release = makeWriteStreamReleaser();
   try {
     const buf = await bufferStream(data);
-    return await writeObjectInner(bucket, key, buf, contentType, auditAction, auditPrefix);
+    return await writeObjectInner(bucket, key, buf, contentType, auditAction, auditPrefix, uploader);
   } finally {
     release();
   }
@@ -389,7 +389,7 @@ async function writeObject(bucket, key, data, contentType, auditAction, auditPre
  * @param {string} [auditAction]
  * @param {string} [auditPrefix]
  */
-async function writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix) {
+async function writeObjectInner(bucket, key, data, contentType, auditAction, auditPrefix, uploader) {
   const k = normalizeKey(key);
   const { cfg, cos } = requireCfgCos();
   let plainBuf;
@@ -420,7 +420,11 @@ async function writeObjectInner(bucket, key, data, contentType, auditAction, aud
     Bucket: cfg.bucket, Region: cfg.region, Key: k,
     Body: body,
     ContentLength: body.length,
-    Headers: { 'Content-Type': contentType || 'application/octet-stream' },
+    // R36：WebDAV 上传同样记录上传者（属性面板与网页上传看到的是同一份数据）。
+    Headers: Object.assign(
+      { 'Content-Type': contentType || 'application/octet-stream' },
+      uploaderMeta(uploader),
+    ),
   });
 
   // SEC-08 + R7-02：**密文确认落云之后**才写入解密凭据（IV/TAG/盐/文件头），并立刻同步落盘。
@@ -988,9 +992,17 @@ async function movePrefix(bucket, srcPrefix, dstPrefix, auditAction, auditPrefix
    * 位置在删源**之前**：补建失败就不该继续做不可逆的删除。
    */
   if (!items.length) {
+    // R36：目录标记上带着「创建者」，重命名不该顺手把它丢掉 —— 先读源标记的元数据
+    // 再补建到目标位置（读取失败按无元数据处理，绝不阻断移动）。
+    let markerMeta = {};
+    try {
+      const h = await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: srcP + '/' }, { noStat: true });
+      markerMeta = uploaderMeta(readUploader(h.headers));
+    } catch (e) { /* 无标记对象或读取失败 → 保持空 */ }
     await p(cos, 'putObject', {
       Bucket: cfg.bucket, Region: cfg.region, Key: dstP + '/',
       Body: Buffer.alloc(0), ContentLength: 0,
+      Headers: markerMeta,
     });
   }
 

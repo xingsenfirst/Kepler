@@ -36,12 +36,13 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 24, `public/js 模块数应为 24，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  assertEqual(MODULES.length, 25, `public/js 模块数应为 25，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
   assert(MODULES.includes('share-status.js'), '应包含 share-status.js（分享链接状态判定，与服务端 status() 同序）');
   assert(MODULES.includes('pay-poll.js'), '应包含 pay-poll.js（分享页支付轮询，R8-07 从内联脚本抽出）');
+  assert(MODULES.includes('listdialog.js'), '应包含 listdialog.js（四张列表卡片共用的「显示全部」对话框骨架，R36 独立成模块）');
 });
 
 for (const f of MODULES) {

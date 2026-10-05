@@ -1,0 +1,160 @@
+/**
+ * 通用「列表预览 + 显示全部对话框」组件（R36）
+ *
+ * 背景：R35 为「用户管理」卡片做了「卡片只显示前 N 条 + 显示全部对话框（带搜索/滚动）」，
+ * R36 要把同一套交互复制到访问密钥 / 存储桶 / 分享链接三张卡片。四份各写一遍必然分叉
+ * （最典型的是「其中一张卡片的对话框忘了绑定行内按钮」—— 看得见、点不动），
+ * 因此把对话框**骨架与状态**下沉到这里，卡片只提供数据与行渲染：
+ *
+ *   - `items()`     取当前数据集（每次重绘**现取**，这样后台刷新后的新数据会立刻反映到
+ *                   已打开的对话框里；若在打开时快照一份，删除一条后对话框里却还留着它）
+ *   - `filter()`    过滤规则（各卡片不同：用户按角色、桶按服务商……但关键词规则统一走
+ *                   `util.matchesQuery`）
+ *   - `rowHtml()`   行渲染（**必须**与卡片共用同一个渲染器 —— 两处各写一份表格，
+ *                   新增一列或一个按钮时只会改到一处）
+ *   - `bindRows()`  行内按钮绑定（同上，卡片与对话框共用）
+ *
+ * ⚠️ 本模块**必须**是独立文件而不是 util.js 的一部分：测试沙箱会用桩替换 util.js 里的
+ * `openModal`（它直接操作真实 DOM），再把本文件原样拷进沙箱 —— 于是**真实**的对话框逻辑
+ * 能跑在桩化的弹窗原语上。若把它写进 util.js，沙箱只能连它一起换成桩，测到的就是
+ * 「测试自己写的一份副本」，只能证明自洽（R30 假 Azure 的教训）。
+ */
+import { openModal, escapeHtml } from './util.js';
+
+/**
+ * 打开「全部列表」对话框。
+ *
+ * @param {object} o
+ *  - `idPrefix`   元素 id / class 前缀（如 `'user-all'` → `#user-all-search`、
+ *                 `#user-all-body`、`#user-all-count`）。样式规则按这些前缀分组，
+ *                 保留前缀是为了让每张卡片的样式断言能各自锚定。
+ *  - `title`      弹窗标题（通常含总数）
+ *  - `cls`        弹窗专属尺寸类（7 列 / 10 列表格需要的宽度不同）
+ *  - `placeholder` 搜索框占位符（写明搜的是哪些字段）
+ *  - `selects`    下拉筛选：[{ id, title, value, options: [{ value, text }] }]；
+ *                 **约定 `value === ''` 表示「全部」**
+ *  - `items` / `filter` / `rowHtml` / `bindRows`  见文件头
+ *  - `unit`       总数文案的单位（如 `'位用户'` → 「共 12 位用户」）
+ *  - `unitShort`  匹配文案的单位（缺省同 `unit`；用户卡片用 `'位'` → 「匹配 3 / 共 12 位」）
+ *  - `emptyAll` / `emptyMatch`  两种空态文案
+ *  - `onClose`    关闭回调（卡片据此清掉自己的句柄）
+ * @returns {{ open: boolean, repaint: Function, close: Function }}
+ */
+export function openListDialog(o) {
+  const idp = o.idPrefix;
+  const selects = o.selects || [];
+  const unit = o.unit || '项';
+  const unitShort = o.unitShort || unit;
+
+  const wrap = document.createElement('div');
+  wrap.className = idp;
+  wrap.innerHTML = `
+    <div class="${idp}-bar">
+      <input type="search" id="${idp}-search" class="${idp}-search"
+        placeholder="${escapeHtml(o.placeholder || '搜索…')}" autocomplete="off" spellcheck="false">
+      ${selects.map((s) => `<select id="${idp}-${s.id}" class="${idp}-select" title="${escapeHtml(s.title || '')}">${
+        (s.options || []).map((op) => `<option value="${escapeHtml(op.value)}"${op.value === s.value ? ' selected' : ''}>${escapeHtml(op.text)}</option>`).join('')
+      }</select>`).join('')}
+      <span class="${idp}-count" id="${idp}-count"></span>
+    </div>
+    <div class="${idp}-body" id="${idp}-body"></div>`;
+
+  /** 对话框自己的筛选状态（跨重绘保持：刷新一次就把关键词清掉，用户会以为界面抽风） */
+  const state = { query: '', filters: {} };
+  selects.forEach((s) => { state.filters[s.id] = s.value == null ? '' : String(s.value); });
+
+  const api = { open: true, repaint, close: () => modal.close() };
+  const modal = openModal({
+    title: o.title,
+    body: wrap,
+    foot: o.foot || [{ text: '关闭' }],
+    wide: o.wide !== false,
+    cls: o.cls,
+    onClose: () => { api.open = false; if (o.onClose) o.onClose(); },
+  });
+
+  function currentAll() {
+    return (o.items && o.items()) || [];
+  }
+  function currentShown(all) {
+    return o.filter ? (o.filter(all, state) || []) : all;
+  }
+  /** 是否有任何筛选条件生效（决定计数文案写「共 N」还是「匹配 x / 共 N」） */
+  function filtering() {
+    return String(state.query == null ? '' : state.query).trim() !== ''
+      || Object.keys(state.filters).some((k) => state.filters[k] !== '');
+  }
+
+  function repaint() {
+    if (!api.open) return;
+    const list = document.getElementById(idp + '-body');
+    if (!list) { api.open = false; return; } // 弹窗已被移除（例如登出），别再往空气里渲染
+    const all = currentAll();
+    const shown = currentShown(all);
+
+    const countEl = document.getElementById(idp + '-count');
+    if (countEl) {
+      countEl.textContent = filtering()
+        ? `匹配 ${shown.length} / 共 ${all.length} ${unitShort}`
+        : `共 ${all.length} ${unit}`;
+    }
+    if (!shown.length) {
+      // 「筛不到」与「一条都没有」是两件事，文案必须分开 —— 否则用户会以为数据丢了
+      list.innerHTML = `<div class="lk-empty">${all.length ? (o.emptyMatch || '没有匹配的项') : (o.emptyAll || '暂无数据')}</div>`;
+      return;
+    }
+    list.innerHTML = o.rowHtml(shown);
+    if (o.bindRows) o.bindRows(list, shown);
+  }
+
+  const search = document.getElementById(idp + '-search');
+  // 本地内存过滤（数据已经在手）：既不防抖也不发请求。
+  // 用 `oninput` 而不是 addEventListener：与列表按钮同一写法，且假 DOM 里可直接驱动。
+  search.oninput = () => { state.query = search.value; repaint(); };
+  selects.forEach((s) => {
+    const sel = document.getElementById(idp + '-' + s.id);
+    if (!sel) return;
+    sel.onchange = () => { state.filters[s.id] = sel.value; repaint(); };
+  });
+
+  repaint();
+  if (search.focus) search.focus();
+  return api;
+}
+
+/**
+ * 由数据集推导「服务商下拉」的选项（R36：密钥卡片与存储桶卡片共用）。
+ *
+ * 选项**只列数据集里真实出现过的服务商**，而不是把注册表里 11 家全列出来 ——
+ * 后者会给出大量「选了必然为空」的选项，用户会以为是自己筛错了。
+ * 名称取自 `providerMeta()`（与服务端注册表同源），因此不会出现「下拉写着腾讯云、
+ * 表格里写着 Tencent Cloud」这种两套叫法。
+ *
+ * @param {Array<{provider?: string}>} rows
+ * @param {(id: string) => { name: string }} metaOf  通常传 `providerMeta`
+ * @param {string} allText 「全部」选项的文案
+ */
+export function providerSelectOptions(rows, metaOf, allText) {
+  const seen = [];
+  (rows || []).forEach((r) => {
+    const pid = String((r && r.provider) || 'tencent');
+    if (!seen.includes(pid)) seen.push(pid);
+  });
+  return [{ value: '', text: allText || '全部服务商' }].concat(
+    seen.map((pid) => ({ value: pid, text: (metaOf(pid) || {}).name || pid })),
+  );
+}
+
+/**
+ * 由数据集推导「存储桶下拉」的选项（R36：分享链接卡片用）。
+ * 同理只列真实出现过的桶；历史链接的 `bucket` 可能为空，那类条目在「全部」下仍可见。
+ */
+export function bucketSelectOptions(rows, allText) {
+  const seen = [];
+  (rows || []).forEach((r) => {
+    const b = String((r && r.bucket) || '');
+    if (b && !seen.includes(b)) seen.push(b);
+  });
+  return [{ value: '', text: allText || '全部存储桶' }]
+    .concat(seen.map((b) => ({ value: b, text: b })));
+}

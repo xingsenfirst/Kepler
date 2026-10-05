@@ -243,26 +243,67 @@ test('R34 · 「关于」卡片确实有按钮，且 syssettings 把它接到了
 /**
  * 沙箱桩与真实模块 import 图的同步护栏。
  *
- * `syssettings.js` 现在用具名导入取 `updateNotice`，而 audit31 / 32 / 33 三个前端沙箱
- * 各自在临时目录里放了一份**自己的 `util.js` 桩**。ESM 的具名导入是在**链接期**校验的：
- * 桩里少一个名字，`import syssettings.js` 直接抛
- * `does not provide an export named '…'`，于是那三个文件里**所有**用例整片变红 ——
- * 而红的原因与它们各自要守的东西毫无关系（本轮实测：一次改动引发 9 条无关用例失败）。
+ * 前端沙箱（audit31 / 32 / 33 / 35 …）在临时目录里放一份**自己的 `util.js` 桩**，
+ * 再把被测的真实模块拷进去。ESM 的具名导入是在**链接期**校验的：桩里少一个名字，
+ * `import` 直接抛 `does not provide an export named '…'`，于是该文件里**所有**用例
+ * 整片变红 —— 而红的原因与它们各自要守的东西毫无关系。
  *
- * 这条护栏把「桩的导出集 ⊇ syssettings.js 的导入集」变成断言，让下一次新增导入时
- * 在第一处就报错，而不是让 9 条无关用例替它背锅。
+ * R34 首次写下这条护栏时只盯了 `syssettings.js` 一个模块、只查了 3 个测试文件；
+ * R36 给 `linkmgr.js` 新增 `matchesQuery` 导入时，这个"点对点"的判据完全没响，
+ * 而 `audit32` 里 import linkmgr.js 的用例已经红了。故本轮把它改成**从沙箱现场推导**：
+ *
+ *   1. 扫出每个测试文件**真正拷进沙箱**的模块（`makeXxxSandbox([...])` 的数组元素
+ *      与 `copyFileSync(JS('x.js'))` 两处写法都认）；
+ *   2. 取这些模块从 `./util.js` 具名导入的符号集；
+ *   3. 要求该测试文件的 util 桩导出集**包含**它 —— 两种写法都认：
+ *      `export const/function NAME` 与 `export { NAME } from '…'`（再导出真实实现）。
+ *
+ * 判据只落在**真正需要**的符号上（而非"所有沙箱都补全 util 的所有导出"）：
+ * 过宽会在下一次新增导出时逼着四个无关文件一起改，噪声最终会让人把护栏注释掉。
  */
-test('R34 · 前端沙箱的 util 桩必须覆盖 syssettings.js 从 util.js 具名导入的全部符号', () => {
-  const src = fs.readFileSync(JS('syssettings.js'), 'utf8');
-  const m = /import\s*\{([^}]+)\}\s*from\s*'\.\/util\.js'/.exec(src);
-  assert(m, 'syssettings.js 应从 ./util.js 具名导入');
-  const need = m[1].split(',').map((s) => s.trim()).filter(Boolean);
-  assert(need.length > 0, '解析到的导入集不得为空（否则本条形同虚设）');
-
-  for (const f of ['audit31-regressions.test.js', 'audit32-regressions.test.js', 'audit33-regressions.test.js']) {
-    const t = fs.readFileSync(path.join(ROOT, 'tests', f), 'utf8');
-    const miss = need.filter((n) => !new RegExp(`export\\s+(?:const|function|async\\s+function)\\s+${n}\\b`).test(t));
-    assertEqual(miss.join(','), '',
-      `${f} 的 util 桩缺少：${miss.join('、')} —— ESM 在链接期就会报错，该文件所有 import syssettings.js 的用例会整片变红`);
+test('R34 · 前端沙箱的 util 桩必须覆盖其拷入的每个真实模块从 util.js 具名导入的全部符号', () => {
+  const JS_FILE_RE = /^[\w.-]+\.js$/;
+  /** 该测试文件拷进沙箱的模块名单（两种写法） */
+  function sandboxedModules(src) {
+    const out = new Set();
+    for (const m of src.matchAll(/make\w*Sandbox\(\s*\[([^\]]*)\]/g)) {
+      for (const s of m[1].split(',')) {
+        const name = s.trim().replace(/['"]/g, '');
+        if (JS_FILE_RE.test(name)) out.add(name);
+      }
+    }
+    for (const m of src.matchAll(/copyFileSync\(\s*JS\(\s*'([^']+\.js)'\s*\)/g)) out.add(m[1]);
+    return [...out];
   }
+  /** 某真实模块从 ./util.js 具名导入的符号 */
+  function utilImportsOf(name) {
+    const src = fs.readFileSync(JS(name), 'utf8');
+    const hits = [...src.matchAll(/import\s*\{([^}]+)\}\s*from\s*'\.\/util\.js'/g)];
+    return hits.flatMap((m) => m[1].split(',').map((s) => s.trim()).filter(Boolean));
+  }
+  /** 桩里是否声明/再导出了该符号（注释掉的写法不算数，故要求 export 前缀） */
+  const stubHas = (t, n) => new RegExp(`export\\s+(?:const|let|var|function|async\\s+function|class)\\s+${n}\\b`).test(t)
+    || new RegExp(`export\\s*\\{[^}]*\\b${n}\\b[^}]*\\}`).test(t);
+
+  const files = fs.readdirSync(path.join(ROOT, 'tests')).filter((f) => f.endsWith('.test.js'));
+  const offenders = [];
+  let checkedPairs = 0;
+  for (const f of files) {
+    const t = fs.readFileSync(path.join(ROOT, 'tests', f), 'utf8');
+    if (!/export\s+const\s+toast\b/.test(t)) continue; // 该文件没有 util 桩，不涉及
+    for (const name of sandboxedModules(t)) {
+      if (!fs.existsSync(JS(name))) continue;
+      for (const sym of utilImportsOf(name)) {
+        checkedPairs += 1;
+        if (!stubHas(t, sym)) offenders.push(`${f} 的 util 桩缺少 ${sym}（${name} 需要）`);
+      }
+    }
+  }
+
+  assert(checkedPairs >= 6,
+    `只校验到 ${checkedPairs} 组「模块 × 导入符号」—— 少于 6 说明沙箱写法已经变了、本护栏正在空转`);
+  assertEqual(offenders.join('\n'), '',
+    'ESM 具名导入在链接期校验：桩里少一个导出，该文件所有 import 该模块的用例会整片变红，'
+    + `而红的原因与它们各自要守的东西无关。需要补的：\n${offenders.join('\n')}`);
 });
+

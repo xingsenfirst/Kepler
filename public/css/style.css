@@ -942,30 +942,40 @@ input.full { width: 100%; }
 .user-tbl .mini-btn:disabled { opacity: .45; cursor: not-allowed; }
 .user-tbl .mini-btn:disabled:hover { background: transparent; color: inherit; }
 
-/* 「显示全部」行（R35）：仅当用户数超过预览上限时出现（hidden 由 updateUserMore 控制） */
-.user-more { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
-.user-more[hidden] { display: none; }
-.user-more-hint { font-size: 12px; color: var(--text-2); }
+/* 「显示全部」行（R35 用户卡片起，R36 扩到密钥 / 存储桶 / 分享链接卡片）：
+   仅当条目数超过预览上限时出现（hidden 由各卡片的 xxMore 判据控制） */
+.list-more { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
+.list-more[hidden] { display: none; }
+.list-more-hint { font-size: 12px; color: var(--text-2); }
 
-/* 「全部用户」对话框（R35）：7 列表格需要比通用宽版更宽，故用专属类（openModal 的 cls） */
-.dialog.user-all-dialog { width: min(980px, 94vw); }
-.user-all { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-/* 搜索栏固定在顶部：滚动只发生在下面的列表里，否则筛完还得往上滚回来 */
-.user-all-bar { display: flex; align-items: center; gap: 10px; }
-.user-all-search {
+/* 「全部列表」对话框（R35 / R36）—— 四张卡片共用同一个组件（`listdialog.js` 的
+   `openListDialog()`），组件按 `idPrefix` 生成 `user-all-* / cred-all-* /
+   bucket-all-* / link-all-*` 四组类名，因此下面的规则都是**同一条规则的四份选择器**。
+   保留前缀（而不是统一成一个类名）是为了让每张卡片的样式断言能各自锚定。
+   列数最多的分享链接有 10 列，故统一给到 1040px（用 min() 兼顾窄屏）。 */
+.dialog.user-all-dialog, .dialog.cred-all-dialog, .dialog.bucket-all-dialog, .dialog.link-all-dialog { width: min(1040px, 96vw); }
+.user-all, .cred-all, .bucket-all, .link-all { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* 工具条固定在顶部：滚动只发生在下面的列表里，否则筛完还得往上滚回来 */
+.user-all-bar, .cred-all-bar, .bucket-all-bar, .link-all-bar { display: flex; align-items: center; gap: 10px; }
+.user-all-search, .cred-all-search, .bucket-all-search, .link-all-search {
   flex: 1 1 auto; min-width: 0; height: 32px; padding: 0 10px; font-size: 13px;
   border: 1px solid var(--border-strong); border-radius: 6px; background: #fff; color: var(--text);
 }
-.user-all-search:focus { outline: none; border-color: var(--accent); }
-.user-all-count { flex: none; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.user-all-search:focus, .cred-all-search:focus, .bucket-all-search:focus, .link-all-search:focus { outline: none; border-color: var(--accent); }
+/* 下拉筛选（服务商 / 存储桶 / 角色）：与搜索框同一行、同一高度 */
+.user-all-select, .cred-all-select, .bucket-all-select, .link-all-select {
+  flex: none; height: 32px; max-width: 190px; padding: 0 6px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: #fff; color: var(--text);
+}
+.user-all-count, .cred-all-count, .bucket-all-count, .link-all-count { flex: none; font-size: 12px; color: var(--text-2); white-space: nowrap; }
 /* 列表自带滚动条（表头吸顶，长列表滚动时仍知道每列是什么） */
-.user-all-body {
+.user-all-body, .cred-all-body, .bucket-all-body, .link-all-body {
   max-height: min(54vh, 460px); overflow: auto; border: 1px solid var(--border);
   border-radius: var(--radius); background: #fff;
 }
-.user-all-body .lk-table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
-.user-all-body .lk-table tr:last-child td { border-bottom: 0; }
-.user-all-body .lk-empty { padding: 22px 0; }
+.user-all-body .lk-table thead th, .cred-all-body .lk-table thead th, .bucket-all-body .lk-table thead th, .link-all-body .lk-table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.user-all-body .lk-table tr:last-child td, .cred-all-body .lk-table tr:last-child td, .bucket-all-body .lk-table tr:last-child td, .link-all-body .lk-table tr:last-child td { border-bottom: 0; }
+.user-all-body .lk-empty, .cred-all-body .lk-empty, .bucket-all-body .lk-empty, .link-all-body .lk-empty { padding: 22px 0; }
 
 /* ============================ 负载均衡（按 API Key 的配额，R25） ============================ */
 /* 风箱（手风琴）式列表：默认全部折叠，点标题行展开该密钥下各桶占用 */

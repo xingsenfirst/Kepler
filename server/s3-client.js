@@ -682,18 +682,30 @@ class S3Client {
     });
   }
 
+  /**
+   * 自定义元数据头：COS 命名（`x-cos-meta-*`）→ S3 命名（`x-amz-meta-*`）。
+   *
+   * `putObject` 与 `multipartInit` 共用同一个映射（R36）：分片上传的对象元数据
+   * **只能在创建 uploadId 时**指定 —— `CompleteMultipartUpload` 不接受元数据头，
+   * 因此两处各写一份映射必然会漏掉分片这条路（表现是「大文件上传后没有上传者，
+   * 小文件却有」这种按文件大小分裂的怪现象）。
+   */
+  _metaHeaders(headers) {
+    const out = Object.assign({}, headers || {});
+    for (const k of Object.keys(out)) {
+      if (k.toLowerCase().startsWith('x-cos-meta-')) {
+        out['x-amz-meta-' + k.slice('x-cos-meta-'.length)] = out[k];
+        delete out[k];
+      }
+    }
+    return out;
+  }
+
   putObject(params, cb) {
     return this._do(cb, async () => {
       const { bucket } = this._ctx(params);
-      const headers = Object.assign({}, params.Headers || {});
+      const headers = this._metaHeaders(params.Headers);
       if (params.ContentType) headers['content-type'] = params.ContentType;
-      // COS 元数据头 → S3 元数据头
-      for (const k of Object.keys(headers)) {
-        if (k.toLowerCase().startsWith('x-cos-meta-')) {
-          headers['x-amz-meta-' + k.slice('x-cos-meta-'.length)] = headers[k];
-          delete headers[k];
-        }
-      }
       const isStream = params.Body && typeof params.Body.pipe === 'function';
       // R23-01：同一类缺陷 —— PutObject 响应体为空、ETag 只在头；顺带把真实响应头回传。
       const { res, body } = await this._send({
@@ -858,7 +870,7 @@ class S3Client {
   multipartInit(params, cb) {
     return this._do(cb, async () => {
       const { bucket } = this._ctx(params);
-      const headers = {};
+      const headers = this._metaHeaders(params.Headers);
       if (params.ContentType) headers['content-type'] = params.ContentType;
       const body = await this._send({
         method: 'POST', bucket, key: params.Key || '', query: { uploads: '' }, headers,

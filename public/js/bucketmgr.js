@@ -1,6 +1,7 @@
 /** 存储桶管理页 —— 添加 / 清空文件 / 碎片清理 / 彻底删除 / 存储统计 / IP 访问屏蔽 */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
+import { openListDialog, providerSelectOptions } from './listdialog.js';
 import { App } from './main.js';
 import { providerMeta } from './provider-logos.js';
 
@@ -8,6 +9,15 @@ let wired = false;
 let timer = null;
 let cache = []; // [{ id, bucket, region, remark, quotaBytes, active, stats, error }]
 let ipCache = null; // { rules, chinaRangeCount, methods }
+
+/**
+ * 「存储桶管理」卡片列表的**预览条数上限**（R36 需求 2①）。
+ * 只声明一次：卡片截断与「显示全部」的提示文案必须引用同一个数。
+ */
+const BUCKET_PREVIEW_LIMIT = 10;
+
+/** 「全部存储桶」对话框的句柄（`null` = 未打开）；见 credmgr.js 的同类说明 */
+let bucketsDialog = null;
 
 /* ------------------------- 自动刷新时间（自定义） ------------------------- */
 
@@ -113,6 +123,8 @@ function wire() {
   if (addIp) addIp.onclick = () => openIpRuleDialog(null);
   const testBtn = document.getElementById('btn-ipguard-test');
   if (testBtn) testBtn.onclick = testIpBlocked;
+  const all = document.getElementById('btn-bucket-all');
+  if (all) all.onclick = showAllBuckets;
 }
 
 /* ------------------------------ 渲染 ------------------------------ */
@@ -129,16 +141,40 @@ function render() {
     box.innerHTML = `<div class="lk-empty">${isAdmin()
       ? '还没有绑定存储桶。点击右上角“添加存储桶”，或从云端获取桶列表后选择添加。'
       : '管理员尚未为你开放任何存储桶，请联系管理员在「存储桶可见性权限」中开放。'}</div>`;
+    updateBucketMore(0);
+    repaintAllBuckets();
     return;
   }
-  box.innerHTML = `<table class="lk-table bm-table">
+  // 需求 2①：卡片列表最多展示前 BUCKET_PREVIEW_LIMIT 个存储桶
+  const shown = cache.slice(0, BUCKET_PREVIEW_LIMIT);
+  box.innerHTML = bucketTableHtml(shown, cache);
+  bindBucketRowActions(box, shown);
+
+  updateBucketMore(cache.length);
+  repaintAllBuckets(); // 对话框开着时同步刷新：停用/解绑后两边必须一致
+}
+
+/**
+ * 存储桶表格 HTML —— 卡片列表与「全部存储桶」对话框的**唯一渲染器**（R36）。
+ *
+ * ⚠️ `all` 是**未经过滤的全量数据**，用于「仅剩最后一个启用桶时禁止停用」这条保护
+ * （`disBlocked`）。它**不能**退化成 `rows`：对话框里按服务商筛过之后 `rows` 只是子集，
+ * 在子集里数启用桶会得出「这个厂商只剩一个启用桶了」的错觉，把本该可停用的按钮锁死。
+ *
+ * @param {Array} rows 要渲染的行
+ * @param {Array} [all] 用于全局判定的全量数据（缺省时退化为 `rows`）
+ */
+function bucketTableHtml(rows, all) {
+  const total = all || rows;
+  const enabledCount = total.filter((x) => x.enabled !== false).length;
+  return `<table class="lk-table bm-table">
     <thead><tr>
       <th>服务商</th><th>存储桶</th><th>地域</th><th>已用容量</th><th>累计上传</th><th>累计下载</th><th>请求数</th><th>碎片</th>
       ${isAdmin() ? '<th style="width:90px">屏蔽海外 IP</th>' : ''}
       ${isAdmin() ? '<th style="width:320px">操作</th>' : ''}
     </tr></thead>
     <tbody>
-      ${cache.map((row) => {
+      ${rows.map((row) => {
         const st = row.stats || {};
         const frag = st.fragmentCount;
         const fragCell = frag === null || frag === undefined ? '—'
@@ -147,13 +183,13 @@ function render() {
           : `<span class="lk-badge warn">${frag} 个</span>`;
         // 停用保护：仅剩最后一个启用桶时禁止停用（服务端同样强制校验）
         const disabled = row.enabled === false;
-        const enabledCount = cache.filter((x) => x.enabled !== false).length;
         const disBlocked = !disabled && enabledCount <= 1;
-        const toggleBtn = isAdmin() ? `<button class="mini-btn" data-act="${disabled ? 'en' : 'dis'}"
+        const rid = escapeHtml(row.id);
+        const toggleBtn = isAdmin() ? `<button class="mini-btn" data-act="${disabled ? 'en' : 'dis'}" data-id="${rid}"
           ${disBlocked ? 'disabled title="仅剩一个存储桶时不能停用，请直接解绑。"' : ''}>${disabled ? '启用' : '停用'}</button>` : '';
         const overseaChecked = row.blockOverseasIP === true;
         const overseaCell = isAdmin()
-          ? `<label class="check-line" title="开启后，访问该桶时仅中国大陆 / 内网 IP 可放行"><input type="checkbox" data-act="block-overseas"${overseaChecked ? ' checked' : ''} ${disabled ? 'disabled' : ''}></label>`
+          ? `<label class="check-line" title="开启后，访问该桶时仅中国大陆 / 内网 IP 可放行"><input type="checkbox" data-act="block-overseas" data-id="${rid}"${overseaChecked ? ' checked' : ''} ${disabled ? 'disabled' : ''}></label>`
           : `<span class="lk-badge ${overseaChecked ? 'warn' : ''}">${overseaChecked ? '已开启' : '—'}</span>`;
         const provId = row.provider || 'tencent';
         const prov = providerMeta(provId);
@@ -174,29 +210,93 @@ function render() {
           ${isAdmin() ? `<td class="bm-oversea-cell">${overseaCell}</td>` : ''}
           ${isAdmin() ? `<td class="lk-acts">
             ${toggleBtn}
-            <button class="mini-btn" data-act="perm">编辑权限</button><button class="mini-btn" data-act="clear">清空文件</button><button class="mini-btn" data-act="frag">清理碎片</button><button class="mini-btn danger" data-act="destroy">彻底删除</button>
-            <button class="mini-btn" data-act="unbind" title="仅移除本地绑定记录，不删除云端存储桶">解绑</button>
+            <button class="mini-btn" data-act="perm" data-id="${rid}">编辑权限</button><button class="mini-btn" data-act="clear" data-id="${rid}">清空文件</button><button class="mini-btn" data-act="frag" data-id="${rid}">清理碎片</button><button class="mini-btn danger" data-act="destroy" data-id="${rid}">彻底删除</button>
+            <button class="mini-btn" data-act="unbind" data-id="${rid}" title="仅移除本地绑定记录，不删除云端存储桶">解绑</button>
           </td>` : ''}
         </tr>`;
       }).join('')}
     </tbody></table>`;
+}
 
-  box.querySelectorAll('tr[data-id]').forEach((tr) => {
-    const row = cache.find((x) => x.id === tr.dataset.id);
+/**
+ * 行内按钮绑定 —— 卡片与对话框共用（R36），否则对话框里的按钮会「看得见、点不动」。
+ * 写法与 `syssettings.js` 的 `bindUserRowActions` 严格同型（见 credmgr.js 的同类说明）。
+ */
+function bindBucketRowActions(root, rows) {
+  root.querySelectorAll('[data-act]').forEach((btn) => {
+    const act = btn.getAttribute('data-act');
+    const row = rows.find((x) => x.id === btn.getAttribute('data-id'));
     if (!row) return;
-    tr.querySelectorAll('[data-act]').forEach((btn) => {
-      btn.onclick = () => {
-        const act = btn.dataset.act;
-        if (act === 'clear') confirmClear(row);
-        else if (act === 'frag') confirmClearFragments(row);
-        else if (act === 'destroy') confirmDestroy(row);
-        else if (act === 'unbind') unbind(row);
-        else if (act === 'perm') openVisibilityDialog(row);
-        else if (act === 'en') toggleBucketEnabled(row, true);
-        else if (act === 'dis') toggleBucketEnabled(row, false);
-        else if (act === 'block-overseas') toggleBlockOverseas(row, btn.checked);
-      };
-    });
+    btn.onclick = () => {
+      if (act === 'clear') confirmClear(row);
+      else if (act === 'frag') confirmClearFragments(row);
+      else if (act === 'destroy') confirmDestroy(row);
+      else if (act === 'unbind') unbind(row);
+      else if (act === 'perm') openVisibilityDialog(row);
+      else if (act === 'en') toggleBucketEnabled(row, true);
+      else if (act === 'dis') toggleBucketEnabled(row, false);
+      else if (act === 'block-overseas') toggleBlockOverseas(row, btn.checked);
+    };
+  });
+}
+
+/**
+ * 「显示全部」按钮的显隐与提示文案（需求 2①）。
+ * 判据下沉到 `util.previewMoreState()`（四张卡片共用）—— 用的是**严格大于**：
+ * 正好 10 个存储桶时卡片已完整展示，再摆一个「显示全部」点开只能看到一字不差的副本。
+ */
+function updateBucketMore(total) {
+  const more = document.getElementById('bucket-more');
+  const hint = document.getElementById('bucket-more-hint');
+  const { over, hint: hintText } = previewMoreState(total, BUCKET_PREVIEW_LIMIT, '个存储桶');
+  if (more) more.hidden = !over;
+  if (hint) hint.textContent = hintText;
+}
+
+/** 重绘「全部存储桶」列表（对话框没开时是空操作） */
+function repaintAllBuckets() {
+  if (bucketsDialog) bucketsDialog.repaint();
+}
+
+/**
+ * 按关键词 / 服务商筛选存储桶（R36 需求 2②③④）。
+ *
+ * 需求 ④ 明确要求**只有一个搜索框**同时搜「存储桶名称」与「备注」——
+ * 两个输入框会逼用户先判断"我要找的字在哪一栏"，搜不到还得换个框再试一遍。
+ * 这里把两个字段一起交给 `util.matchesQuery()`（任一命中即算命中）。
+ */
+function filterBuckets(list, query, provider) {
+  const want = String(provider == null ? '' : provider).trim();
+  return (Array.isArray(list) ? list : []).filter((r) => (!want || String((r && r.provider) || 'tencent') === want)
+    && matchesQuery(query, [(r && r.bucket) || '', (r && r.remark) || '']));
+}
+
+/** 打开「全部存储桶」对话框（需求 2②③④：服务商下拉 + 单框同时搜桶名与备注） */
+function showAllBuckets() {
+  if (!isAdmin()) return;
+  if (bucketsDialog) return; // 连点两次不得叠出第二层遮罩（句柄在 onClose 里复位）
+  bucketsDialog = openListDialog({
+    idPrefix: 'bucket-all',
+    title: `全部存储桶（共 ${cache.length} 个）`,
+    placeholder: '搜索存储桶名称或备注（不区分大小写）',
+    cls: 'bucket-all-dialog', // 10 列表格要的宽度（见 style.css）
+    unit: '个存储桶',
+    unitShort: '个',
+    emptyAll: '还没有绑定存储桶',
+    emptyMatch: '没有匹配的存储桶',
+    selects: [{
+      id: 'provider',
+      title: '按服务商筛选',
+      value: '',
+      options: providerSelectOptions(cache, providerMeta, '全部服务商'),
+    }],
+    items: () => cache,
+    filter: (list, st) => filterBuckets(list, st.query, st.filters.provider),
+    // ⚠️ 第二参数必须是**全量** cache：`disBlocked`（仅剩一个启用桶不能停用）要在
+    // 全量上判定。传 `shown` 会让筛过之后的子集被当成全域，把本该可停用的按钮锁死。
+    rowHtml: (shown) => bucketTableHtml(shown, cache),
+    bindRows: (list, shown) => bindBucketRowActions(list, shown),
+    onClose: () => { bucketsDialog = null; },
   });
 }
 

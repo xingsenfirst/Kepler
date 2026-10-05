@@ -1,10 +1,23 @@
 /** 链接管理页 —— 查看全部分享链接，编辑 / 删除 / 复制 */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
+import { openListDialog, bucketSelectOptions } from './listdialog.js';
 import { STATUS_META, statusOf, isDead } from './share-status.js';
 
 let linksCache = [];
 let wired = false;
+
+/**
+ * 「分享链接管理」卡片列表的**预览条数上限**（R36 需求 3：最多显示 100 个）。
+ *
+ * 与另外三张卡片的 10 条不同 —— 链接是「一次性产物」，动辄成百上千条，
+ * 截到 10 条会让卡片本身失去概览价值；而 100 行已经远超前端表格一屏的可读量，
+ * 再多就该进对话框配合搜索来看了。
+ */
+const LINK_PREVIEW_LIMIT = 100;
+
+/** 「全部链接」对话框的句柄（`null` = 未打开）；见 credmgr.js 的同类说明 */
+let linksDialog = null;
 
 function wire() {
   if (wired) return;
@@ -13,6 +26,8 @@ function wire() {
   if (btn) btn.onclick = () => refresh();
   const clean = document.getElementById('btn-links-clean');
   if (clean) clean.onclick = () => removeDeadLinks();
+  const all = document.getElementById('btn-link-all');
+  if (all) all.onclick = showAllLinks;
 }
 
 function fmtExpiry(l) {
@@ -65,14 +80,32 @@ function render() {
   if (head) head.textContent = linksCache.length ? `（共 ${linksCache.length} 条）` : '';
   if (!linksCache.length) {
     box.innerHTML = `<div class="lk-empty">还没有分享链接。在文件列表中选中文件 → 点击“复制链接”即可创建。</div>`;
+    updateLinkMore(0);
+    repaintAllLinks();
     return;
   }
-  box.innerHTML = `<table class="lk-table">
+  // 需求 3：卡片列表最多展示前 LINK_PREVIEW_LIMIT 条链接
+  const shown = linksCache.slice(0, LINK_PREVIEW_LIMIT);
+  box.innerHTML = linkTableHtml(shown);
+  bindLinkRowActions(box, shown);
+
+  updateLinkMore(linksCache.length);
+  repaintAllLinks(); // 对话框开着时同步刷新：删链接后两边必须一致
+}
+
+/**
+ * 链接表格 HTML —— 卡片列表与「全部链接」对话框的**唯一渲染器**（R36）。
+ *
+ * 10 列的宽表格尤其不能抄两份：新增一列（比如以后加「付费金额」）只改一处，
+ * 另一处会静默少一列，而表头与数据错位的表格在视觉上很难被立刻发现。
+ */
+function linkTableHtml(links) {
+  return `<table class="lk-table">
     <thead><tr>
       <th>文件</th><th>分享者</th><th>存储桶</th><th>状态</th><th>有效期至</th><th>下载次数</th><th>密码</th><th>付费</th><th>创建时间</th><th style="width:150px">操作</th>
     </tr></thead>
     <tbody>
-      ${linksCache.map((l) => {
+      ${links.map((l) => {
         const st = statusOf(l);
         const sm = STATUS_META[st];
         // 文件已被删除：整行灰化 + 划线（.lk-dim 只标数据列，状态列与操作列保持可读）
@@ -89,25 +122,90 @@ function render() {
           <td${dim}>${fmtPaid(l)}</td>
           <td${dim}>${escapeHtml(fmtTime(l.createdAt))}</td>
           <td class="lk-acts">
-            <button class="mini-btn" data-act="copy">复制</button>
-            <button class="mini-btn" data-act="edit">编辑</button>
-            <button class="mini-btn danger" data-act="del">删除</button>
+            <button class="mini-btn" data-act="copy" data-id="${escapeHtml(l.id)}">复制</button>
+            <button class="mini-btn" data-act="edit" data-id="${escapeHtml(l.id)}">编辑</button>
+            <button class="mini-btn danger" data-act="del" data-id="${escapeHtml(l.id)}">删除</button>
           </td>
         </tr>`;
       }).join('')}
     </tbody></table>`;
+}
 
-  box.querySelectorAll('tr[data-id]').forEach((tr) => {
-    const l = linksCache.find((x) => x.id === tr.dataset.id);
+/**
+ * 行内按钮绑定 —— 卡片与对话框共用（R36），否则对话框里的按钮会「看得见、点不动」。
+ * 写法与 `syssettings.js` 的 `bindUserRowActions` 严格同型（见 credmgr.js 的同类说明）。
+ */
+function bindLinkRowActions(root, links) {
+  root.querySelectorAll('[data-act]').forEach((btn) => {
+    const act = btn.getAttribute('data-act');
+    const l = links.find((x) => x.id === btn.getAttribute('data-id'));
     if (!l) return;
-    tr.querySelectorAll('[data-act]').forEach((btn) => {
-      btn.onclick = () => {
-        const act = btn.dataset.act;
-        if (act === 'copy') copyUrl(l);
-        else if (act === 'edit') openEditDialog(l);
-        else if (act === 'del') removeLink(l);
-      };
-    });
+    btn.onclick = () => {
+      if (act === 'copy') copyUrl(l);
+      else if (act === 'edit') openEditDialog(l);
+      else if (act === 'del') removeLink(l);
+    };
+  });
+}
+
+/**
+ * 「显示全部」按钮的显隐与提示文案（需求 3）。
+ * 判据下沉到 `util.previewMoreState()`（四张卡片共用）—— 用的是**严格大于**：
+ * 正好 100 条时卡片已完整展示，再摆一个「显示全部」点开只能看到一字不差的副本。
+ */
+function updateLinkMore(total) {
+  const more = document.getElementById('link-more');
+  const hint = document.getElementById('link-more-hint');
+  const { over, hint: hintText } = previewMoreState(total, LINK_PREVIEW_LIMIT, '条链接');
+  if (more) more.hidden = !over;
+  if (hint) hint.textContent = hintText;
+}
+
+/** 重绘「全部链接」列表（对话框没开时是空操作） */
+function repaintAllLinks() {
+  if (linksDialog) linksDialog.repaint();
+}
+
+/**
+ * 按关键词 / 存储桶筛选链接（R36 需求 3）。
+ *
+ * 关键词同时匹配「文件名」与「分享者」—— 二者是页面上最常用的两个定位维度，
+ * 而它们的值都不会互相包含（文件名里几乎不会出现用户名），合成一个框不会产生歧义。
+ * 规则本身走 `util.matchesQuery()`（四张卡片同一条）。
+ *
+ * 历史链接的 `bucket` 可能为空串（早于「按创建者隔离」的旧数据）——
+ * 那类条目在「全部存储桶」下仍可见，不会被这项筛选悄悄藏起来。
+ */
+function filterLinks(list, query, bucket) {
+  const want = String(bucket == null ? '' : bucket).trim();
+  return (Array.isArray(list) ? list : []).filter((l) => (!want || String((l && l.bucket) || '') === want)
+    && matchesQuery(query, [(l && (l.fileName || l.key)) || '', (l && l.createdBy) || '']));
+}
+
+/** 打开「全部链接」对话框（需求 3：存储桶下拉 + 搜索文件名与分享者） */
+function showAllLinks() {
+  if (linksDialog) return; // 连点两次不得叠出第二层遮罩（句柄在 onClose 里复位）
+  linksDialog = openListDialog({
+    idPrefix: 'link-all',
+    title: `全部分享链接（共 ${linksCache.length} 条）`,
+    placeholder: '搜索文件名或分享者（不区分大小写）',
+    cls: 'link-all-dialog', // 10 列表格要的宽度（见 style.css）
+    unit: '条链接',
+    unitShort: '条',
+    emptyAll: '还没有分享链接',
+    emptyMatch: '没有匹配的链接',
+    selects: [{
+      id: 'bucket',
+      title: '按存储桶筛选',
+      value: '',
+      options: bucketSelectOptions(linksCache, '全部存储桶'),
+    }],
+    items: () => linksCache,
+    filter: (list, st) => filterLinks(list, st.query, st.filters.bucket),
+    // 卡片与对话框共用同一个表格渲染器与同一套行按钮绑定
+    rowHtml: (shown) => linkTableHtml(shown),
+    bindRows: (list, shown) => bindLinkRowActions(list, shown),
+    onClose: () => { linksDialog = null; },
   });
 }
 

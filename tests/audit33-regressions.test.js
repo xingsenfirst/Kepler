@@ -607,6 +607,11 @@ export const filterUsersByName = (list, q) => {
   const s = String(q == null ? '' : q).trim().toLowerCase();
   return s ? all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(s) !== -1) : all;
 };
+// R36：previewMoreState 同理（「显示全部」判据下沉到 util.js）
+export const previewMoreState = (total, limit, unit) => {
+  const over = total > limit;
+  return { over, hint: over ? ('卡片仅显示前 ' + limit + ' ' + unit + '，共 ' + total + ' ' + unit) : '' };
+};
 `;
 
 /** `main.js` 桩：只需 App.state.user（isAdmin / currentId 的判据），身份由 __me 控制 */
@@ -633,6 +638,9 @@ function makeFeSandbox(realFiles) {
   fs.writeFileSync(path.join(dir, 'webauthn.js'), WEBAUTHN_STUB);
   fs.writeFileSync(path.join(dir, 'paysettings.js'), PAYSETTINGS_STUB);
   for (const f of realFiles) fs.copyFileSync(JS(f), path.join(dir, f));
+  // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）——
+  // 沙箱缺了它会在 ESM 链接期直接失败，所有 import syssettings 的用例整片变红。
+  fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
   return dir;
 }
 

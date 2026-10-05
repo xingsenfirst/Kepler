@@ -16,7 +16,7 @@ const { URL } = require('url');
 const configStore = require('./config-store');
 const security = require('./security');
 const statsStore = require('./stats-store');
-const { getClient, p, normalizeKey, listAllExact, translateError } = require('./cos');
+const { getClient, p, normalizeKey, listAllExact, translateError, uploaderMeta } = require('./cos');
 const providers = require('./providers');
 const gateway = require('./fs-gateway');
 /**
@@ -842,7 +842,11 @@ function buildApp() {
         await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
         await bucketStats.assertBucketQuota(cos, cfg, { addBytes: 0 });
         try { await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key }, { noStat: true }); return res.status(405).end(); } catch (e) { /* 不存在则创建 */ }
-        await p(cos, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key, Body: Buffer.alloc(0), ContentLength: 0 });
+        // R36：目录标记对象顺带记录创建者（属性面板的文件夹「创建者」）
+        await p(cos, 'putObject', {
+          Bucket: cfg.bucket, Region: cfg.region, Key: key, Body: Buffer.alloc(0), ContentLength: 0,
+          Headers: uploaderMeta(req.webdavUser && req.webdavUser.username),
+        });
         return res.status(201).end();
       }
       /**
@@ -863,7 +867,8 @@ function buildApp() {
         cfg.bucket, key, req,
         req.headers['content-type'] || guessContentType(key),
         'webdav.put',
-        req.webdavUser ? `${req.webdavUser.username} 上传 ` : 'WebDAV 上传 '
+        req.webdavUser ? `${req.webdavUser.username} 上传 ` : 'WebDAV 上传 ',
+        req.webdavUser && req.webdavUser.username // R36：记录上传者供属性面板展示
       );
       // 记账落盘后的**实际**字节数（加密后会与 Content-Length 不同）—— 供配额判定用
       bucketStats.recordUsageDelta(cfg, r.bytesWritten);
@@ -901,7 +906,10 @@ function buildApp() {
         await p(cos, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: dirKey }, { noStat: true });
         return res.status(405).type('text/plain').send('405 Method Not Allowed：集合已存在');
       } catch (e) { /* 不存在，继续创建 */ }
-      await p(cos, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: dirKey, Body: Buffer.alloc(0), ContentLength: 0 });
+      await p(cos, 'putObject', {
+        Bucket: cfg.bucket, Region: cfg.region, Key: dirKey, Body: Buffer.alloc(0), ContentLength: 0,
+        Headers: uploaderMeta(req.webdavUser && req.webdavUser.username), // R36：目录创建者
+      });
       res.status(201).end();
     } catch (e) {
       // R22-03：MKCOL 同型收口

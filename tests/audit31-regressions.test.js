@@ -127,6 +127,11 @@ export const filterUsersByName = (list, q) => {
   const s = String(q == null ? '' : q).trim().toLowerCase();
   return s ? all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(s) !== -1) : all;
 };
+// R36：syssettings.js 又新增了 previewMoreState 具名导入（「显示全部」判据下沉到 util.js），同理补上
+export const previewMoreState = (total, limit, unit) => {
+  const over = total > limit;
+  return { over, hint: over ? ('卡片仅显示前 ' + limit + ' ' + unit + '，共 ' + total + ' ' + unit) : '' };
+};
 `;
 
 const MAIN_STUB = `
@@ -158,6 +163,9 @@ function makeSandbox({ withSyssettings = false } = {}) {
     w('webauthn.js', WEBAUTHN_STUB);
     w('paysettings.js', PAYSETTINGS_STUB);
     fs.copyFileSync(JS('syssettings.js'), path.join(dir, 'syssettings.js'));
+    // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）—— 沙箱缺了它
+    // 会在 ESM **链接期**直接失败，本文件所有 import syssettings 的用例整片变红。
+    fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
   } else {
     w('payment-logos.js', PAYLOGOS_STUB);
     fs.copyFileSync(JS('paysettings.js'), path.join(dir, 'paysettings.js'));

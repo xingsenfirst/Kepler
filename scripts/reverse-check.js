@@ -206,20 +206,31 @@ const CASES = [
       minFail: 2,
     },
     {
+      // R36：`writeObject` 新增第 7 个参数 `uploader`，Headers 由字面量改成
+      // `Object.assign(...)` —— 旧 anchor 不再命中，锚点随重构一起迁移。
+      // 变异**只**改「走不走 p()」这一件事：Headers 保持与现实现逐字相同，
+      // 否则就变成「顺带把上传者元数据也丢了」的另一处变异，红的原因就不唯一了。
       name: 'R7-06 · fs-gateway 的 putObject 退回「直接回调式调用」（绕过 p()）',
       file: 'server/fs-gateway.js',
       anchor: "  await p(cos, 'putObject', {\n"
         + "    Bucket: cfg.bucket, Region: cfg.region, Key: k,\n"
         + "    Body: body,\n"
-        + "    ContentLength: body.length,\n"
-        + "    Headers: { 'Content-Type': contentType || 'application/octet-stream' },\n"
+        + '    ContentLength: body.length,\n'
+        + '    // R36：WebDAV 上传同样记录上传者（属性面板与网页上传看到的是同一份数据）。\n'
+        + '    Headers: Object.assign(\n'
+        + "      { 'Content-Type': contentType || 'application/octet-stream' },\n"
+        + '      uploaderMeta(uploader),\n'
+        + '    ),\n'
         + '  });',
       replacement: '  await new Promise((resolve, reject) => {\n'
         + '    cos.putObject({\n'
         + '      Bucket: cfg.bucket, Region: cfg.region, Key: k,\n'
         + '      Body: body,\n'
         + '      ContentLength: body.length,\n'
-        + "      Headers: { 'Content-Type': contentType || 'application/octet-stream' },\n"
+        + '      Headers: Object.assign(\n'
+        + "        { 'Content-Type': contentType || 'application/octet-stream' },\n"
+        + '        uploaderMeta(uploader),\n'
+        + '      ),\n'
         + '    }, (err) => (err ? reject(err) : resolve()));\n'
         + '  });',
       testFile: 'audit7-regressions.test.js',
@@ -3726,10 +3737,12 @@ const CASES = [
       minFail: 1,
     },
     {
+      // R36：判据下沉到 `util.previewMoreState()`（四张卡片共用），锚点随之迁到
+      // 那个**唯一实现点**上 —— 变异仍只改「严格大于 vs 大于等于」这一件事。
       name: 'R35-01b · 「显示全部」判据写成 >=（正好 10 位也摆出按钮，点开是与卡片一字不差的副本）',
-      file: 'public/js/syssettings.js',
-      anchor: '  const over = total > USER_PREVIEW_LIMIT;',
-      replacement: '  const over = total >= USER_PREVIEW_LIMIT;',
+      file: 'public/js/util.js',
+      anchor: '  const over = total > limit;',
+      replacement: '  const over = total >= limit;',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
@@ -3742,17 +3755,21 @@ const CASES = [
       minFail: 1,
     },
     {
+      // R36：对话框改为「只提供数据 + 行渲染回调」，截断动作改在行渲染里复现
+      // （`rowHtml` 收到的是**已过滤的完整列表**，切片到 10 就等价于旧 bug）。
       name: 'R35-01d · 对话框也按 10 条截断（「显示全部」里仍然看不全）',
       file: 'public/js/syssettings.js',
-      anchor: '  const shown = filterUsersByName(users, allUsersQuery);',
-      replacement: '  const shown = filterUsersByName(users, allUsersQuery).slice(0, USER_PREVIEW_LIMIT);',
+      anchor: '    rowHtml: (shown) => userTableHtml(shown, currentId),',
+      replacement: '    rowHtml: (shown) => userTableHtml(shown.slice(0, USER_PREVIEW_LIMIT), currentId),',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
     {
+      // R36：搜索框接线移入 `listdialog.js`（四张卡片共用）—— 锚点随之下沉，
+      // 变异仍是「干脆不接线」。
       name: 'R35-01e · 搜索框不接线（弹窗里那个输入框输什么都没反应）',
-      file: 'public/js/syssettings.js',
-      anchor: '  if (search) search.oninput = () => { allUsersQuery = search.value; repaintAllUsers(); };',
+      file: 'public/js/listdialog.js',
+      anchor: '  search.oninput = () => { state.query = search.value; repaint(); };',
       replacement: '',
       testFile: 'audit35-regressions.test.js',
       minFail: 2,
@@ -3766,18 +3783,23 @@ const CASES = [
       minFail: 2,
     },
     {
+      // R36：`filterUsersByName()` 的空串短路下沉到 `matchesQuery()`（四张卡片共用
+      // 同一条关键词规则）—— 锚点随之迁到那里；变异仍是「空关键词谁都匹配不上」，
+      // 表现为搜索框一清空整个列表白屏。
       name: 'R35-01g · 空关键词返回空数组（搜索框一清空、整个列表就白屏）',
       file: 'public/js/util.js',
-      anchor: '  if (!q) return all;',
-      replacement: '  if (!q) return [];',
+      anchor: '  if (!q) return true;',
+      replacement: '  if (!q) return false;',
       testFile: 'audit35-regressions.test.js',
       minFail: 2,
     },
     {
+      // R36：行按钮绑定改由 `listdialog.js` 统一调用卡片传入的 `bindRows()` ——
+      // 锚点下沉，变异仍是「渲染了行、却不绑按钮」（看得见、点不动）。
       name: 'R35-01h · 对话框里的行不绑按钮（看得见、点不动）',
-      file: 'public/js/syssettings.js',
-      anchor: '  list.innerHTML = userTableHtml(shown, currentId);\n  bindUserRowActions(list, shown);',
-      replacement: '  list.innerHTML = userTableHtml(shown, currentId);',
+      file: 'public/js/listdialog.js',
+      anchor: '    if (o.bindRows) o.bindRows(list, shown);',
+      replacement: '',
       testFile: 'audit35-regressions.test.js',
       minFail: 2,
     },
@@ -3790,25 +3812,28 @@ const CASES = [
       minFail: 1,
     },
     {
+      // R36：`clearUserDom()` 改调 `usersDialog.close()` 关窗，但**显式清空容器**这一步
+      // 仍然必须保留（关闭只是把弹窗从 #modal-root 移除，容器节点里的用户名 / 角色 /
+      // 封禁原因不会自己消失）。锚点即这两行，变异把它们去掉。
       name: 'R35-01j · 登出不清理对话框（换账号后上一个账号的用户列表仍留在 DOM 里）',
       file: 'public/js/syssettings.js',
-      anchor: "  allUsersOpen = false;\n  allUsersQuery = '';\n  const allList = document.getElementById('user-all-body');\n  if (allList) allList.innerHTML = '';",
-      replacement: "  allUsersOpen = false;\n  allUsersQuery = '';",
+      anchor: "  const allList = document.getElementById('user-all-body');\n  if (allList) allList.innerHTML = '';",
+      replacement: '',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
     {
       name: 'R35-01k · 关闭弹窗时不复位状态（第二次点「显示全部」再也打不开）',
       file: 'public/js/syssettings.js',
-      anchor: "    onClose: () => { allUsersOpen = false; allUsersQuery = ''; },",
+      anchor: '    onClose: () => { usersDialog = null; },',
       replacement: '    onClose: () => {},',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
     {
-      name: 'R35-01l · 去掉 `.user-more[hidden]` 规则（容器是 display:flex，hidden 属性彻底失效 → 按钮一直露着）',
+      name: 'R35-01l · 去掉 `.list-more[hidden]` 规则（容器是 display:flex，hidden 属性彻底失效 → 按钮一直露着）',
       file: 'public/css/style.css',
-      anchor: '.user-more[hidden] { display: none; }\n',
+      anchor: '.list-more[hidden] { display: none; }\n',
       replacement: '',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
@@ -3822,11 +3847,14 @@ const CASES = [
       minFail: 1,
     },
     {
+      // R36：对话框不再自己渲染表格（改调卡片传入的 `rowHtml`），故把「另抄一份表头」
+      // 复现为在 `rowHtml` 里额外拼一段表头 —— 静态断言数 `syssettings.js` 里
+      // `<th>用户名</th>` 的出现次数，凭空多一份即变红（两处迟早分叉）。
       name: 'R35-01n · 对话框里另抄一份表格表头（用户表格出现两份 → 两处迟早分叉）',
       file: 'public/js/syssettings.js',
-      anchor: '  list.innerHTML = userTableHtml(shown, currentId);',
-      replacement: "  list.innerHTML = '<table class=\"lk-table user-tbl\"><thead><tr><th>用户名</th></tr></thead><tbody></tbody></table>'"
-        + ' + userTableHtml(shown, currentId);',
+      anchor: '    rowHtml: (shown) => userTableHtml(shown, currentId),',
+      replacement: "    rowHtml: (shown) => '<table class=\"lk-table user-tbl\"><thead><tr><th>用户名</th></tr></thead><tbody></tbody></table>'"
+        + ' + userTableHtml(shown, currentId),',
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
@@ -3839,18 +3867,34 @@ const CASES = [
       minFail: 1,
     },
     {
+      // R36：`filterUsersByName()` 改为委托 `matchesQuery()` 之后，「空关键词返回入参本体」
+      // **不再是单步变异能复现的** —— `.filter()` 本身就会新建数组，光去掉防御性 `.slice()`
+      // 已经测不出来（本轮实测 fail=0）。改为两步，合起来才等于旧实现：
+      //   ① 去掉 `.slice()`（`all` 就是调用方的数组本体）；
+      //   ② 空关键词短路 `return all`（旧写法正是 `if (!q) return all;`）。
       name: 'R35-01p · 空关键词返回入参本体（把模块级 usersState 交出去，调用方一 sort 就改到全局状态）',
       file: 'public/js/util.js',
-      anchor: '  const all = Array.isArray(list) ? list.slice() : [];',
-      replacement: '  const all = Array.isArray(list) ? list : [];',
+      mutations: [
+        {
+          anchor: '  const all = Array.isArray(list) ? list.slice() : [];',
+          replacement: '  const all = Array.isArray(list) ? list : [];',
+        },
+        {
+          anchor: '  return all.filter((u) => matchesQuery(query, (u && u.username) || \'\')',
+          replacement: '  if (!String(query == null ? \'\' : query).trim()) return all;\n'
+            + '  return all.filter((u) => matchesQuery(query, (u && u.username) || \'\')',
+        },
+      ],
       testFile: 'audit35-regressions.test.js',
       minFail: 1,
     },
     {
+      // R36：过滤动作改由「卡片传入的 `filter()` 回调」承担（骨架在 listdialog.js），
+      // 锚点随之迁到 `showAllUsers` 里那份回调上；变异仍是「无视搜索关键词」。
       name: 'R35-01q · 对话框忽略搜索关键词（过滤与「刷新后保持过滤」两条用例同时变红）',
       file: 'public/js/syssettings.js',
-      anchor: '  const shown = filterUsersByName(users, allUsersQuery);',
-      replacement: "  const shown = filterUsersByName(users, '');",
+      anchor: '    filter: (list, st) => filterUsersByName(list, st.query, st.filters.role),',
+      replacement: "    filter: (list, st) => filterUsersByName(list, '', st.filters.role),",
       testFile: 'audit35-regressions.test.js',
       minFail: 2,
     },
@@ -3864,6 +3908,273 @@ const CASES = [
       anchor: '  if (stray.length) {\n    return {\n      error: \'无法识别的参数：\' + stray.join(\' \')',
       replacement: '  if (false) {\n    return {\n      error: \'无法识别的参数：\' + stray.join(\' \')',
       testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ---------------- R36 · 四张列表卡片「显示全部」+ 属性面板「创建者 / 上传者」+ 上传者元数据 ----------------
+     * 本轮是**功能需求**（不是缺陷），反向对照的落点因此分三类：
+     *  ① 共享判据层（util.matchesQuery / util.previewMoreState / listdialog.openListDialog）——
+     *     四张卡片都靠它们，改坏一处四张一起坏（其中「严格大于」那条由 R35-01b 继续守着）；
+     *  ② 各卡片自己的接线（截断上限、下拉筛选、搜索字段、全量 vs 子集判定）；
+     *  ③ 服务端「上传者」元数据的唯一实现点与各写入出口。
+     */
+    {
+      // 需求 2②③④ / 3：一张卡片要同时搜多个字段（密钥：备注+ID；桶：桶名+备注；
+      // 链接：文件名+分享者），全靠 matchesQuery 的 `.some`。退化成只比第一个字段，
+      // 表现为「搜第二个字段永远搜不到」。
+      name: 'R36-01a · matchesQuery 只比较第一个字段（多字段搜索退化成单字段）',
+      file: 'public/js/util.js',
+      anchor: '  const list = Array.isArray(texts) ? texts : [texts];',
+      replacement: '  const list = Array.isArray(texts) ? texts.slice(0, 1) : [texts];',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      // 打开时快照一份数据集：后台刷新（删除 / 新增）之后对话框里还是旧的那一份，
+      // 表现为「在对话框里删掉一条，它却还在」。
+      name: 'R36-01b · openListDialog 打开时快照 items（后台刷新后对话框不更新）',
+      file: 'public/js/listdialog.js',
+      anchor: '  function currentAll() {\n    return (o.items && o.items()) || [];\n  }',
+      replacement: '  const __snap = (o.items && o.items()) || [];\n  function currentAll() {\n    return __snap;\n  }',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「筛不到」与「一条都没有」必须两句话 —— 合并之后用户分不清是数据没了还是筛错了。
+      name: 'R36-01c · openListDialog 把「无匹配」与「一条都没有」合并成同一句文案',
+      file: 'public/js/listdialog.js',
+      anchor: "      list.innerHTML = `<div class=\"lk-empty\">${all.length ? (o.emptyMatch || '没有匹配的项') : (o.emptyAll || '暂无数据')}</div>`;",
+      replacement: "      list.innerHTML = `<div class=\"lk-empty\">${o.emptyMatch || '没有匹配的项'}</div>`;",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 筛选生效时计数必须同时给出「匹配 x / 共 N」；只写「共 N」时用户无法确认到底筛没筛到。
+      name: 'R36-01d · openListDialog 计数不再给出「匹配 x / 共 N」',
+      file: 'public/js/listdialog.js',
+      anchor: '        ? `匹配 ${shown.length} / 共 ${all.length} ${unitShort}`',
+      replacement: '        ? `共 ${all.length} ${unitShort}`',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 服务商下拉不去重：同一家出现多次（数据集里同厂商的密钥 / 桶通常占多数）。
+      name: 'R36-01e · providerSelectOptions 不去重（下拉里同一服务商出现多次）',
+      file: 'public/js/listdialog.js',
+      anchor: '    if (!seen.includes(pid)) seen.push(pid);',
+      replacement: '    seen.push(pid);',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // bucket 为空的**历史链接**若占一个选项，就是一个「选了必然为空」的空选项 ——
+      // 它们在「全部存储桶」下本来仍然可见（见 R36-05 的「历史链接不得被筛掉」）。
+      name: 'R36-01f · bucketSelectOptions 把空 bucket 也列成一个选项',
+      file: 'public/js/listdialog.js',
+      anchor: '    if (b && !seen.includes(b)) seen.push(b);',
+      replacement: '    if (!seen.includes(b)) seen.push(b);',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 1 的核心判据：「标签随对象类型变」只在 util.propertyBodyHtml 里写一次。
+      // 写反即变红（文件夹属性里出现「上传者」、文件属性里出现「创建者」）。
+      name: 'R36-02a · propertyBodyHtml 把标签写反（文件夹显示「上传者」、文件显示「创建者」）',
+      file: 'public/js/util.js',
+      anchor: "  const ownerRow = row(st.isFolder ? '创建者' : '上传者', ownerText(st.uploader));",
+      replacement: "  const ownerRow = row(st.isFolder ? '上传者' : '创建者', ownerText(st.uploader));",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 历史对象没有元数据。**不能**拿「当前登录用户」或「最后操作者」顶替 ——
+      // 那是在编造一个看起来合理的事实，属性面板的价值恰恰在于它说的是真的。
+      name: 'R36-02b · ownerText 对空值顶替一个「合理」的名字（而不是如实显示「—」）',
+      file: 'public/js/util.js',
+      anchor: "  const name = String(u == null ? '' : u).trim();\n  if (name) return escapeHtml(name);",
+      replacement: "  const name = String(u == null ? '' : u).trim() || '未知用户';\n  if (name) return escapeHtml(name);",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R36-03a · 密钥卡片不再截断（11 个密钥全渲染 → 需求 2① 名存实亡）',
+      file: 'public/js/credmgr.js',
+      anchor: '  const shown = creds.slice(0, CRED_PREVIEW_LIMIT);',
+      replacement: '  const shown = creds;',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R36-03b · 密钥卡片对话框忽略服务商筛选（下拉成了摆设）',
+      file: 'public/js/credmgr.js',
+      anchor: '    filter: (list, st) => filterCreds(list, st.query, st.filters.provider),',
+      replacement: "    filter: (list, st) => filterCreds(list, st.query, ''),",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 2② 明说「搜索备注」——但密钥卡片同时要能按「访问密钥 ID」搜（占位符里写了）。
+      name: 'R36-03c · 密钥卡片搜索不再匹配「访问密钥 ID」（只搜备注）',
+      file: 'public/js/credmgr.js',
+      anchor: "    && matchesQuery(query, [(c && c.remark) || '', (c && c.secretIdMasked) || '']));",
+      replacement: "    && matchesQuery(query, [(c && c.remark) || '']));",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R36-04a · 存储桶卡片不再截断（11 个存储桶全渲染 → 需求 2① 名存实亡）',
+      file: 'public/js/bucketmgr.js',
+      anchor: '  const shown = cache.slice(0, BUCKET_PREVIEW_LIMIT);',
+      replacement: '  const shown = cache;',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // ⚠️ 本轮最容易犯的语义错误：把**筛过的子集**当成全域去数启用桶，
+      // 于是「按厂商筛选后只剩 1 个启用桶」的假象把本该可停用的按钮锁死。
+      name: 'R36-04b · 存储桶的「只剩一个启用桶不得停用」按筛过的子集判定',
+      file: 'public/js/bucketmgr.js',
+      anchor: '    rowHtml: (shown) => bucketTableHtml(shown, cache),',
+      replacement: '    rowHtml: (shown) => bucketTableHtml(shown, shown),',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R36-04c · 存储桶对话框忽略服务商筛选（下拉成了摆设）',
+      file: 'public/js/bucketmgr.js',
+      anchor: '    filter: (list, st) => filterBuckets(list, st.query, st.filters.provider),',
+      replacement: "    filter: (list, st) => filterBuckets(list, st.query, ''),",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 2④：**一个**搜索框同时搜「存储桶名称」与「备注」。只搜桶名即退化为半个功能。
+      name: 'R36-04d · 存储桶搜索只搜桶名、不搜备注（需求 2④「一个框搜两者」名存实亡）',
+      file: 'public/js/bucketmgr.js',
+      anchor: "    && matchesQuery(query, [(r && r.bucket) || '', (r && r.remark) || '']));",
+      replacement: "    && matchesQuery(query, [(r && r.bucket) || '']));",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 3：分享链接卡片的预览上限是 **100**（与另两张卡片的 10 不同）。
+      name: 'R36-05a · 分享链接卡片的预览上限从 100 改成 10（与需求 3 不符）',
+      file: 'public/js/linkmgr.js',
+      anchor: 'const LINK_PREVIEW_LIMIT = 100;',
+      replacement: 'const LINK_PREVIEW_LIMIT = 10;',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R36-05b · 分享链接筛选忽略存储桶（下拉成了摆设）',
+      file: 'public/js/linkmgr.js',
+      anchor: "  return (Array.isArray(list) ? list : []).filter((l) => (!want || String((l && l.bucket) || '') === want)",
+      replacement: '  return (Array.isArray(list) ? list : []).filter((l) => (!want || true)',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 3：搜索要同时覆盖「文件名」与「分享者」。
+      name: 'R36-05c · 分享链接搜索忽略分享者（只搜文件名）',
+      file: 'public/js/linkmgr.js',
+      anchor: "    && matchesQuery(query, [(l && (l.fileName || l.key)) || '', (l && l.createdBy) || '']));",
+      replacement: "    && matchesQuery(query, [(l && (l.fileName || l.key)) || '']));",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求 0：用户对话框新增角色下拉。
+      name: 'R36-06a · 全部用户对话框忽略角色筛选（新增的下拉成了摆设）',
+      file: 'public/js/syssettings.js',
+      anchor: '    filter: (list, st) => filterUsersByName(list, st.query, st.filters.role),',
+      replacement: "    filter: (list, st) => filterUsersByName(list, st.query, ''),",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 角色条件写死成恒真：选了「管理员」也照样把普通用户列出来。
+      name: 'R36-06b · filterUsersByName 的角色条件失效（选了角色仍列出全部用户）',
+      file: 'public/js/util.js',
+      anchor: "    && (!wantRole || String((u && u.role) || '') === wantRole));",
+      replacement: '    && (!wantRole || true));',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 静态结构护栏：四张卡片必须共用 util.previewMoreState，不得就地重写判据 ——
+      // 「严格大于」写两份，必然有一天其中一份被改成 >=（R35-01b 守的就是这里）。
+      name: 'R36-07a · 密钥卡片不再共用 previewMoreState（就地重写了一份判据）',
+      file: 'public/js/credmgr.js',
+      anchor: "  const { over, hint: hintText } = previewMoreState(total, CRED_PREVIEW_LIMIT, '个密钥');",
+      replacement: "  const over = total > CRED_PREVIEW_LIMIT;\n  const hintText = over ? '卡片仅显示前 10 个密钥，共 ' + total + ' 个密钥' : '';",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 静态结构护栏：对话框骨架只允许一份（listdialog.openListDialog）。
+      // 这里用一个**最小可判定的代理变异** —— 把共用函数换成模块自有的名字，
+      // 静态断言 `openListDialog(` 随即失配（即「各写一份」的形态）。
+      name: 'R36-07b · 分享链接卡片不再共用 openListDialog（对话框各写一套）',
+      file: 'public/js/linkmgr.js',
+      anchor: '  linksDialog = openListDialog({',
+      replacement: '  linksDialog = openListDialogInline({',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 截断上限必须引用常量：就地写死数字 10 之后，改上限时卡片与提示文案会分家。
+      name: 'R36-07c · 存储桶卡片把截断上限写死成数字（与提示文案分家）',
+      file: 'public/js/bucketmgr.js',
+      anchor: '  const shown = cache.slice(0, BUCKET_PREVIEW_LIMIT);',
+      replacement: '  const shown = cache.slice(0, 10);',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 元数据键名只能在 cos.js 出现一次（协议护栏：期望值按约定写死在测试里）。
+      name: 'R36-08a · 上传者元数据键名不再是 x-cos-meta-uploader',
+      file: 'server/cos.js',
+      anchor: "const UPLOADER_META = 'x-cos-meta-uploader';",
+      replacement: "const UPLOADER_META = 'x-meta-uploader';",
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // gateway.writeObject 的第 7 个参数 `uploader` 若半路丢掉，网页上传能记上传者、
+      // WebDAV 上传却永远显示「—」—— 同一条链路两个出口两套行为。
+      name: 'R36-08b · gateway.writeObject 丢掉 uploader（第 7 个参数半路流失）',
+      file: 'server/fs-gateway.js',
+      anchor: '      uploaderMeta(uploader),',
+      replacement: '      {},',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 适配器必须把上层的 `x-cos-meta-*` 翻译成各自厂商的头（S3 → x-amz-meta-*）。
+      name: 'R36-08c · s3-client 不再翻译 x-cos-meta-*（元数据到了云端变成自定义残留头）',
+      file: 'server/s3-client.js',
+      anchor: "      if (k.toLowerCase().startsWith('x-cos-meta-')) {",
+      replacement: '      if (false) {',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 新建文件夹的目录标记对象也要带上传者，否则文件夹属性永远只能显示「—」。
+      name: 'R36-08d · mkdir 写入点不带上传者（文件夹属性永远显示「—」）',
+      file: 'server/routes/fs.js',
+      anchor: "      Headers: uploaderMeta(req.authUser && req.authUser.username),\n    });\n    res.json({ ok: true, key });",
+      replacement: '      Headers: {},\n    });\n    res.json({ ok: true, key });',
+      testFile: 'audit36-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 移动文件夹时重建空目录标记，必须**沿用**原标记的上传者 —— 否则一次移动就把
+      // 文件夹的「创建者」抹成「—」（文件的上传者反而因为复制保留元数据而幸存）。
+      name: 'R36-08e · movePrefix 重建空目录标记时不沿用原上传者（移动一次创建者就丢）',
+      file: 'server/fs-gateway.js',
+      anchor: '      markerMeta = uploaderMeta(readUploader(h.headers));',
+      replacement: '      markerMeta = {};',
+      testFile: 'audit36-regressions.test.js',
       minFail: 1,
     },
   ];

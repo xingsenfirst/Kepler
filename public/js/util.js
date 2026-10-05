@@ -77,21 +77,51 @@ export function updateNotice(r) {
 export const USER_PREVIEW_LIMIT = 10;
 
 /**
- * 按用户名搜索过滤（R35「全部用户」对话框的搜索框）。
+ * 关键词匹配 —— **所有列表筛选的唯一判据**（R36）。
+ *
+ * 规则：
+ *  - 关键词去掉首尾空白；空关键词 → **恒为真**（等于「不过滤」）；
+ *  - 大小写不敏感的子串匹配（`ali` 能命中 `Alice`）；
+ *  - 可以一次给多个字段（`texts` 数组），**任一命中即算命中** —— 存储桶卡片要
+ *    「一个搜索框同时搜桶名与备注」、分享链接要搜「文件名与分享者」，都走它；
+ *  - 字段缺失 / 非字符串 → 安全降级为空串比较，绝不抛错（数据来自服务端，
+ *    一条脏数据不该让整个对话框白屏）。
+ *
+ * 之所以提取出来，是因为四张卡片的筛选必须**同一条规则**：各写一份的必然结果是
+ * 「密钥列表能搜大写、桶列表搜不到」这种没人会想到去核对的不一致。
+ */
+export function matchesQuery(query, texts) {
+  const q = String(query == null ? '' : query).trim().toLowerCase();
+  if (!q) return true;
+  const list = Array.isArray(texts) ? texts : [texts];
+  return list.some((t) => String(t == null ? '' : t).toLowerCase().indexOf(q) !== -1);
+}
+
+/**
+ * 「显示全部」按钮的显隐判据与提示文案（**唯一实现点**，R36）。
+ *
+ * 判据用**严格大于**：正好等于上限时卡片已经完整展示了全部条目，此时再摆一个
+ * 「显示全部」，点开只能看到与卡片一字不差的一份副本 —— 用户点了个寂寞。
+ */
+export function previewMoreState(total, limit, unit) {
+  const over = total > limit;
+  return { over, hint: over ? `卡片仅显示前 ${limit} ${unit}，共 ${total} ${unit}` : '' };
+}
+
+/**
+ * 按用户名搜索过滤（R35 的「全部用户」对话框；R36 起支持按角色再筛一层）。
  *
  * 规则（**单一实现点**，卡片 / 对话框 / 将来的任何用户列表都走它）：
- *  - 关键词去掉首尾空白；空关键词 → 返回**全部**（副本）；
- *  - 大小写不敏感的子串匹配（`ali` 能命中 `Alice`）；
- *  - 列表不是数组、或用户名缺失 → 安全降级，绝不抛错（数据来自服务端，
- *    一条脏数据不该让整个对话框白屏）；
+ *  - 关键词规则见 {@link matchesQuery}；
+ *  - `role` 为空 → 不按角色过滤；给定 `'admin'` / `'user'` 时再做一次精确匹配；
  *  - **不修改入参**：调用方持有的是模块级 `usersState`，就地截断/排序会让
  *    下一次过滤基于已被改过的数据，且"刷新前"的列表被悄悄改掉。
  */
-export function filterUsersByName(list, query) {
+export function filterUsersByName(list, query, role) {
   const all = Array.isArray(list) ? list.slice() : [];
-  const q = String(query == null ? '' : query).trim().toLowerCase();
-  if (!q) return all;
-  return all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(q) !== -1);
+  const wantRole = String(role == null ? '' : role).trim();
+  return all.filter((u) => matchesQuery(query, (u && u.username) || '')
+    && (!wantRole || String((u && u.role) || '') === wantRole));
 }
 
 /* ------------------------------ Toast ------------------------------ */
@@ -299,6 +329,58 @@ export function iconHtml(item, badgeCls = 'badge') {
   }
   const ext = extOf(item.name) || '文件';
   return `<span class="${badgeCls} t-${item.type}">${escapeHtml(ext)}</span>`;
+}
+
+/* --------------------------- 属性面板（R36） --------------------------- */
+
+/**
+ * 「创建者 / 上传者」的展示值（R36 需求 1）。
+ *
+ * 数据来自**对象自身的元数据** —— 网页上传、分片上传、WebDAV 写入与新建文件夹时写入，
+ * 因此**重命名 / 移动不会改变它**（服务器端复制默认保留元数据）。
+ *
+ * 而本版之前创建的对象云端根本没有这项元数据，此处如实显示「—」并说明原因：
+ * **不拿「当前登录用户」或「最后操作者」顶替** —— 那是在编造一个看起来合理的事实，
+ * 而属性面板的全部价值就在于它说的是真的。
+ */
+export function ownerText(u) {
+  const name = String(u == null ? '' : u).trim();
+  if (name) return escapeHtml(name);
+  return '<span class="lk-dash" title="该对象创建于「记录上传者」功能之前，云端没有这项元数据">—</span>';
+}
+
+/**
+ * 属性面板的正文 HTML（R36）—— **唯一渲染器**，卡片与各分支共用。
+ *
+ * 需求 1 是「文件夹显示**创建者**、文件显示**上传者**」：这条「标签随对象类型变」的规则
+ * 只在这里出现一次。若照旧在两个 `if` 分支里各写一行 `row(...)`，将来给文件多加一行
+ * （比如「加密」）时只改一处、另一处静默落后，就会出现「文件夹属性里有的项，文件属性里没有」
+ * ——而两处看起来都"写了"。
+ *
+ * @param {object} st    `/fs/stat` 的返回（`isFolder` 决定走哪一支）
+ * @param {string} type 文件类型的展示文案（由调用方按列表项给出，如「图片」）
+ */
+export function propertyBodyHtml(st, type) {
+  const row = (label, value) =>
+    `<div class="prop-row"><span class="prop-label">${label}</span><span class="prop-value">${value}</span></div>`;
+  const fullPath = `<div class="prop-path" title="${escapeHtml(st.key)}">${escapeHtml(st.key)}</div>`;
+  // ⚠️ 这一行是本需求的核心：文件夹 → 创建者，文件 → 上传者
+  const ownerRow = row(st.isFolder ? '创建者' : '上传者', ownerText(st.uploader));
+  if (st.isFolder) {
+    return fullPath +
+      row('名称', escapeHtml(st.name)) +
+      row('类型', '文件夹') +
+      ownerRow +
+      row('创建时间', st.lastModified ? fmtTime(st.lastModified) : '—') +
+      row('对象总数', st.reachedCap ? `≥ ${st.objectCount}（已达统计上限）` : String(st.objectCount));
+  }
+  return fullPath +
+    row('名称', escapeHtml(st.name)) +
+    row('类型', type) +
+    ownerRow +
+    row('创建时间', st.lastModified ? fmtTime(st.lastModified) : '—') +
+    row('大小', `${fmtSize(st.size)}（${Number(st.size).toLocaleString()} 字节）`) +
+    (st.encrypted ? row('加密', '已加密（云端存储为密文，此为解密后大小）') : '');
 }
 
 /* ------------------------------ Canvas 图表 ------------------------------ */

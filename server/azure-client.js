@@ -451,19 +451,28 @@ class AzureBlobClient {
 
   /* ------------------------------ 对象读写 ------------------------------ */
 
+  /**
+   * 自定义元数据头：`x-cos-meta-*`（上层统一命名）→ `x-ms-meta-*`（Azure 只认后者）。
+   *
+   * `putObject` 与 `multipartComplete` 共用（R36）：Azure 与 S3 的关键差异是，
+   * 它的块列表提交（Put Block List）**仍接受** `x-ms-meta-*` —— 于是分片上传的
+   * 元数据既可以在提交时写入，也可以只在单请求 Put Blob 时写入；两处走同一个映射，
+   * 才不会出现「小文件有上传者、大文件没有」的分裂。
+   */
+  _metaHeaders(headers) {
+    const out = {};
+    for (const [k, v] of Object.entries(headers || {})) {
+      const lk = String(k).toLowerCase();
+      if (lk.startsWith('x-cos-meta-')) out['x-ms-meta-' + lk.slice('x-cos-meta-'.length)] = String(v);
+    }
+    return out;
+  }
+
   /** 上传单个对象（单请求 Put Blob，块类型 BlockBlob） */
   putObject(params, cb) {
     return this._do(cb, async () => {
       const { bucket, key } = this._ctx(params);
-      const headers = { 'x-ms-blob-type': 'BlockBlob' };
-      /**
-       * 上层的自定义元数据用 `x-cos-meta-*` 命名（COS/S3 适配器的约定），
-       * Azure 侧必须翻成 `x-ms-meta-*` 才会被当元数据保存。
-       */
-      for (const [k, v] of Object.entries(params.Headers || {})) {
-        const lk = String(k).toLowerCase();
-        if (lk.startsWith('x-cos-meta-')) headers['x-ms-meta-' + lk.slice('x-cos-meta-'.length)] = String(v);
-      }
+      const headers = Object.assign({ 'x-ms-blob-type': 'BlockBlob' }, this._metaHeaders(params.Headers));
       if (params.ContentType) headers['content-type'] = String(params.ContentType);
       const r = await this._request({
         method: 'PUT', bucket, key, headers, body: params.Body === undefined ? Buffer.alloc(0) : params.Body,
@@ -731,7 +740,7 @@ class AzureBlobClient {
       const r = await this._request({
         method: 'PUT', bucket, key,
         query: { comp: 'blocklist' },
-        headers: { 'content-type': 'application/xml' },
+        headers: Object.assign({ 'content-type': 'application/xml' }, this._metaHeaders(params.Headers)),
         body: xml,
       });
       return { Location: '', Bucket: bucket, Key: key, ETag: r.headers.etag || '' };

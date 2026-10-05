@@ -1,6 +1,7 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState } from './util.js';
+import { openListDialog } from './listdialog.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
@@ -680,8 +681,11 @@ let usersRenderId = 0; // 单调递增的渲染序号：丢弃过期响应，避
 // R35：「全部用户」对话框的状态。**必须**放在模块级而不是对话框闭包里 ——
 // 卡片列表每次刷新都会重绘（`loadUsers → renderUsers`），对话框里的行必须跟着一起更新
 // （在对话框里删掉一个用户、卡片上却仍显示他，是最容易漏掉的一类不一致）。
-let allUsersOpen = false; // 对话框是否开着（决定 renderUsers 末尾要不要重绘它）
-let allUsersQuery = ''; // 搜索框当前内容（跨重绘保持，否则删一个用户就把搜索条件清掉了）
+// R35：「全部用户」对话框。R36 起对话框骨架下沉到 `listdialog.js`（四张卡片共用），
+// 这里只保留一个**句柄** —— 卡片列表每次刷新都会重绘（`loadUsers → renderUsers`），
+// 对话框里的行必须跟着一起更新（在对话框里删掉一个用户、卡片上却仍显示他，
+// 是最容易漏掉的一类不一致）。
+let usersDialog = null; // openListDialog 返回的句柄；null = 未打开
 
 /**
  * 抹掉用户卡片与「全部用户」对话框里的动态内容。
@@ -699,8 +703,9 @@ function clearUserDom() {
   if (more) more.hidden = true;
   const hint = document.getElementById('user-more-hint');
   if (hint) hint.textContent = '';
-  allUsersOpen = false;
-  allUsersQuery = '';
+  // R36：对话框一并关掉。**必须**同时显式清掉容器内容 —— 关闭只是把弹窗从
+  // `#modal-root` 移除，容器节点上已经渲染好的用户名 / 角色 / 封禁原因不会自己消失。
+  if (usersDialog) usersDialog.close();
   const allList = document.getElementById('user-all-body');
   if (allList) allList.innerHTML = '';
 }
@@ -860,17 +865,18 @@ function bindUserRowActions(root, users) {
 }
 
 /**
- * 「显示全部」按钮的显隐（R35 需求 2 / 3 的**唯一判据**）。
+ * 「显示全部」按钮的显隐（R35 需求 2 / 3）。
  *
- * 判据用**严格大于**：正好 10 个用户时卡片已经完整展示了全部用户，
+ * 判据与提示文案下沉到 `util.previewMoreState()`（R36：四张卡片共用）——
+ * 那里的判据是**严格大于**：正好 10 个用户时卡片已经完整展示了全部用户，
  * 此时再摆一个「显示全部」，点开只能看到与卡片一字不差的一份副本。
  */
 function updateUserMore(total) {
   const more = document.getElementById('user-more');
   const hint = document.getElementById('user-more-hint');
-  const over = total > USER_PREVIEW_LIMIT;
+  const { over, hint: hintText } = previewMoreState(total, USER_PREVIEW_LIMIT, '位用户');
   if (more) more.hidden = !over;
-  if (hint) hint.textContent = over ? `卡片仅显示前 ${USER_PREVIEW_LIMIT} 位，共 ${total} 位用户` : '';
+  if (hint) hint.textContent = hintText;
 }
 
 function renderUsers() {
@@ -895,78 +901,59 @@ function renderUsers() {
   repaintAllUsers(); // 对话框开着时同步刷新：删/封/改名之后两边必须一致
 }
 
-/* ============================ 全部用户对话框（R35） ============================ */
+/* ============================ 全部用户对话框（R35 / R36） ============================ */
 /*
  * 用户数超过 USER_PREVIEW_LIMIT 时，卡片只展示前 10 位，「显示全部」把其余用户
- * 连同**搜索框**放进一个对话框：列表自带滚动条，搜索框固定在顶部、不随列表滚走。
+ * 连同**搜索框与角色筛选**放进一个对话框：列表自带滚动条，工具条固定在顶部、不随列表滚走。
  *
- * 两条容易做错的约束：
+ * 三条容易做错的约束：
  *  1. 对话框里的行**必须**带完整操作按钮。「列表里看不见的用户 = 管不了的用户」
  *     是这一版最可能犯的错：50 个用户时后 40 个将永远无法编辑 / 封禁 / 删除。
  *  2. 所有变更（删除 / 封禁 / 编辑保存）都经由 `loadUsers() → renderUsers()` 这**一个**
  *     收口点，所以对话框的重绘挂在 `renderUsers()` 末尾（`repaintAllUsers()`），
  *     而不是在每个操作里各写一遍刷新 —— 那样迟早漏一个。
+ *  3. R36：对话框骨架下沉到 `listdialog.js` 的 `openListDialog()`（四张列表卡片共用），
+ *     本文件只提供数据与**卡片同款**的行渲染 / 绑定。
  */
 
 /** 重绘「全部用户」列表（对话框没开时是空操作） */
 function repaintAllUsers() {
-  if (!allUsersOpen) return;
-  const list = document.getElementById('user-all-body');
-  if (!list) { allUsersOpen = false; return; } // 弹窗已被移除（例如登出时），别再往空气里渲染
-  const users = usersState || [];
-  const shown = filterUsersByName(users, allUsersQuery);
-  const currentId = App.state.user ? App.state.user.id : null;
-
-  const countEl = document.getElementById('user-all-count');
-  if (countEl) {
-    countEl.textContent = allUsersQuery.trim()
-      ? `匹配 ${shown.length} / 共 ${users.length} 位`
-      : `共 ${users.length} 位用户`;
-  }
-
-  if (!shown.length) {
-    // 「搜索没命中」与「系统里一个用户都没有」是两件事，文案必须分开
-    list.innerHTML = `<div class="lk-empty">${users.length ? '没有匹配的用户' : '暂无用户'}</div>`;
-    return;
-  }
-  list.innerHTML = userTableHtml(shown, currentId);
-  bindUserRowActions(list, shown);
+  if (usersDialog) usersDialog.repaint();
 }
 
-/** 打开「全部用户」对话框（R35 需求 3） */
+/** 打开「全部用户」对话框（R35 需求 3；R36 需求 0：新增角色下拉筛选） */
 function showAllUsers() {
   if (!canManageUsers()) return;
-  if (allUsersOpen) return; // 连点两次不得叠出第二层遮罩
+  if (usersDialog) return; // 连点两次不得叠出第二层遮罩（句柄在 onClose 里复位）
 
   const users = usersState || [];
-  const wrap = document.createElement('div');
-  wrap.className = 'user-all';
-  wrap.innerHTML = `
-    <div class="user-all-bar">
-      <input type="search" id="user-all-search" class="user-all-search"
-        placeholder="搜索用户名（不区分大小写）" autocomplete="off" spellcheck="false">
-      <span class="user-all-count" id="user-all-count"></span>
-    </div>
-    <div class="user-all-body" id="user-all-body"></div>`;
-
-  allUsersQuery = '';
-  openModal({
+  const currentId = App.state.user ? App.state.user.id : null;
+  usersDialog = openListDialog({
+    idPrefix: 'user-all',
     title: `全部用户（共 ${users.length} 位）`,
-    body: wrap,
-    foot: [{ text: '关闭' }],
-    wide: true,
+    placeholder: '搜索用户名（不区分大小写）',
     cls: 'user-all-dialog', // 7 列表格要的宽度（见 style.css）
-    onClose: () => { allUsersOpen = false; allUsersQuery = ''; },
+    unit: '位用户',
+    unitShort: '位',
+    emptyAll: '暂无用户',
+    emptyMatch: '没有匹配的用户',
+    selects: [{
+      id: 'role',
+      title: '按角色筛选',
+      value: '',
+      options: [
+        { value: '', text: '全部角色' },
+        { value: 'admin', text: '管理员' },
+        { value: 'user', text: '普通用户' },
+      ],
+    }],
+    items: () => usersState || [],
+    filter: (list, st) => filterUsersByName(list, st.query, st.filters.role),
+    // 卡片与对话框共用同一个表格渲染器与同一套行按钮绑定
+    rowHtml: (shown) => userTableHtml(shown, currentId),
+    bindRows: (list, shown) => bindUserRowActions(list, shown),
+    onClose: () => { usersDialog = null; },
   });
-  allUsersOpen = true;
-
-  const search = document.getElementById('user-all-search');
-  // 搜索是**本地内存过滤**（数据已经在手），因此既不防抖也不发请求。
-  // 用 `oninput` 而不是 addEventListener：与列表按钮同一写法，且假 DOM 里可直接驱动。
-  if (search) search.oninput = () => { allUsersQuery = search.value; repaintAllUsers(); };
-
-  repaintAllUsers();
-  if (search && search.focus) search.focus();
 }
 
 /* ============================ 账户封禁（R33） ============================ */

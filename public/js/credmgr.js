@@ -1,6 +1,7 @@
 /** 密钥管理页 —— 访问密钥（共享/可见性）/ 自定义域名 / 连接验证 */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, matchesQuery, previewMoreState } from './util.js';
+import { openListDialog, providerSelectOptions } from './listdialog.js';
 import { App } from './main.js';
 import { providerList, providerLogo, providerMeta } from './provider-logos.js';
 
@@ -9,6 +10,23 @@ let cache = { credentials: [], activeCredentialId: '' };
 let domainCache = { primary: '', backup: '' };
 /** 添加密钥表单中当前选中的服务商（默认腾讯云，与服务端默认值保持一致） */
 let pickedProvider = 'tencent';
+
+/**
+ * 「访问密钥管理」卡片列表的**预览条数上限**（R36 需求 2①）。
+ *
+ * 与 `USER_PREVIEW_LIMIT` 同理只声明一次：卡片截断（`creds.slice(0, …)`）与
+ * 「显示全部」的提示文案都要引用同一个数 —— 两处各写一个字面量，
+ * 改一处就会出现「卡片显示 10 条、提示却写 20 条」这种自相矛盾的界面。
+ */
+const CRED_PREVIEW_LIMIT = 10;
+
+/**
+ * 「全部密钥」对话框的句柄（`null` = 未打开）。
+ *
+ * **必须**放在模块级而不是弹窗闭包里：卡片列表每次刷新（`refresh → render`）都要把
+ * 已打开的对话框一并重绘，否则在对话框里删掉一把密钥、卡片上却仍留着它。
+ */
+let credsDialog = null;
 
 export function refresh() {
   wire();
@@ -44,6 +62,8 @@ function wire() {
   if (rf) rf.onclick = () => refresh();
   const sd = document.getElementById('btn-credmgr-save-domain');
   if (sd) sd.onclick = saveDomain;
+  const all = document.getElementById('btn-cred-all');
+  if (all) all.onclick = showAllCreds;
   // 密钥变更后刷新
   window.addEventListener('buckets-changed', () => {
     const sec = document.getElementById('credmgr');
@@ -63,10 +83,30 @@ function render() {
   if (head) head.textContent = creds.length ? `（共 ${creds.length} 个）` : '';
   if (!creds.length) {
     box.innerHTML = `<div class="lk-empty">${isAdmin() ? '尚未保存任何密钥。请点击下方「＋ 添加密钥」完成配置。' : '尚无可用密钥，请联系管理员添加。'}</div>`;
+    updateCredMore(0);
+    repaintAllCreds();
     renderAddForm(box);
     return;
   }
-  box.innerHTML = `
+  // 需求 2①：卡片列表最多展示前 CRED_PREVIEW_LIMIT 个密钥
+  const shown = creds.slice(0, CRED_PREVIEW_LIMIT);
+  box.innerHTML = credTableHtml(shown);
+  bindCredRowActions(box, shown);
+
+  updateCredMore(creds.length);
+  repaintAllCreds(); // 对话框开着时同步刷新：删/改备注后两边必须一致
+  renderAddForm(box);
+}
+
+/**
+ * 密钥表格 HTML —— 卡片列表与「全部密钥」对话框的**唯一渲染器**（R36）。
+ *
+ * 两处各写一份表格是这类界面最典型的腐烂方式：新增一列或一个按钮只改了一处，
+ * 另一处静默落后，于是出现「卡片里能删、对话框里却不能」这种只能翻代码才解释得通的现象。
+ * 因此它只接受「要渲染哪些密钥」，渲染进哪个容器由调用方决定。
+ */
+function credTableHtml(creds) {
+  return `
     <table class="lk-table bm-table">
       <thead><tr>
         <th>服务商</th><th>密钥</th><th>访问密钥 ID</th><th>对普通用户</th><th>状态</th><th style="width:${isAdmin() ? 300 : 120}px">操作</th>
@@ -84,31 +124,100 @@ function render() {
             <td>${c.visibleToUsers !== false ? '<span class="lk-badge ok">可见</span>' : '<span class="lk-badge">仅管理员</span>'}</td>
             <td>${disabled ? '<span class="lk-badge warn">已停用</span>' : '<span class="lk-badge ok">使用中</span>'}</td>
             <td class="lk-acts">
-              ${isAdmin() ? `<button class="mini-btn" data-act="${disabled ? 'en' : 'dis'}">${disabled ? '启用' : '停用'}</button>` : ''}
-              ${isAdmin() ? `<button class="mini-btn" data-act="vis">${c.visibleToUsers !== false ? '设为不可见' : '设为可见'}</button>
-                <button class="mini-btn" data-act="edit">备注</button>
-                <button class="mini-btn danger" data-act="del">删除</button>` : ''}
+              ${isAdmin() ? `<button class="mini-btn" data-act="${disabled ? 'en' : 'dis'}" data-id="${escapeHtml(c.id)}">${disabled ? '启用' : '停用'}</button>` : ''}
+              ${isAdmin() ? `<button class="mini-btn" data-act="vis" data-id="${escapeHtml(c.id)}">${c.visibleToUsers !== false ? '设为不可见' : '设为可见'}</button>
+                <button class="mini-btn" data-act="edit" data-id="${escapeHtml(c.id)}">备注</button>
+                <button class="mini-btn danger" data-act="del" data-id="${escapeHtml(c.id)}">删除</button>` : ''}
             </td>
           </tr>`;
         }).join('')}
       </tbody></table>`;
+}
 
-  box.querySelectorAll('tr[data-id]').forEach((tr) => {
-    const cred = creds.find((x) => x.id === tr.dataset.id);
+/**
+ * 行内按钮绑定 —— 卡片与对话框共用（R36），否则对话框里的按钮会「看得见、点不动」。
+ *
+ * 写法与 `syssettings.js` 的 `bindUserRowActions` 严格同型：查询根节点上的
+ * `[data-act]`（扁平）、id 由 `getAttribute('data-id')` 取 —— 因此每个行内按钮
+ * **自己**带着 `data-id`（挂在 `<tr>` 上不够：扁平查询拿不到行元素）。
+ * 四张卡片同一种写法，测试里的假 DOM 才能用同一套实现驱动它们。
+ */
+function bindCredRowActions(root, creds) {
+  root.querySelectorAll('[data-act]').forEach((btn) => {
+    const act = btn.getAttribute('data-act');
+    const cred = creds.find((x) => x.id === btn.getAttribute('data-id'));
     if (!cred) return;
-    tr.querySelectorAll('[data-act]').forEach((btn) => {
-      btn.onclick = () => {
-        const act = btn.dataset.act;
-        if (act === 'vis') toggleVisibility(cred);
-        else if (act === 'en') toggleEnabled(cred, true);
-        else if (act === 'dis') toggleEnabled(cred, false);
-        else if (act === 'edit') editRemark(cred);
-        else if (act === 'del') deleteCredential(cred);
-      };
-    });
+    btn.onclick = () => {
+      if (act === 'vis') toggleVisibility(cred);
+      else if (act === 'en') toggleEnabled(cred, true);
+      else if (act === 'dis') toggleEnabled(cred, false);
+      else if (act === 'edit') editRemark(cred);
+      else if (act === 'del') deleteCredential(cred);
+    };
   });
+}
 
-  renderAddForm(box);
+/**
+ * 「显示全部」按钮的显隐与提示文案（需求 2①）。
+ *
+ * 判据下沉到 `util.previewMoreState()`（四张卡片共用）—— 那里用的是**严格大于**：
+ * 正好 10 个密钥时卡片已完整展示，再摆一个「显示全部」点开只能看到一字不差的副本。
+ */
+function updateCredMore(total) {
+  const more = document.getElementById('cred-more');
+  const hint = document.getElementById('cred-more-hint');
+  const { over, hint: hintText } = previewMoreState(total, CRED_PREVIEW_LIMIT, '个密钥');
+  if (more) more.hidden = !over;
+  if (hint) hint.textContent = hintText;
+}
+
+/** 重绘「全部密钥」列表（对话框没开时是空操作） */
+function repaintAllCreds() {
+  if (credsDialog) credsDialog.repaint();
+}
+
+/**
+ * 按关键词 / 服务商筛选密钥（R36 需求 2②）。
+ *
+ * 关键词的匹配范围取**卡片「密钥」列所显示的内容**：备注名，没有备注时就是访问密钥掩码 ——
+ * 这样「屏幕上看得见的字」都能搜到。规则本身走 `util.matchesQuery()`（四张卡片同一条），
+ * 不在这里另写一份，否则会出现「密钥列表能搜大写、桶列表搜不到」这种没人想到去核对的不一致。
+ */
+function filterCreds(list, query, provider) {
+  const want = String(provider == null ? '' : provider).trim();
+  return (Array.isArray(list) ? list : []).filter((c) => (!want || String((c && c.provider) || 'tencent') === want)
+    && matchesQuery(query, [(c && c.remark) || '', (c && c.secretIdMasked) || '']));
+}
+
+/** 打开「全部密钥」对话框（需求 2②：服务商下拉筛选 + 搜索备注） */
+function showAllCreds() {
+  if (!isAdmin()) return;
+  if (credsDialog) return; // 连点两次不得叠出第二层遮罩（句柄在 onClose 里复位）
+  const creds = cache.credentials || [];
+  credsDialog = openListDialog({
+    idPrefix: 'cred-all',
+    title: `全部密钥（共 ${creds.length} 个）`,
+    placeholder: '搜索备注 / 访问密钥 ID（不区分大小写）',
+    cls: 'cred-all-dialog', // 6 列表格要的宽度（见 style.css）
+    unit: '个密钥',
+    unitShort: '个',
+    emptyAll: '尚未保存任何密钥',
+    emptyMatch: '没有匹配的密钥',
+    // 选项只列**数据集里真实出现过的**服务商，而不是把注册表 11 家全列出来 ——
+    // 后者会给出大量「选了必然为空」的选项，用户会以为是自己筛错了。
+    selects: [{
+      id: 'provider',
+      title: '按服务商筛选',
+      value: '',
+      options: providerSelectOptions(creds, providerMeta, '全部服务商'),
+    }],
+    items: () => cache.credentials || [],
+    filter: (list, st) => filterCreds(list, st.query, st.filters.provider),
+    // 卡片与对话框共用同一个表格渲染器与同一套行按钮绑定
+    rowHtml: (shown) => credTableHtml(shown),
+    bindRows: (list, shown) => bindCredRowActions(list, shown),
+    onClose: () => { credsDialog = null; },
+  });
 }
 
 /** 追加「添加密钥」表单（仅管理员可见） */

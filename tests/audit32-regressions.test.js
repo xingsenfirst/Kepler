@@ -364,6 +364,19 @@ export const filterUsersByName = (list, q) => {
   const s = String(q == null ? '' : q).trim().toLowerCase();
   return s ? all.filter((u) => String((u && u.username) || '').toLowerCase().indexOf(s) !== -1) : all;
 };
+// R36：previewMoreState 同理（「显示全部」判据下沉到 util.js）
+export const previewMoreState = (total, limit, unit) => {
+  const over = total > limit;
+  return { over, hint: over ? ('卡片仅显示前 ' + limit + ' ' + unit + '，共 ' + total + ' ' + unit) : '' };
+};
+// R36：linkmgr.js 新增 matchesQuery 具名导入（关键词筛选规则下沉到 util.js）——
+// 桩少这一个导出，本文件**所有** import linkmgr.js 的用例都会在链接期整片变红。
+export const matchesQuery = (query, texts) => {
+  const q = String(query == null ? '' : query).trim().toLowerCase();
+  if (!q) return true;
+  const list = Array.isArray(texts) ? texts : [texts];
+  return list.some((t) => String(t == null ? '' : t).toLowerCase().indexOf(q) !== -1);
+};
 `;
 
 /** 在临时模块图里放一份**真实**模块（连带它 import 的同目录依赖） */
@@ -372,6 +385,9 @@ function makeFeSandbox(realFiles) {
   fs.writeFileSync(path.join(dir, 'api.js'), API_STUB);
   fs.writeFileSync(path.join(dir, 'util.js'), UTIL_STUB);
   for (const f of realFiles) fs.copyFileSync(JS(f), path.join(dir, f));
+  // R36：syssettings.js 现在 import './listdialog.js'（列表对话框骨架）——
+  // 沙箱缺了它会在 ESM 链接期直接失败，所有 import syssettings 的用例整片变红。
+  fs.copyFileSync(JS('listdialog.js'), path.join(dir, 'listdialog.js'));
   return dir;
 }
 

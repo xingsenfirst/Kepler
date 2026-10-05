@@ -9,6 +9,7 @@ const { express, providers, configStore, statsStore, uploadSessions, encStore, s
 const {
   getClient, p, translateError, listAll, listAllInfo, listAllExact, listPage, LIMITS,
   normalizeKey, badRequest, copySource,
+  uploaderMeta, readUploader, // R36：属性面板的「创建者 / 上传者」元数据（唯一实现点在 cos.js）
 } = require('../cos');
 const { deleteMultipleConfirmed } = require('../cos'); // R10-03：批量删除的白名单判据（共用）
 /**
@@ -153,9 +154,13 @@ router.get('/fs/stat', async (req, res) => {
         if (again) return again;
 
         let lastModified = null;
+        // R36：文件夹的「创建者」取自目录标记对象的元数据（建文件夹时写入）。
+        // 纯虚拟目录（没有标记对象）→ 保持空，前端显示「—」，不猜测。
+        let uploader = '';
         try {
           const head = await p(client, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
           lastModified = head.headers['last-modified'] || null;
+          uploader = readUploader(head.headers);
         } catch (e) { /* 无标记对象（纯虚拟目录）→ 创建时间未知 */ }
 
         const STAT_CAP = LIMITS.STAT;
@@ -166,6 +171,7 @@ router.get('/fs/stat', async (req, res) => {
           ok: true, isFolder: true, key,
           name: baseName(key.replace(/\/$/, '')) || key,
           lastModified,
+          uploader,
           objectCount: Math.min(files.length, STAT_CAP),
           reachedCap,
         };
@@ -184,6 +190,8 @@ router.get('/fs/stat', async (req, res) => {
       size: encMeta ? encMeta.origSize : (Number(head.headers['content-length']) || 0), // 加密文件显示原始大小
       encrypted: !!encMeta, // 云端存储为密文
       lastModified: head.headers['last-modified'] || null,
+      // R36：上传者。历史对象（本版之前上传）没有该元数据 → 空串，前端显示「—」。
+      uploader: readUploader(head.headers),
     });
   } catch (e) {
     if (e.statusCode === 404 || e.statusCode === '404' || /NotFound|NoSuchKey/i.test(String(e.code || ''))) {
@@ -387,7 +395,13 @@ router.post('/fs/mkdir', async (req, res) => {
     let key = normalizeKey(String((req.body || {}).path || ''));
     if (!key) throw badRequest('路径不能为空');
     if (!key.endsWith('/')) key += '/';
-    await p(client, 'putObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key, Body: Buffer.alloc(0), ContentLength: 0 });
+    // R36：文件夹的「创建者」同样落在目录标记对象的元数据上 —— 否则文件夹属性
+    // 永远只能显示「—」，而需求明确要求文件夹显示创建者。
+    await p(client, 'putObject', {
+      Bucket: cfg.bucket, Region: cfg.region, Key: key,
+      Body: Buffer.alloc(0), ContentLength: 0,
+      Headers: uploaderMeta(req.authUser && req.authUser.username),
+    });
     res.json({ ok: true, key });
     statsStore.addLog({ action: 'fs.mkdir', detail: '创建文件夹 ' + key });
   } catch (e) {
@@ -426,7 +440,10 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
     await p(client, 'putObject', {
       Bucket: cfg.bucket, Region: cfg.region, Key: key,
       Body: body, ContentLength: stored,
-      Headers: { 'x-cos-meta-file-mtime': String(req.query.mtime || '') },
+      Headers: Object.assign(
+        { 'x-cos-meta-file-mtime': String(req.query.mtime || '') },
+        uploaderMeta(req.authUser && req.authUser.username), // R36：属性面板的「上传者」
+      ),
     });
     // SEC-08 + R7-02：密文**确认落云之后**才写解密凭据（encryptBuffer 不再代写）。
     // 先写元数据再写云端的话，putObject 失败会让本地凭据覆盖成新值、云端却还是旧密文 → 永久不可解。
@@ -516,7 +533,12 @@ router.post('/fs/upload/init', async (req, res) => {
       await assertBucketQuota(client, cfg, { addBytes: netAdd }); // R28-02：单桶上限（同一净增量口径）
     }
     if (!sess) {
-      const init = await p(client, 'multipartInit', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
+      // R36：分片上传的「上传者」只能在此刻写入 —— S3 / COS 的对象元数据
+      // 只在创建 uploadId 时生效，合并（complete）时再传是被忽略的。
+      const init = await p(client, 'multipartInit', {
+        Bucket: cfg.bucket, Region: cfg.region, Key: key,
+        Headers: uploaderMeta(who),
+      });
       // 分片上限 48MB，防止超过 express.raw 64MB 限制导致 413（Claude issue #4）
       // R11-08：上限提取为 UPLOAD_CHUNK_MAX —— chunk 路由校验「会话缺 chunkSize」
       // 时要回落到这里，两处必须同源
@@ -801,6 +823,13 @@ router.post('/fs/upload/complete', async (req, res) => {
     await p(client, 'multipartComplete', {
       Bucket: sess.bucket, Region: sess.region, Key: sess.key,
       UploadId: sess.uploadId, Parts: parts,
+      /**
+       * R36：上传者用**会话创建者**（`sess.createdBy`）而不是当前请求者 ——
+       * 管理员代为完成他人会话时，上传者仍是发起上传的那个人。
+       * 对 S3 / COS 而言这个头在 complete 时是被忽略的（元数据已在 init 写入），
+       * 但 Azure 的块列表提交接受并保存 `x-ms-meta-*`，因此必须带上。
+       */
+      Headers: uploaderMeta(sess.createdBy),
     });
     // SEC-08：分片合并成功即云端已有完整密文，解密凭据必须同步落盘。
     // R8-03：会话以「不加密」模式开启时，合并出来的就是明文 —— 必须清掉被覆盖掉的

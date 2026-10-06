@@ -15,6 +15,27 @@ const IS_LOOPBACK = DEPLOY_HOST === '127.0.0.1' || DEPLOY_HOST === 'localhost' |
 const IS_DEPLOY = !IS_LOOPBACK;
 
 /**
+ * R38：**本站对外域名**（部署脚本写入 `SITE_DOMAIN=cos.example.com`）。
+ *
+ * 为什么必须有它 —— 这是 R38-01 的根因所在：`deploy.sh` 生成的运行环境里
+ * `HOST=0.0.0.0`。那是**通配绑定地址**（要求内核监听全部网卡），它**永远不可能**
+ * 出现在请求的 `Host` 头里；而真实域名此前只被写进 nginx 的 `server_name`，
+ * **应用完全不知道「自己叫什么」**。
+ *
+ * 后果是部署模式下「本站」允许集里只剩一个通配地址，于是：
+ *  - WebAuthn：任何用真实域名访问的注册 / 登录都被 `webauthnContext()` 判成
+ *    「当前访问地址不是本站域名」→ 403，Windows Hello 完全不可用；
+ *  - HTTPS 跳转：`configuredSiteHost()` 取不到域名，`httpsRedirectHost()` 只能
+ *    退回 `https://0.0.0.0:3443/…`（Windows 上根本无法解析）。
+ *
+ * ⚠️ 它**不是**「自定义请求域名（`cfg.domains`）」，两者语义不同、不可合并：
+ * 后者是**分享链接优先使用的 CDN 域名**（见密钥管理页的原话），可选，且与
+ * 「本站是否在本域名下提供服务」毫无关系；把它当成 rpId 白名单来源，等于用
+ * 「分享走哪个域名」回答「本站叫什么」。
+ */
+const SITE_DOMAIN = normalizeHost(process.env.SITE_DOMAIN || '');
+
+/**
  * 是否信任反向代理注入的 X-Forwarded-For 头（N1 修复）。
  * 仅当显式配置 TRUST_PROXY=1 时才信任；否则一律使用 socket 对端地址，
  * 杜绝直连场景下通过伪造 XFF 绕过限流/锁定。
@@ -205,7 +226,9 @@ function normalizeHost(v) {
 function isOwnSiteHost(host, extra) {
   const h = normalizeHost(host);
   if (!h) return false;
-  const own = new Set([normalizeHost(DEPLOY_HOST)]);
+  // R38：`SITE_DOMAIN`（部署脚本写入的真实域名）优先纳入 —— 缺了它，默认部署
+  // 下整个允许集里只剩 `HOST=0.0.0.0` 这个通配绑定地址，真实域名一律被判「非本站」。
+  const own = new Set([normalizeHost(DEPLOY_HOST), SITE_DOMAIN]);
   try {
     const cfg = require('./config-store').load();
     own.add(normalizeHost(cfg && cfg.domains && cfg.domains.primary));
@@ -213,11 +236,18 @@ function isOwnSiteHost(host, extra) {
   } catch (e) { /* 配置不可读时只认本机 HOST */ }
   for (const e of extra || []) own.add(normalizeHost(e));
   own.delete('');
+  // R38：通配绑定地址不是「本站域名」。把它留在允许集里只会制造「看着有一条、
+  // 其实永远不命中」的假象（请求 Host 不可能等于 0.0.0.0），还会让
+  // `httpsRedirectHost()` 的回退分支把「无域名可用」误判成「有域名可用」。
+  for (const x of [...own]) { if (isBindAllHost(x)) own.delete(x); }
   return own.has(h);
 }
 
 /** 配置里的站点主/备域名（取第一个非空），读不到返回 '' */
 function configuredSiteHost() {
+  // R38：部署脚本写下的真实域名优先于「分享用 CDN 域名」—— 后者只是分享链接的
+  // 展示偏好，拿它做 HTTPS 跳转目标会把用户送到一个并不提供本系统的域名上。
+  if (SITE_DOMAIN) return SITE_DOMAIN;
   try {
     const cfg = require('./config-store').load();
     const d = cfg && cfg.domains;
@@ -536,10 +566,21 @@ const webdavRevealLimiter = createLimiter({ name: 'webdav-reveal', windowMs: 10 
  * 多人共用；但它只是渲染一个静态页面 + 一次**已做并发合并**的探测，
  * 300 次/10 分钟对正常访问绰绰有余。
  */
+/**
+ * R38：「备份配置」导出时校验账户口令的限流器。
+ *
+ * 为什么不复用 `passwordLimiter`（10 次/分钟）：两者都拿 scrypt 校验**同一份**
+ * 口令哈希，共用预算会让「导出备份」把「改密码」的额度吃掉 —— 用户改密码时突然
+ * 被「操作过于频繁」挡住，而他只会以为是自己密码打错了。语义不同就各给一条
+ * （本项目既有约定：支付链路上的三个限流器也是因此没有合并）。
+ */
+const backupExportLimiter = createLimiter({ name: 'backup-export', windowMs: 10 * 60 * 1000, max: 10 });
+
 const shareViewLimiter = createLimiter({ name: 'share-view', windowMs: 10 * 60 * 1000, max: 300 });
 
 module.exports = {
   DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY,
+  SITE_DOMAIN, // R38：部署脚本写入的本站对外域名（「本站」允许集的权威来源）
   secureCookieAttr, clientIp,
   // R17-01：唯一的 XFF 解析实现 + 「IP 及其来源」；R17-03：「这个地址是不是本站」
   // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
@@ -555,4 +596,5 @@ module.exports = {
   shareLimiter, shareLock,
   initLimiter, passwordLimiter, webdavAuthLimiter, shareDownloadLimiter, webdavRevealLimiter, payNotifyLimiter,
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
+  backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）
 };

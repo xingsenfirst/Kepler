@@ -857,6 +857,31 @@ input.full { width: 100%; }
 }
 .sl-err { font-size: 12px; color: var(--danger); }
 
+/* ---------------------- R38：备份配置 ---------------------- */
+.sysset-tag.backup { background: #6b4fbb; color: #fff; }
+.backup-code-wrap { margin: 8px 0 6px; }
+.backup-code {
+  width: 100%; min-height: 88px; max-height: 220px; resize: vertical;
+  box-sizing: border-box; padding: 8px 10px;
+  font-family: Consolas, "Courier New", monospace; font-size: 11px; line-height: 1.5;
+  color: var(--text); background: var(--panel, #f8f9fb);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  word-break: break-all; white-space: pre-wrap;
+}
+.backup-meta { margin-top: 4px; }
+.backup-meta-text { font-size: 12px; color: var(--text-2); }
+.backup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 6px; }
+.backup-import-hint { font-size: 12px; color: var(--text-2); }
+.backup-import-hint.backup-import-open { color: var(--success, #1a7f37); }
+.backup-live-note { margin-top: 6px; }
+.backup-form { display: flex; flex-direction: column; gap: 10px; }
+.backup-form .bk-input { width: 100%; box-sizing: border-box; text-align: left; }
+.backup-form textarea.backup-code { min-height: 96px; }
+.backup-import-warn { margin-bottom: 4px; }
+.dialog.backup-dialog { width: min(560px, 94vw); }
+/* 导入按钮在「已有配置」的实例上禁用：disabled 的元素必须看得出来不能点 */
+.backup-actions .mini-btn:disabled { opacity: .5; cursor: not-allowed; }
+
 /* ------------------------- WebDAV 服务 ------------------------- */
 .wd-url-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .wd-url {

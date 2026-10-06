@@ -4330,6 +4330,190 @@ const CASES = [
       testFile: 'audit37-regressions.test.js',
       minFail: 1,
     },
+
+    /* ============ R38-01 · Windows Hello「当前访问地址不是本站域名」 ============ */
+
+    {
+      // 根因就是这一行漏了 `SITE_DOMAIN`：允许集里只剩 `HOST=0.0.0.0` 这个**通配
+      // 绑定地址**（请求的 `Host` 头永远不可能等于它）加上两个默认空字符串 ——
+      // 允许集**实际为空**，于是用真实域名访问本站反而被判成「访问了外站」。
+      name: 'R38-01a · SITE_DOMAIN 未纳入「本站域名」允许集（用户报的 403 原样复现）',
+      file: 'server/security.js',
+      anchor: '  const own = new Set([normalizeHost(DEPLOY_HOST), SITE_DOMAIN]);',
+      replacement: '  const own = new Set([normalizeHost(DEPLOY_HOST)]);',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 修这个根因时最顺手的做法就是「把这道判据放宽」—— 而那会把 R24-02 的防钓鱼面
+      // 一起拆掉：任何域名都成了「本站」，攻击者可以在仿冒域上骗取 Windows Hello 签名。
+      name: 'R38-01b · 干脆把 isOwnSiteHost 放宽成恒真（防钓鱼面被一起拆掉）',
+      file: 'server/security.js',
+      anchor: '  return own.has(h);\n}',
+      replacement: '  return true;\n}',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // `0.0.0.0` 留在允许集里**不会**造成误放行（请求 `Host` 不可能等于它），
+      // 但会让 `httpsRedirectHost()` 的回退分支把「无域名可用」误判成「有域名可用」，
+      // 跳转目标于是变成 `https://0.0.0.0:3443/…` —— 一个必然打不开的地址。
+      name: 'R38-01c · 不再剔除通配绑定地址（跳转目标退回 https://0.0.0.0:3443/…）',
+      file: 'server/security.js',
+      anchor: '  for (const x of [...own]) { if (isBindAllHost(x)) own.delete(x); }',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「本站叫什么」与「分享链接优先用哪个域名」是两件事：后者只是展示偏好，
+      // 拿它做 HTTPS 跳转目标会把用户送到一个并不提供本系统的域名上。
+      name: 'R38-01d · HTTPS 跳转目标不认 SITE_DOMAIN（用户被送到分享用 CDN 域名）',
+      file: 'server/security.js',
+      anchor: '  if (SITE_DOMAIN) return SITE_DOMAIN;',
+      replacement: '  if (false) return SITE_DOMAIN;',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 只改应用侧，只能救「手动设了 SITE_DOMAIN」的那一半；一键部署的站点完全靠
+      // 这一行拿到自己的域名 —— 少了它，自动部署的站点原样踩同一个坑。
+      name: 'R38-01f · 部署脚本不写 SITE_DOMAIN（自动部署的站点仍被判「外站」）',
+      file: 'deploy.sh',
+      anchor: 'SITE_DOMAIN=${DOMAIN}',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ==================== R38-02 · 设置页「备份配置」 ==================== */
+
+    {
+      // 需求把「API Key 管理」与「负载均衡」列成两项，但它们在 `config.enc` 里是
+      // **同一条 credentials 记录**（`quotaBytes`）。另立一个分区 = 同一个字段两个
+      // 来源，导入时谁覆盖谁全凭顺序。
+      name: 'R38-02b · 「负载均衡」被拆成独立分区（同一条记录两个来源）',
+      file: 'server/backup.js',
+      anchor: "  { label: '负载均衡', section: 'credentials' },",
+      replacement: "  { label: '负载均衡', section: 'loadbalance' },",
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求原话：「所有用户均不在备份范围内（包括管理员）」。账户与口令哈希属于
+      // **这台实例**的身份，跨实例搬运等于把「谁能登录」一起搬走。
+      name: 'R38-02c · 备份把用户表一起带上（跨实例搬运把「谁能登录」也搬走）',
+      file: 'server/backup.js',
+      anchor: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },\n  };',
+      replacement: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },\n    users: clone(cfg.users || []),\n  };',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // WebDAV 口令在 `config.enc` 里是**字段级密封**（绑定本实例的 `data/secret.key`）。
+      // 原样把 `passwordSealed` 搬走，在目标实例上是一段永远解不开的密文 ——
+      // 症状是「导入成功、WebDAV 却登录不上」，且界面上看不出任何异常。
+      name: 'R38-02k · 备份里带上 passwordSealed（跨实例永远解不开）',
+      file: 'server/backup.js',
+      anchor: "      password: String(full.password || ''),\n    };",
+      replacement: "      password: String(full.password || ''),\n      passwordSealed: String(a.passwordSealed || 'sealed'),\n    };",
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 准入判据要求「备份范围内每一项都算数」。漏掉任何一项，都会让「已经配过该项
+      // 的实例」仍然显示可导入 —— 而那一次点击是**不可撤销**的整批覆盖。
+      name: 'R38-02l · 准入判据漏掉「登陆验证」一项（配过却仍允许导入线上实例）',
+      file: 'server/backup.js',
+      anchor: '  if (cap.enabled || cap.siteKey || cap.secretKey) return false;\n',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 另一侧的失效：分区清单里列了、实际没写回。界面上「导入成功 7 项」，
+      // 而上传排除一个字都没变 —— 没有任何运行期症状。
+      name: 'R38-02m · 导入漏还原「上传排除」分区（清单列了、实际没写回）',
+      file: 'server/backup.js',
+      anchor: '  configStore.save({\n    uploadExcludes: {\n      dsStore: boolOf(ue.dsStore),\n      thumbsDb: boolOf(ue.thumbsDb),\n      gitignore: boolOf(ue.gitignore),\n    },\n  });',
+      replacement: '  void ue; // 变异：整个分区不写回',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 导入若图省事循环调 `addRule()`，会丢掉 `id` 与 `enabled` ——
+      // 「备份时停用的屏蔽规则，还原后变成启用」，用户只会觉得「导入把配置弄坏了」。
+      name: 'R38-02o · 整批替换丢掉规则的 id / 停用状态（停用的屏蔽规则悄悄生效）',
+      file: 'server/ip-guard.js',
+      anchor: '  guard.rules = (Array.isArray(rules) ? rules : []).map((r) => {\n    const o = normalizeRule(r);\n    if (!o.id) o.id = newId();\n    return o;\n  });',
+      replacement: '  guard.rules = (Array.isArray(rules) ? rules : []).map((r) => (\n    Object.assign({}, normalizeRule(r), { id: newId(), enabled: true })\n  ));',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 实时码里含 API Key / 支付凭证 / WebDAV 口令的**明文**。
+      name: 'R38-02q · /backup/code 漏挂 requireAdmin（普通用户可读走全部密钥明文）',
+      file: 'server/routes/backup.js',
+      anchor: "router.get('/backup/code', requireAdmin, (req, res) => {",
+      replacement: "router.get('/backup/code', (req, res) => {",
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求原话：「导出该代码需进行权限验证（输入密码）」。拿掉这一步，任何持有
+      // 有效会话的人都能把整份配置（含全部密钥明文）导出走。
+      name: 'R38-02r · 导出不再校验账户口令（有会话就能导出全部密钥）',
+      file: 'server/routes/backup.js',
+      anchor: '  await assertAccountPassword(req, b.password);',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 顺序本身就是安全属性：先解密再判准入，会让「在已配置实例上反复试备份密码」
+      // 成为一条可利用的**口令爆破信道**（响应差异可区分密码对不对）。
+      name: 'R38-02s · 导入准入判据被摘掉（已配置实例上可反复试密码）',
+      file: 'server/routes/backup.js',
+      anchor: '  if (!backup.canImport()) {',
+      replacement: '  if (false) {',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 准入判据被写成定值（「现算」的反面）—— 用户刚配好一个密钥，页面仍然显示
+      // 「可以导入」，而那次点击会把线上配置整批覆盖掉。
+      //
+      // ⚠️ 这条对照**首次登记时 fail=0**，两次都错在同一个思路上：先去改 `backup.canImport()`
+      // 的**本体**（加一个 module 级缓存），而护栏在 R38-02l 里已经先调过一次该函数、
+      // 之后实例一直是「已配置」状态，缓存值恰好与期望值相同，于是变异测不出。
+      // 打在**接口返回值**上才真正落在这条用例的判据上 —— 登记前实跑一遍的价值就在这里。
+      name: 'R38-02t · 准入判据被写成定值（已配置实例仍显示「可以导入」）',
+      file: 'server/routes/backup.js',
+      anchor: '    canImport: backup.canImport(),',
+      replacement: '    canImport: true,',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「仅管理员可见」是这道功能的**第一层**保护：实时码里就是密钥明文。
+      name: 'R38-02w · 备份卡片未纳入 ADMIN_ONLY_CARDS（普通用户也能读到实时码）',
+      file: 'public/js/syssettings.js',
+      anchor: "'sysset-payment-card', 'sysset-backup-card'];",
+      replacement: "'sysset-payment-card'];",
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 需求把「所有用户」排除在备份之外，于是导入**只覆盖备份范围里的顶层键**。
+      // 顺手把载荷里的用户表也写进去（载荷里没有就写成空数组），后果不是「某个设置
+      // 没还原」，而是把系统导成**零管理员** —— 管理页打不开、也没有自助恢复通道。
+      name: 'R38-02x · 导入顺手写了用户表（把系统导成零管理员 → 永久锁死）',
+      file: 'server/backup.js',
+      anchor: '  configStore.flush();\n  return summarize(collect());',
+      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  configStore.flush();\n  return summarize(collect());',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

@@ -257,6 +257,13 @@ export const API = {
   // 设置限速本身走各实体既有的 PUT（见 speedlimit.js 的 SAVE_BY_SCOPE），不另开写接口。
   throttleCeiling: (p) => request('GET', '/api/throttle/ceiling?' + qs(p)),
 
+  // R38：配置备份（四条接口全部仅管理员 —— 实时码含 API Key / 支付凭证 / WebDAV 口令明文）
+  backupStatus: () => request('GET', '/api/backup/status'),
+  backupCode: () => request('GET', '/api/backup/code'),
+  // 导出要**两把**密码：账户口令（权限验证）+ 独立的备份密码（保护导出码）
+  backupExport: (password, backupPassword) => request('POST', '/api/backup/export', { password, backupPassword }),
+  backupImport: (code, backupPassword) => request('POST', '/api/backup/import', { code, backupPassword }),
+
   list: (p) => request('GET', '/api/fs/list?' + qs(p)),
   // opt.signal：供调用方取消在途搜索（服务端据此停止后续翻页，不再白扫）
   search: (p, opt) => request('GET', '/api/fs/search?' + qs(p), undefined, opt),

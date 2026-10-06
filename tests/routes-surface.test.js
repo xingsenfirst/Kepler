@@ -69,6 +69,10 @@ const EXPECTED = [
   // R37：查「上层已经设了多小的下载限速」——四个设置入口的提示文案用它。
   // 不挂 requireAdmin（普通用户在「创建分享链接」时也要能看到自己的上限）。
   'GET /throttle/ceiling',
+  // R38：配置备份。四条全部挂 requireAdmin —— 实时码里含 API Key / 支付凭证 /
+  // WebDAV 口令的**明文**（它们本就在 config.enc 里，只是被整文件加密保护）。
+  'GET /backup/status', 'GET /backup/code',
+  'POST /backup/export', 'POST /backup/import',
   'GET /enc/settings', 'PUT /enc/settings', 'POST /enc/unlock',
   // R8-14：只回 `{ passwordSet }`（不含 mode / 魔数）的只读端点，普通用户也可访问
   // —— 前端 `ensureUnlocked()` 靠它判断「要不要弹查看密码框」。见下方 selfServe。

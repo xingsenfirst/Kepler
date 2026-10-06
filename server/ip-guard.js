@@ -364,6 +364,35 @@ function isPrivateIPv6(ip) {
 
 let guard = null; // { rules: [], updatedAt }
 
+/**
+ * 单条规则的归一化 —— **唯一实现点**（读盘 / 导入共用）。
+ *
+ * 三件事缺一不可，且历史上每一条都各自踩过坑：
+ *  ① `bucketId` → `bucketIds` 数组迁移（旧版单桶字段）；
+ *  ② `kind` / `speedLimit` 显式补默认值（R37：历史规则全是「拦截」，缺省即 block。
+ *     靠 `undefined !== 'speed'` 隐式成立很脆 —— 有人写成 `r.kind === 'block'`
+ *     就会把历史规则整批放行）；
+ *  ③ 预解析 `target` → `_parsed`（性能），**且判据不能只看 `text`**：
+ *     R28-01 的坏缓存（IPv6 的 `bytes` 被 JSON 退化成 `{type:'Buffer',data:[…]}`）
+ *     其 `text` 与 target 一字不差，旧判据会一直沿用坏缓存 ⇒ 规则静默失效。
+ */
+function normalizeRule(r) {
+  const o = Object.assign({}, r);
+  if (!Array.isArray(o.bucketIds)) {
+    const legacy = String(o.bucketId || '').trim();
+    o.bucketIds = legacy ? [legacy] : [];
+  }
+  o.bucketIds = o.bucketIds.map((x) => String(x || '').trim()).filter(Boolean);
+  delete o.bucketId;
+  o.kind = normalizeKind(o.kind);
+  o.speedLimit = coerceSpeedLimit(o.speedLimit);
+  const cached = o._parsed;
+  const stale = !cached || cached.text !== String(o.target || '').trim();
+  const corrupt = Boolean(cached && cached.v6 && !Buffer.isBuffer(cached.bytes));
+  if (stale || corrupt) o._parsed = parseTarget(o.target);
+  return o;
+}
+
 function load() {
   if (guard) return guard;
   // S4：加密存储（兼容历史明文文件）
@@ -376,44 +405,13 @@ function load() {
   } catch (e) {
     console.error('[ip-guard] IP 屏蔽规则文件损坏，已降级为空规则并锁定写入：', e.message);
   }
-  if (j && typeof j === 'object') {
-    guard = {
-      rules: Array.isArray(j.rules) ? j.rules : [],
-      updatedAt: j.updatedAt || '',
-    };
-  } else {
-    guard = { rules: [], updatedAt: '' };
-  }
-  // 迁移历史单桶字段 bucketId → bucketIds 数组（幂等）
-  for (const r of guard.rules) {
-    if (!Array.isArray(r.bucketIds)) {
-      const legacy = String(r.bucketId || '').trim();
-      r.bucketIds = legacy ? [legacy] : [];
-    }
-    r.bucketIds = r.bucketIds.map((x) => String(x || '').trim()).filter(Boolean);
-    delete r.bucketId;
-  }
-  // R37：历史规则没有 kind 字段 —— 它们**全部**是「拦截」规则，缺省即 block。
-  // 显式补上而不是靠 `undefined !== 'speed'` 隐式成立：隐式判据一旦有人写成
-  // `r.kind === 'block'` 就会把历史规则整批放行（本项目反复出现的一类失效）。
-  for (const r of guard.rules) {
-    r.kind = normalizeKind(r.kind);
-    r.speedLimit = coerceSpeedLimit(r.speedLimit);
-  }
-  // 预解析每条规则的 target → _parsed，避免每次 evaluate 都重复 parseTarget（性能 #1）
-  //
-  // R28-01：判据不能只看 `text`。历史落盘里可能带着**已经被 JSON 破坏**的缓存
-  // （IPv6 的 `bytes` 由 Buffer 退化为 `{type:'Buffer',data:[…]}`），而它的 `text`
-  // 与 target 一字不差 ⇒ 旧判据会认为「缓存可用」并一直用它，规则从此静默失效。
-  // 这里补一条类型校验：IPv6 缓存的 `bytes` 必须仍是 Buffer，否则重解析。
-  for (const r of guard.rules) {
-    const cached = r._parsed;
-    const stale = !cached || cached.text !== String(r.target || '').trim();
-    const corrupt = Boolean(cached && cached.v6 && !Buffer.isBuffer(cached.bytes));
-    if (stale || corrupt) {
-      r._parsed = parseTarget(r.target);
-    }
-  }
+  guard = (j && typeof j === 'object')
+    ? { rules: Array.isArray(j.rules) ? j.rules : [], updatedAt: j.updatedAt || '' }
+    : { rules: [], updatedAt: '' };
+  // 归一化走**唯一实现点** `normalizeRule()`：读盘与「配置备份导入」
+  // （`replaceAllRules`）必须得到完全一致的规则对象，否则导入进来的规则会缺
+  // kind / bucketIds 迁移或 _parsed 预解析，表现为「导入成功但规则不生效」。
+  guard = { rules: guard.rules.map(normalizeRule), updatedAt: guard.updatedAt };
   // 迁移历史全局 chinaMode → 按桶 blockOverseasIP（幂等；仅执行一次）
   // 语义等价：原先全局生效，迁移后等价于「当时存在的每个桶都开启」
   if (j && typeof j === 'object' && j.chinaMode !== undefined) {
@@ -457,6 +455,28 @@ function persist() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   guard.updatedAt = new Date().toISOString();
   secureStore.writeJson(GUARD_FILE, persistView(guard));
+}
+
+/**
+ * R38：**整批替换**规则集 —— 「配置备份」导入的唯一落点。
+ *
+ * 为什么不让导入方循环调 `addRule()`：那样会丢掉每条规则的 `id` / `enabled` / `hits`，
+ * 于是「备份时停用的规则，还原后变成启用」—— 一条被刻意停用的屏蔽规则悄悄生效，
+ * 用户只会觉得「导入把配置弄坏了」。这里保留原记录（缺 id 才补一个），
+ * 归一化复用 `normalizeRule()`，与读盘路径**同一口径**。
+ *
+ * 说明：导入是**覆盖**语义（需求原话「导入配置后，原有设置项将被直接覆盖」），
+ * 因此这里不做合并；调用方（`server/backup.js`）负责保证只在「全新实例」窗口内被调用。
+ */
+function replaceAllRules(rules) {
+  load();
+  guard.rules = (Array.isArray(rules) ? rules : []).map((r) => {
+    const o = normalizeRule(r);
+    if (!o.id) o.id = newId();
+    return o;
+  });
+  persist();
+  return listRules();
 }
 
 /**
@@ -1008,6 +1028,8 @@ module.exports = {
   // R28-06：拒绝原因 → 文案的唯一实现点（WebDAV 分支也用它，避免两处文案再次分叉）
   blockTip,
   listRules, addRule, updateRule, removeRule, setRuleEnabled, setBucketOverseas, removeRulesForBucket,
+  // R38：整批替换（配置备份导入）+ 单条归一化的唯一实现点
+  replaceAllRules, normalizeRule,
   invalidateOverseasCache,
   // R37：IP 地址限速（kind='speed' 的规则）—— 只参与限速判定，绝不参与拦截
   speedLimitFor, RULE_KINDS, normalizeKind,

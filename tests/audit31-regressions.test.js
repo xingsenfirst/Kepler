@@ -169,6 +169,9 @@ function makeSandbox({ withSyssettings = false } = {}) {
     // R37：syssettings.js 又 import 了 './speedlimit.js'（「限速」列 + 限速对话框）——
     // 同一条链接期规则；必须拷**真实**的那一份（它只从 util.js 取三个原语）。
     fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
+    // R38：syssettings.js 又 import 了 './backupcfg.js'（「备份配置」卡片）—— 同一条链接期
+    // 规则。同样必须拷**真实**的那一份（它只从 api.js 取 API、从 util.js 取 toast / openModal）。
+    fs.copyFileSync(JS('backupcfg.js'), path.join(dir, 'backupcfg.js'));
   } else {
     w('payment-logos.js', PAYLOGOS_STUB);
     fs.copyFileSync(JS('paysettings.js'), path.join(dir, 'paysettings.js'));

@@ -520,11 +520,58 @@
               </div>
             </div>
 
+            <!-- R38：备份配置（仅管理员）。必须位于「关于」之上，而「关于」仍留在设置页最末。 -->
+            <div class="dash-card wide sysset-card" id="sysset-backup-card">
+              <h3 class="sysset-h3"><span class="sysset-tag backup">备份</span>备份配置
+                <button id="btn-backup-refresh" class="mini-btn sysset-action" type="button">刷新代码</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：下方这串长代码就是当前配置的备份。它<b>随设置变化自动更新</b> ——
+                改了任何一项备份范围内的设置，代码立刻跟着变；没有变，说明这次改动不在备份范围内。
+                <b>导出</b>时需要先验证你的<b>账户密码</b>（确认是你本人在导出），再为这份备份单独设一个
+                <b>备份密码</b>；导出得到的是一串加密后的新代码 —— 只有<b>它</b>能拿到别的实例上还原，
+                导入时必须输入同一个备份密码。<br>
+                <b>备份范围（共 8 项）</b>：API Key 管理、负载均衡、上传排除、登陆验证、WebDAV 服务、
+                支付设置、存储桶管理、IP 地址管理。
+              </div>
+              <div class="backup-code-wrap">
+                <textarea id="backup-code" class="backup-code" readonly spellcheck="false"
+                  aria-label="配置备份代码" placeholder="正在生成…"></textarea>
+                <div class="backup-meta">
+                  <span id="backup-meta-text" class="backup-meta-text"></span>
+                </div>
+                <div class="card-note backup-live-note">上方是<b>实时码</b>，只用于核对「它有没有跟着设置一起变」。
+                  真正要保存到别处请用下方<b>复制备份码</b> / <b>导出为 JSON</b> —— 那两步会先验证你的账户密码、
+                  再让你设一个<b>备份密码</b>，得到的是<b>加密后的导出码</b>，也只有它能被导入。</div>
+              </div>
+              <div class="backup-actions">
+                <button id="btn-backup-copy" class="mini-btn" type="button">复制备份码…</button>
+                <button id="btn-backup-export" class="mini-btn primary" type="button">导出为 JSON…</button>
+                <button id="btn-backup-import" class="mini-btn" type="button">导入配置…</button>
+                <span id="backup-import-hint" class="backup-import-hint"></span>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li><b>为什么不含分享链接与订单</b>：它们属于运行时数据，且体量不确定。全量备份要经 JSON 请求体上传，
+                    而服务端 <code>express.json</code> 的请求体上限是 <b>2MB</b> —— 链接与订单一多，
+                    备份请求会先被拒掉，表现为「备份莫名其妙失败」，比不备份更糟。因此它们不在备份范围内。</li>
+                  <li><b>为什么不含「文件加密选项」与用户列表</b>：<code>secret.key</code>（配置主密钥）、
+                    <code>enc.key</code>（文件加密主密钥）以及 <code>enc-meta.json</code> 这些密钥文件
+                    <b>无法备份，也绝不能备份</b> —— 把它们随备份一起流传出去，等于把整份配置的密文、
+                    乃至云端全部已加密文件一并交出去。也正因为密钥文件不在备份里，备份「文件加密选项」毫无意义
+                    （还原了开关却没有 <code>enc.key</code>，只会让系统以为文件是加密的、实际一份也解不开）；
+                    用户列表同理，且账户与口令哈希属于本实例的身份，不该被搬运。</li>
+                  <li><b>导入是覆盖，不可撤销</b>：导入配置后，<b>原有设置项将被直接覆盖、全部丢失</b>。
+                    正因如此，导入<b>仅在全新部署、尚未配置任何项目的实例上开放</b>；一旦这台实例配过
+                    密钥、桶、WebDAV、登录验证、支付或 IP 规则中的任意一项，导入就会被服务端拒绝。</li>
+                </ul>
+              </div>
+            </div>
+
             <!-- 关于（该卡片永远置于“设置页”的最后，不能有任何功能卡片在此之后） -->
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.6.0</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.6.1</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

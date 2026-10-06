@@ -36,7 +36,7 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 27, `public/js 模块数应为 27，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  assertEqual(MODULES.length, 28, `public/js 模块数应为 28，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
@@ -45,6 +45,7 @@ test('前端模块数量符合预期（未意外增删）', () => {
   assert(MODULES.includes('listdialog.js'), '应包含 listdialog.js（四张列表卡片共用的「显示全部」对话框骨架，R36 独立成模块）');
   assert(MODULES.includes('speedlimit.js'), '应包含 speedlimit.js（下载限速对话框与 MB/s 换算，R37 独立成模块）');
   assert(MODULES.includes('ipmgr.js'), '应包含 ipmgr.js（「IP 地址管理」页，R37 从 bucketmgr 迁出）');
+  assert(MODULES.includes('backupcfg.js'), '应包含 backupcfg.js（「备份配置」卡片：实时码 + 导出 / 导入，R38）');
 });
 
 for (const f of MODULES) {

@@ -376,6 +376,8 @@ function makeFeSandbox(realFiles) {
   // 同样必须是**真实**的那一份（它只从 util.js 取 openModal / escapeHtml / toast 三个原语，
   // 于是真实的对话框逻辑能跑在桩化的弹窗原语上）。
   if (!realFiles.includes('speedlimit.js')) fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
+  // R38：syssettings.js 还 import 了 './backupcfg.js'（「备份配置」卡片），同一条链接期规则。
+  if (!realFiles.includes('backupcfg.js')) fs.copyFileSync(JS('backupcfg.js'), path.join(dir, 'backupcfg.js'));
   return dir;
 }
 

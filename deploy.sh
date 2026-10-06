@@ -1649,6 +1649,12 @@ gen_env_file() {
 # 修改后执行：systemctl restart ${SERVICE_NAME}（docker 方式：docker compose restart）
 NODE_ENV=production
 HOST=0.0.0.0
+# R38：「本站对外域名」—— 应用据此回答「这个请求是不是本站」（Windows Hello 的 rpId
+# 白名单、HTTPS 跳转目标）。必须是下面 nginx server_name 用的那个域名本身。
+# 为什么不靠 HOST：HOST 是**监听地址**，部署时必须写 0.0.0.0 才能被外部访问，而
+# 0.0.0.0 永远不可能出现在请求的 Host 头里 —— 只认它会把「用真实域名访问本站」
+# 判成「访问了外站」，Windows Hello 直接 403。
+SITE_DOMAIN=${DOMAIN}
 PORT=${port}
 HTTPS_PORT=3443
 WEBDAV_PORT=${WEBDAV_PORT}

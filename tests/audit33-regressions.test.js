@@ -644,6 +644,8 @@ function makeFeSandbox(realFiles) {
   // R37：syssettings.js 现在 import './speedlimit.js'（「限速」列 + 限速对话框）——
   // 同一条链接期规则，缺文件则本文件所有 import syssettings 的用例一起红。
   fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
+  // R38：syssettings.js 又 import 了 './backupcfg.js'（「备份配置」卡片）—— 同一条链接期规则。
+  fs.copyFileSync(JS('backupcfg.js'), path.join(dir, 'backupcfg.js'));
   return dir;
 }
 

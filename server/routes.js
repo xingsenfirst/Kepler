@@ -15,6 +15,7 @@
  *   routes/buckets.js   存储桶管理 / 容量统计 / 清空销毁 / ACL 检查
  *   routes/ipguard.js   IP 访问屏蔽（全局 + 桶级）
  *   routes/throttle.js  下载限速的「上层下限」查询（R37，设置入口的提示文案用）
+ *   routes/backup.js    配置备份（R38，实时码 / 导出 / 导入，全部仅管理员）
  *   routes/enc.js       文件加密设置 / 上传排除设置
  *   routes/webdav.js    WebDAV 服务设置
  *   routes/links.js     分享链接管理
@@ -46,6 +47,8 @@ router.use(require('./routes/ipguard'));
 // 它不注册任何参数路由，与前后模块不存在路径歧义。
 // 不挂 requireAdmin：普通用户在「创建分享链接」时要能看到自己被上层限到多少。
 router.use(require('./routes/throttle'));
+// R38：配置备份（4 条，全部 requireAdmin —— 实时导出码含密钥明文，见 routes/backup.js）
+router.use(require('./routes/backup'));
 router.use(require('./routes/enc'));
 router.use(require('./routes/webdav'));
 router.use(require('./routes/links'));

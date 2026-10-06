@@ -328,10 +328,18 @@ function webauthnContext(req) {
    * 为什么放行回环：`Host: 127.0.0.1` 只可能来自访问本机的浏览器（远端攻击者无法让
    * 受害者的浏览器把远端站点写成回环地址），且 WebAuthn 依赖「回环属安全上下文」这
    * 一例外；本机（非部署）模式因此完全不受影响。
+   *
+   * R38-01：这条 fail-closed 判据本身没错，**错在它的允许集此前是空的** —— `deploy.sh`
+   * 生成的运行环境写的是 `HOST=0.0.0.0`（通配绑定地址，永远不可能出现在 Host 头里），
+   * 真实域名只进了 nginx 的 `server_name`，应用无从得知。于是**用真实域名访问本站**也会
+   * 走到下面这个 403：用户看到「不是本站域名」，可它明明就是本站。修法不是放宽本判据
+   * （那会撤掉 R24-02 的防钓鱼），而是给 `isOwnSiteHost()` 补上权威来源
+   * `SITE_DOMAIN`（部署脚本写入）。文案同步补上可执行动作。
    */
   if (security.IS_DEPLOY && !security.isOwnSiteHost(rpId, []) && !isLoopbackHostname(rpId)) {
     const e = new Error('当前访问地址不是本站域名，Windows Hello 仅能在本站域名下使用；'
-      + '请改用配置的站点域名访问，或用密码登录');
+      + '请改用配置的站点域名访问（docker / systemd 部署请确认 SITE_DOMAIN 或 HOST '
+      + '与浏览器地址栏完全一致），或用密码登录');
     e.status = 403;
     e.webauthnUntrusted = true;
     throw e;

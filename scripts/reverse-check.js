@@ -1366,10 +1366,15 @@ const CASES = [
        * 删掉重装前的完整性预检后，安装目录里若躺着一个坏掉的 deploy.sh
        * （最典型：curl 不带 -f 把 14 字节的「404: Not Found」存成了它），
        * exec 出去就是一句「404: line 1: 404:: command not found」—— 用户完全无从下手。
+       *
+       * ⚠️ R39 把这段内联判据（shebang + `bash -n`）收敛进了唯一实现点 `script_is_sane()`
+       * （与「自我交接」共用同一份），**旧 anchor 随之失效**（本条曾在全量里报「未命中」）。
+       * 按纪律「重构挪旧锚点位置时连旧锚点一起迁移」：锚点改指 `reinstall_now` 里那次
+       * **委托调用**，变异意图不变 —— 撤掉预检，坏脚本照样被直接 exec。
        */
       name: 'D1-06 · 删掉重装前的脚本完整性预检（坏脚本被直接 exec）',
       file: 'deploy.sh',
-      anchor: '  if ! head -n1 "$target" | grep -qE \'^#!.*(bash|sh)\\b\' || ! bash -n "$target" 2>/dev/null; then\n'
+      anchor: '  if ! script_is_sane "$target"; then\n'
         + '    die "安装目录内的部署脚本不完整或已损坏：${target}（无法重装，请重新执行一键部署）"\n'
         + '  fi',
       replacement: '  : # 完整性预检已被反向对照移除',
@@ -4512,6 +4517,115 @@ const CASES = [
       anchor: '  configStore.flush();\n  return summarize(collect());',
       replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  configStore.flush();\n  return summarize(collect());',
       testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ======== R39-01 · 部署脚本与应用的版本对齐（「修完重新部署仍复现」） ======== */
+
+    {
+      // 用户报的「重新部署后故障依旧」的最小复现：判据退化成「永不交接」，
+      // 于是旧脚本继续生成环境变量、应用却已是新代码 —— 新文案 + 旧环境。
+      name: 'R39-01a · 自我交接判据退化成「永不交接」（新代码 + 旧环境原样复现）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$th" == "$SELF_SCRIPT_HASH" ]]; then return 1; fi\n  return 0',
+      replacement: '  if [[ "$th" == "$SELF_SCRIPT_HASH" ]]; then return 1; fi\n  return 1',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 反向的一半：内容一致也交接 —— 每次正常部署都白跑一整趟。
+      name: 'R39-01b · 判据退化成「永远交接」（同版本也白跑一趟）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$th" == "$SELF_SCRIPT_HASH" ]]; then return 1; fi',
+      replacement: '  if [[ 1 == 0 ]]; then return 1; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 摘掉防环兜底 → 交出去的脚本会再交接回来，部署成了无限递归。
+      name: 'R39-01c · 摘掉防环标记（自我交接变成无限递归）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "${KEPLER_SELF_HANDOFF:-0}" == "1" ]]; then return 1; fi',
+      replacement: '  if [[ "${KEPLER_SELF_HANDOFF:-0}" == "__never__" ]]; then return 1; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 脚本走管道（curl | bash）时无法自证版本，取向**必须**是「交给安装目录里那份」。
+      // 反过来（不交接）就等于「管道部署永远拿不到新环境变量」，坑照旧。
+      name: 'R39-01d · 自证不了版本时改为「不交接」（管道部署仍用旧环境变量）',
+      file: 'deploy.sh',
+      anchor: '  if [[ -z "${SELF_SCRIPT_HASH:-}" ]]; then return 0; fi',
+      replacement: '  if [[ -z "${SELF_SCRIPT_HASH:-}" ]]; then return 1; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // ⭐ 本轮根因的正面对照：主流程不再交接 → 后面每一步都由上一版逻辑跑完，
+      // 环境变量由旧 gen_env_file 生成。位置断言（必须在 gen_env_file 之前）即变红。
+      name: 'R39-01e · 主流程不再做版本交接（环境变量仍由上一版逻辑生成）',
+      file: 'deploy.sh',
+      anchor: '\n  handoff_to_installed_script\n',
+      replacement: '\n',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // exec 不触发 EXIT trap：不摘旧 trap，新进程一启动就撞上自己留下的锁，
+      // 直接判「另一个部署进程正在运行」—— 交接等于没发生。
+      name: 'R39-01f · exec 前不摘 EXIT trap（新进程撞上自己的锁直接退出）',
+      file: 'deploy.sh',
+      anchor: '  trap - EXIT\n  if ((${#ORIGINAL_ARGV[@]} > 0)); then',
+      replacement: '  if ((${#ORIGINAL_ARGV[@]} > 0)); then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 不带域名 → 第二趟会再问一次域名；非交互场景（管道 / CI）直接判失败。
+      name: 'R39-01g · 交接时不带已解析的域名（第二趟重复提问 / 非交互直接失败）',
+      file: 'deploy.sh',
+      anchor: 'KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      replacement: 'KEPLER_SELF_HANDOFF=1 \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 不带锁 → 与 R39-01f 同后果的另一条实现路径：锁没交接，新进程自锁。
+      name: 'R39-01h · 交接时不带单实例锁（新进程判「另一个部署进程正在运行」）',
+      file: 'deploy.sh',
+      anchor: 'KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      replacement: 'DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // exec 前不做完整性预检 → 会把安装目录里被污染的文件（例如把下载到的
+      // `404: Not Found` 响应体存成的「脚本」）当成脚本执行，以一句无从下手的报错中断。
+      name: 'R39-01i · 交接前不做脚本完整性预检（把污染文件当脚本执行）',
+      file: 'deploy.sh',
+      anchor: '  if ! script_is_sane "$target"; then\n    warn "安装目录里的部署脚本疑似损坏',
+      replacement: '  if false; then\n    warn "安装目录里的部署脚本疑似损坏',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 第二趟以安装目录自身为源码目录；若不短路，就会对它做
+      // `tar -cf - . | tar -xf - -C 自己` —— 一边读一边覆盖自己。
+      name: 'R39-01j · 取消「源码目录==安装目录」短路（对自己做 tar 自解压）',
+      file: 'deploy.sh',
+      anchor: '  if [[ -n "$src_real" && "$src_real" == "$dst_real" ]]; then',
+      replacement: '  if false; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 启动瞬间不采样指纹 → 判据永远认为「自己就是最新那份」（运行中被覆盖后再读自己，
+      // 读到的已经是新内容），于是这个坑重新变成不可发现的。
+      name: 'R39-01k · 启动时不采样自身指纹（判据永远认为「自己是最新」）',
+      file: 'deploy.sh',
+      anchor: 'SELF_SCRIPT_HASH="$(script_content_hash "$SELF_SCRIPT_FILE")"',
+      replacement: 'SELF_SCRIPT_HASH=""',
+      testFile: 'deploy-script.test.js',
       minFail: 1,
     },
   ];

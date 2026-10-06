@@ -25,6 +25,17 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HTTPS_PORT=3443
 
+# ---------------------------------------------------------------------------
+# 「本站对外域名」`SITE_DOMAIN` —— 刻意**不**在这里烘进镜像，必须由运行期提供：
+#     docker run -e SITE_DOMAIN=cos.example.com …
+#     或 docker compose 的 env_file（deploy.sh 生成的 compose 已含 .env）
+# 它是 Windows Hello 的 rpId 白名单（security.isOwnSiteHost）与 HTTPS 跳转目标的
+# 权威来源。容器里只设 HOST 是不够的：HOST 是**监听地址**，必须是 0.0.0.0 才能被
+# 外部访问，而 0.0.0.0 永远不会出现在请求的 Host 头里 —— 于是白名单为空，用真实
+# 域名访问本站反而被判成「外站」，启用 Windows Hello 会 403（R38-01 / R39-01）。
+# 本机 localhost 调试无需设置。
+# ---------------------------------------------------------------------------
+
 # 容器内需监听 0.0.0.0 才能被外部访问；此时务必配合反向代理或仅内网暴露
 RUN apk add --no-cache tini
 

@@ -1543,14 +1543,25 @@ prepare_source() {
 
 install_app() {
   mkdir -p "$INSTALL_DIR" "$DATA_DIR"
-  info "同步源码 → ${INSTALL_DIR}（排除 data/node_modules/.git，绝不覆盖数据目录）"
-  # tar 管道复制：每次覆盖同名文件，保持幂等（重复执行即升级）
-  if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
-    warn "tar 同步失败（可能是 busybox tar 不支持 --exclude），改用逐项复制…"
-    for item in package.json package-lock.json server public scripts Dockerfile; do
-      [[ -e "${SRC_DIR}/${item}" ]] || continue
-      run cp -a "${SRC_DIR}/${item}" "${INSTALL_DIR}/"
-    done
+  # R39：源码目录**就是**安装目录时不做同步 —— 自我交接后的第二趟正是这种形态
+  # （prepare_source 发现脚本自己在 INSTALL_DIR 里，就把它当成「本地源码目录」）。
+  # 此时 `tar -cf - . | tar -xf - -C 同一目录` 是一边读一边覆盖自己：徒劳无功，
+  # 而且理论上可能把正在读的文件截断。直接跳过。
+  local src_real="" dst_real=""
+  src_real="$(readlink -f "$SRC_DIR" 2>/dev/null || true)"
+  dst_real="$(readlink -f "$INSTALL_DIR" 2>/dev/null || true)"
+  if [[ -n "$src_real" && "$src_real" == "$dst_real" ]]; then
+    info "源码目录即安装目录，无需同步：${INSTALL_DIR}"
+  else
+    info "同步源码 → ${INSTALL_DIR}（排除 data/node_modules/.git，绝不覆盖数据目录）"
+    # tar 管道复制：每次覆盖同名文件，保持幂等（重复执行即升级）
+    if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
+      warn "tar 同步失败（可能是 busybox tar 不支持 --exclude），改用逐项复制…"
+      for item in package.json package-lock.json server public scripts Dockerfile; do
+        [[ -e "${SRC_DIR}/${item}" ]] || continue
+        run cp -a "${SRC_DIR}/${item}" "${INSTALL_DIR}/"
+      done
+    fi
   fi
   if [[ -f "${INSTALL_DIR}/package.json" ]]; then
     # 取不到就回落默认值，绝不因 grep/sed 的返回码让部署中断（pipefail 下会）
@@ -1605,6 +1616,108 @@ npm_install_deps() {
     die_with_hint "npm 依赖安装失败（已尝试 npm ci / npm install / 国内镜像）" "${HINTS[@]}"
   fi
   ok "依赖安装完成"
+}
+
+# ------------------------------------------------------------------------------
+# 5.1 版本对齐：把控制权交回刚同步进安装目录的脚本（R39）
+# ------------------------------------------------------------------------------
+# ⚠️ 这里修的是一个**只在升级时出现、且完全静默**的坑 —— 用户报的
+# 「按报告修完，重新部署后还是同样的错」就是它：
+#
+#   install_app() 把源码树整体同步进 INSTALL_DIR，**deploy.sh 自己也在源码树里**。
+#   而最常见的维护入口恰恰就是安装目录里的那一份：
+#     · 终端里敲 `kepler` → 菜单 1「重新安装」→ reinstall_now() 直接
+#       `exec bash ${INSTALL_DIR}/deploy.sh --reinstall`；
+#     · 或者当初跑的就是被同步进安装目录的那份脚本。
+#   于是**正在执行的这个文件会在运行中被新版本覆盖**。
+#
+#   bash 是边读边执行、函数定义在解析时就固化下来的：**已解析过的定义不会被替换**。
+#   因此后面每一步都还在跑上一版的逻辑，而应用已经是新代码：
+#     · 旧 gen_env_file() 不认识新版本才引入的环境变量 —— R38 的 `SITE_DOMAIN`
+#       就是这么丢的（部署报「成功」，Windows Hello 却仍然 403）；
+#     · 更糟的是旧逻辑的产物与磁盘上已有的 .env **逐字节相同**，
+#       write_file() 于是打印「配置未变化，跳过写入」—— 全程没有任何异常迹象。
+#   症状因此极具误导性：**报错文案是新的（应用已是新代码），失败原因却是旧的
+#   （环境变量还是旧脚本写的）**，顺着提示往应用侧查永远查不出来。
+#
+#   修法：同步完源码后，把控制权交回 ${INSTALL_DIR}/deploy.sh —— 它此刻与刚装进去
+#   的应用**同源同版本**，从它往下跑就能保证「环境变量 / 守护单元 / Nginx 配置」与
+#   「应用代码」始终处于同一版本。这不是自我重启的死循环：第二趟拿到的脚本内容与
+#   本脚本一致，判据立即返回「无需交接」；外层还有 KEPLER_SELF_HANDOFF 兜底防环。
+
+# 目标文件是否「确实是一份可用的 bash 脚本」。
+#   · shebang 检查 —— 拦「内容根本不是脚本」：下载到的 `404: Not Found` 响应体在
+#     bash 眼里是一条**语法合法**的命令（`bash -n` 会放行），只有首行不是 shebang 能识破；
+#   · bash -n —— 拦「是脚本但被截断/改坏」：首行 shebang 还在、后面引号没闭合。
+# 两者互补，缺一不可（与 reinstall_now 的预检同源）。
+script_is_sane() {
+  local f="$1"
+  if [[ -z "$f" || ! -f "$f" || ! -r "$f" ]]; then return 1; fi
+  if ! head -n1 "$f" | grep -qE '^#!.*(bash|sh)\b'; then return 1; fi
+  if ! bash -n "$f" 2>/dev/null; then return 1; fi
+  return 0
+}
+
+# 文件内容指纹 —— **仅**用于回答「这两份脚本是不是同一个版本」，不参与任何安全判据。
+# 取不到（命令缺失 / 不可读 / 不是普通文件）一律回空串，调用方按「无法自证」处理。
+script_content_hash() {
+  local f="$1" out=""
+  if [[ -z "$f" || ! -f "$f" || ! -r "$f" ]]; then printf '%s' ""; return 0; fi
+  if have sha256sum; then
+    out="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+  elif have md5sum; then
+    out="$(md5sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  # coreutils 遇到「文件名里有反斜杠」会给整行**加一个转义前缀**（例如 git-bash 的
+  # mktemp 返回 `C:\Users\...`，`$1` 就成了 `\e8b2…`）。指纹只可能是十六进制，
+  # 因此把非十六进制字符一律剥掉 —— 免得同一份内容仅因为路径写法不同而算出两个指纹，
+  # 把「无需交接」误判成「需要交接」。
+  out="${out//[^0-9a-fA-F]/}"
+  printf '%s' "$out"
+}
+
+# 是否需要交回安装目录里的脚本。**纯判据**：不改状态、不 exec ——
+# 拆出来是为了能在测试里直接构造「两处脚本相同 / 不同」来验证判据本身。
+handoff_needed() {
+  local target="${INSTALL_DIR}/deploy.sh"
+  # 已交接过一次 → 永不二次交接（防环兜底：万一判据被环境怪癖顶成恒真）
+  if [[ "${KEPLER_SELF_HANDOFF:-0}" == "1" ]]; then return 1; fi
+  if [[ -z "${INSTALL_DIR:-}" ]]; then return 1; fi
+  if [[ ! -f "$target" || ! -r "$target" ]]; then return 1; fi
+  local th=""
+  th="$(script_content_hash "$target")"
+  # 算不出目标指纹 → 不冒险交接（宁可照旧跑完，也不能 exec 一个来路不明的文件）
+  if [[ -z "$th" ]]; then return 1; fi
+  # 自证不了（脚本来自管道 / 非普通文件）→ 交给目标：它刚被 install_app 写成与应用同版本
+  if [[ -z "${SELF_SCRIPT_HASH:-}" ]]; then return 0; fi
+  # 自己就是它（同版本，例如从安装目录直接执行）→ 无需交接
+  if [[ "$th" == "$SELF_SCRIPT_HASH" ]]; then return 1; fi
+  return 0
+}
+
+handoff_to_installed_script() {
+  if ! handoff_needed; then return 0; fi
+  local target="${INSTALL_DIR}/deploy.sh"
+  if ! script_is_sane "$target"; then
+    warn "安装目录里的部署脚本疑似损坏：${target}（本次不做版本交接，以免部署中断）"
+    warn "  建议用最新脚本重跑：bash ${SCRIPT_NAME} --domain <域名>"
+    return 0
+  fi
+  info "本脚本与刚同步进安装目录的版本不一致 —— 交回最新脚本继续执行（环境变量与代码保持同版本）"
+  plain "    运行中的脚本：${SELF_SCRIPT_FILE:-<无法读取>}"
+  plain "    最新脚本    ：${target}"
+  # exec 不会触发 EXIT trap，所以显式把单实例锁交接给新进程（与 reinstall_now 同法），
+  # 否则新进程一启动就会撞上自己留下的锁、直接判「另一个部署进程正在运行」。
+  # 已解析好的域名也随环境带过去：否则第二趟会在终端里**再问一次**域名
+  # （collect_config 只在 $DOMAIN 为空时提问），非交互场景下更是直接判失败。
+  # 原始命令行一并原样转发（ORIGINAL_ARGV 在参数解析前就存好了），保住 --skip-* 等开关。
+  trap - EXIT
+  if ((${#ORIGINAL_ARGV[@]} > 0)); then
+    exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+      bash "$target" "${ORIGINAL_ARGV[@]}"
+  fi
+  exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+    bash "$target"
 }
 
 # ------------------------------------------------------------------------------
@@ -3490,11 +3603,8 @@ reinstall_now() {
   # 完整性预检：安装目录里的脚本可能已被覆盖成非脚本内容（最典型的是把下载到的
   # 「404: Not Found」响应体存成了它）。不预检就直接 exec，用户只会看到一句莫名其妙的
   # 「404: line 1: 404:: command not found」，完全无从下手。
-  #   · shebang 检查 —— 拦「内容不是脚本」：`404: Not Found` 在 bash 眼里是一条**语法合法**
-  #     的命令（bash -n 会放行），只有首行不是 shebang 才能识破；
-  #   · bash -n —— 拦「是脚本但被截断/改坏」：首行 shebang 还在、后面引号没闭合。
-  # 两者互补，缺一不可。
-  if ! head -n1 "$target" | grep -qE '^#!.*(bash|sh)\b' || ! bash -n "$target" 2>/dev/null; then
+  # 判据（shebang + bash -n）收敛在 script_is_sane()，与 5.1 的自我交接共用同一份。
+  if ! script_is_sane "$target"; then
     die "安装目录内的部署脚本不完整或已损坏：${target}（无法重装，请重新执行一键部署）"
   fi
   info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装。"
@@ -3800,6 +3910,12 @@ main() {
   step "拉取源码并安装依赖"
   prepare_source
   install_app
+  # R39：install_app 可能刚把**本脚本自己**换成了新版本（脚本就在源码树里）。
+  # 必须在往下走之前把控制权交回最新那份，否则「环境变量 / 守护单元 / Nginx 配置」
+  # 会由旧逻辑生成，而应用已是新代码 —— 这正是「修完重新部署仍复现」的成因。
+  # 位置刻意放在 npm_install_deps 之前：第二趟用安装目录自身当源码目录，
+  # 依赖只装一次，不产生重复工作。
+  handoff_to_installed_script
   npm_install_deps
 
   step "生成环境变量与运行用户"
@@ -3834,6 +3950,16 @@ main() {
 
   print_summary
 }
+
+# ------------------------------------------------------------------------------
+# 14.1 启动指纹（在 main 之前执行；供 5.1 的自我交接判断「我是不是最新那份」）
+# ------------------------------------------------------------------------------
+# ⚠️ 必须在**任何可能覆盖本文件的动作之前**采样，所以放在这里（main 调用点之前）：
+# install_app() 会把源码树同步进 INSTALL_DIR，若本次执行的就是
+# ${INSTALL_DIR}/deploy.sh，它就等于把自己换成新版本。等到那时再读自己，
+# 读到的已经是**新内容**，比对便永远成立 —— 那正是这个坑能一直藏着的原因。
+SELF_SCRIPT_FILE="${BASH_SOURCE[0]:-}"
+SELF_SCRIPT_HASH="$(script_content_hash "$SELF_SCRIPT_FILE")"
 
 # 被 source（而非直接执行）时只加载函数，便于静态检查与单元验证。
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

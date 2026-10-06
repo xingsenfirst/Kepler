@@ -609,11 +609,18 @@ done
 
 test('deploy.sh：重装前必须识破「安装目录里的脚本已损坏」（不得把它当脚本执行）', async () => {
   const body = codeOnly(fnBody(readDeploy(), 'reinstall_now'));
-  assert(/head -n1 "\$target" \| grep -qE/.test(body),
-    'reinstall_now 必须检查首行 shebang：「404: Not Found」在 bash 眼里是一条**语法合法**的命令（bash -n 会放行），只有 shebang 检查能识破它');
-  assert(/bash -n "\$target"/.test(body),
-    'reinstall_now 还必须用 bash -n 兜住另一种坏法：shebang 还在、内容被截断或改坏');
+  // R39：判据收敛到唯一实现点 script_is_sane()（与自我交接共用同一份），
+  // 因此这里断言「必须委托」+「该实现点本身两项检查都在」，而不是再把内联写法抄一遍。
+  assert(/script_is_sane "\$target"/.test(body),
+    'reinstall_now 的完整性预检必须委托给唯一实现点 script_is_sane()：'
+    + '两处各写一份 shebang / bash -n 判据，迟早漂移成两种行为（一处认得损坏脚本、另一处放行）');
   assert(/die /.test(body), '预检不通过必须给人话错误，而不是继续 exec 一个坏文件');
+
+  const helper = codeOnly(fnBody(readDeploy(), 'script_is_sane'));
+  assert(/head -n1 "\$f" \| grep -qE/.test(helper),
+    'script_is_sane 必须检查首行 shebang：「404: Not Found」在 bash 眼里是一条**语法合法**的命令（bash -n 会放行），只有 shebang 检查能识破它');
+  assert(/bash -n "\$f"/.test(helper),
+    'script_is_sane 还必须用 bash -n 兜住另一种坏法：shebang 还在、内容被截断或改坏');
 
   const { tmp } = tempDataDir('kepler-deploy-reinstall-');
   try {
@@ -1997,4 +2004,137 @@ printf 'BLANK_SUBJECT_LINE=%s\\n' "$(openssl x509 -in "$T/blank/fullchain.pem" -
     assert(/BLANK_SUBJ=1/.test(r.out),
       `subject/issuer 全空白的证书必须判**不可用** —— 这正是「脚本说签发成功、浏览器里证书字段全空白」的来源：${seen.slice(0, 800)}`);
   }
+});
+
+/* ==================================================================
+ * R39：部署脚本「版本对齐」护栏
+ *
+ * 背景（用户报的「按报告修完、重新部署仍复现」）：
+ *   install_app() 会把源码树整体同步进 INSTALL_DIR，而 **deploy.sh 自己也在源码树里**；
+ *   最常见的维护入口（kepler → 菜单 1 重新安装 → exec ${INSTALL_DIR}/deploy.sh）执行的
+ *   恰好就是这个文件。于是它在运行中被换成新版本，而 bash **不会重建已解析的函数定义** ——
+ *   后面每一步都还在跑旧逻辑，旧 gen_env_file() 于是写出一份**缺新环境变量**的 .env
+ *   （R38 的 SITE_DOMAIN 就是这么丢的），且产物与磁盘上已有的 .env 逐字节相同，
+ *   write_file() 还会打「配置未变化，跳过写入」。表现就是：**报错文案是新的（应用是
+ *   新代码），失败原因却是旧的（环境是旧脚本写的）** —— 顺着提示查应用侧永远查不出来。
+ *
+ * 因此这一组护栏同时钉两件事：
+ *   ① 判据本身（同内容不交接 / 不同内容必须交接 / 防环 / 自证不了时的取向）；
+ *   ② 交接的**位置**与**携带物**（必须在生成环境变量之前交接；必须带上锁、防环标记、
+ *      已解析的域名与原始命令行，否则第二趟要么死锁要么重新提问）。
+ * ================================================================== */
+
+test('deploy.sh：版本对齐判据（R39-01a）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+INSTALL_DIR="$T/opt"; mkdir -p "$INSTALL_DIR"
+cp ./deploy.sh "$INSTALL_DIR/deploy.sh"
+if handoff_needed; then echo "SAME=1"; else echo "SAME=0"; fi
+printf '%s\\n' '#!/usr/bin/env bash' 'echo old' > "$INSTALL_DIR/deploy.sh"
+if handoff_needed; then echo "STALE=1"; else echo "STALE=0"; fi
+if KEPLER_SELF_HANDOFF=1 handoff_needed; then echo "GUARD=1"; else echo "GUARD=0"; fi
+if SELF_SCRIPT_HASH="" handoff_needed; then echo "NOPROOF=1"; else echo "NOPROOF=0"; fi
+INSTALL_DIR="$T/empty"; mkdir -p "$INSTALL_DIR"
+if handoff_needed; then echo "MISSING=1"; else echo "MISSING=0"; fi
+`);
+  assert(r.code === 0, `探针应正常结束：${r.err}`);
+  const seen = `${r.out}${r.err}`.slice(0, 800);
+  assert(/SAME=0/.test(r.out),
+    `本脚本与安装目录里的脚本内容一致时必须**不**交接 —— 否则每次正常部署都白白多跑一趟：${seen}`);
+  assert(/STALE=1/.test(r.out),
+    `两份脚本内容不同时必须交接 —— 这正是「新代码 + 旧环境变量」的修复点（用户报的故障）：${seen}`);
+  assert(/GUARD=0/.test(r.out),
+    `KEPLER_SELF_HANDOFF=1 时必须不再交接 —— 否则自我交接会变成无限递归：${seen}`);
+  assert(/NOPROOF=1/.test(r.out),
+    `脚本来自管道、无法自证版本时应当交给安装目录里那一份（它刚被 install_app 写成与应用同版本）：${seen}`);
+  assert(/MISSING=0/.test(r.out), `安装目录里没有可交接的脚本时不得交接：${seen}`);
+});
+
+test('deploy.sh：自我交接确实交出控制权并原样带上配置（R39-01b）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+INSTALL_DIR="$T/opt"; mkdir -p "$INSTALL_DIR"
+cat > "$INSTALL_DIR/deploy.sh" <<'EOS'
+#!/usr/bin/env bash
+echo "HANDOFF_DONE=1"
+echo "SEEN_DOMAIN=\${DOMAIN:-}"
+echo "SEEN_LOCK=\${KEPLER_LOCK_HELD:-}"
+echo "SEEN_FLAG=\${KEPLER_SELF_HANDOFF:-}"
+echo "SEEN_ARGV=\$*"
+EOS
+DOMAIN="cos.example.com"
+SELF_SCRIPT_HASH="deadbeef"
+SELF_SCRIPT_FILE="/tmp/kepler-deploy.sh"
+ORIGINAL_ARGV=(--domain cos.example.com --skip-nginx)
+handoff_to_installed_script
+echo "NOT_HANDED_OFF=1"
+`);
+  assert(r.code === 0, `探针应正常结束：${r.err}`);
+  const seen = `${r.out}${r.err}`.slice(0, 800);
+  assert(/HANDOFF_DONE=1/.test(r.out), `两份脚本不一致时必须真的把控制权交出去：${seen}`);
+  assert(!/NOT_HANDED_OFF=1/.test(r.out),
+    `交接必须用 exec 完成 —— 不 exec 的话旧进程会接着往下跑，等于没修：${seen}`);
+  assert(/SEEN_DOMAIN=cos\.example\.com/.test(r.out),
+    `已解析的域名必须随环境带过去：否则第二趟会在终端里**再问一次**域名，非交互场景直接判失败：${seen}`);
+  assert(/SEEN_LOCK=\/var\/lock\/kepler-deploy\.lock/.test(r.out),
+    `单实例锁必须交接（KEPLER_LOCK_HELD）：exec 不触发 EXIT trap，不交接新进程会撞上自己的锁而直接退出：${seen}`);
+  assert(/SEEN_FLAG=1/.test(r.out), `必须带上防环标记 KEPLER_SELF_HANDOFF=1：${seen}`);
+  assert(/SEEN_ARGV=.*--skip-nginx/.test(r.out),
+    `原始命令行必须原样转发（否则 --skip-nginx 这类开关在第二趟静默失效）：${seen}`);
+});
+
+test('deploy.sh：版本对齐必须发生在生成环境变量之前（R39-01c）', () => {
+  const src = readDeploy();
+  const flow = codeOnly(src.slice(src.indexOf('\nmain() {')));
+  const iInstall = flow.indexOf('install_app');
+  const iHandoff = flow.indexOf('handoff_to_installed_script');
+  const iDeps = flow.indexOf('npm_install_deps');
+  const iEnv = flow.indexOf('gen_env_file');
+  assert(iInstall !== -1 && iHandoff !== -1 && iDeps !== -1 && iEnv !== -1,
+    '主流程必须依次出现 install_app / handoff_to_installed_script / npm_install_deps / gen_env_file');
+  assert(iInstall < iHandoff,
+    '交接必须排在 install_app **之后** —— 那一步才刚把最新脚本同步进安装目录');
+  assert(iHandoff < iEnv,
+    '⚠️ 交接必须排在 gen_env_file **之前**：否则环境变量仍由旧逻辑生成，'
+    + '「新代码 + 旧环境」原样复现（这正是本轮的故障）');
+  assert(iHandoff < iDeps,
+    '交接要排在 npm_install_deps 之前：第二趟以安装目录自身为源码目录，依赖只装一次，不产生重复工作');
+});
+
+test('deploy.sh：源码目录即安装目录时不得自我同步（R39-01d）', () => {
+  const body = codeOnly(fnBody(readDeploy(), 'install_app'));
+  assert(/readlink -f "\$SRC_DIR"/.test(body) && /readlink -f "\$INSTALL_DIR"/.test(body),
+    '必须比较两个目录的真实路径 —— 自我交接后的第二趟正是「源码目录 == 安装目录」这种形态');
+  assert(/if \[\[ -n "\$src_real" && "\$src_real" == "\$dst_real" \]\]; then[\s\S]*?else[\s\S]*?tar /m.test(body),
+    '两个目录相同时必须走「跳过同步」分支，tar 同步只能留在 else 里：'
+    + '否则会对同一个目录做 `tar -cf - . | tar -xf - -C 自己`，一边读一边覆盖自己');
+});
+
+test('deploy.sh：交接前的预检与锁交接（R39-01e）', () => {
+  const src = readDeploy();
+  assert(hasFn(src, 'script_is_sane'),
+    '脚本完整性预检（shebang + bash -n）必须是一个具名函数，供重装与自我交接共用');
+  const body = codeOnly(fnBody(src, 'handoff_to_installed_script'));
+  assert(/script_is_sane "\$target"/.test(body),
+    'exec 之前必须预检目标脚本 —— 否则会把一个被污染的文件（如 404 响应体）当成脚本执行');
+  const iTrap = body.indexOf('trap - EXIT');
+  const iExec = body.indexOf('exec env');
+  assert(iTrap !== -1, 'exec 之前必须 trap - EXIT：不摘掉旧 trap，新进程一启动就会撞上锁文件');
+  assert(iExec !== -1, '必须用 exec 交接（否则旧进程继续跑，版本对齐失效）');
+  assert(iTrap < iExec, 'trap - EXIT 必须在 exec 之前');
+  assert(/KEPLER_LOCK_HELD="\$LOCK_FILE"/.test(body), '必须把单实例锁交接给新进程');
+  assert(/KEPLER_SELF_HANDOFF=1/.test(body), '必须带上防环标记');
+  assert(/DOMAIN="\$DOMAIN"/.test(body), '必须把已解析的域名带过去，避免第二趟重复提问');
+
+  // 单一实现点：reinstall_now 的预检必须复用 script_is_sane，不得再留一份
+  const rn = codeOnly(fnBody(src, 'reinstall_now'));
+  assert(/script_is_sane "\$target"/.test(rn), 'reinstall_now 必须复用 script_is_sane');
+  assert(!/bash -n/.test(rn),
+    '不得在 reinstall_now 里再写一份 shebang / bash -n 判据 —— 两份判据迟早漂移成两种行为');
 });

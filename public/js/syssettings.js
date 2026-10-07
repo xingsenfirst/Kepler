@@ -819,8 +819,12 @@ function userTableHtml(users, currentId) {
           const helloBadge = u.webauthnEnabled
             ? '<span class="lk-badge ok" title="已启用：登录时需通过 Windows Hello 验证">已启用</span>'
             : '<span class="bk-sub">未启用</span>';
-          // 本卡片仅管理员可见，因此编辑按钮文案恒为「编辑」；
-          // 管理员编辑自己时由 showUserForm 内部限制不可改角色，仍可管理自己的 Windows Hello。
+          // R40：自己那一行**不渲染**「编辑」按钮（需求：管理员不能在「用户管理」里编辑自己）。
+          // 与封禁/删除同一条思路 —— 这张卡片管的是「别的账户」。自己的资料走账户菜单的
+          // 「编辑资料」（profile.js），那里同样能改用户名 / 密码 / Windows Hello，能力不缺。
+          // 刻意「不渲染」而不是 disabled：留一个永远点不动的按钮，只会让人以为是坏了。
+          const editBtn = isSelf ? ''
+            : `<button class="mini-btn" data-act="edit" data-id="${escapeHtml(u.id)}" type="button">编辑</button>`;
           // 删除按钮：自己的行禁用（不能删除当前登录账户）
           const delBtn = `<button class="mini-btn danger" data-act="del" data-id="${escapeHtml(u.id)}" type="button" ${isSelf ? 'disabled title="不能删除当前登录账户"' : ''}>删除</button>`;
           // R33：封禁 / 解封。自己的行不给按钮（服务端也会 400 拦下自封禁）——
@@ -839,7 +843,7 @@ function userTableHtml(users, currentId) {
             <td class="bk-sub">${fmtTime(u.createdAt)}</td>
             <td class="bk-sub">${fmtTime(u.updatedAt)}</td>
             <td class="lk-acts" style="text-align:right">
-              <button class="mini-btn" data-act="edit" data-id="${escapeHtml(u.id)}" type="button">编辑</button>
+              ${editBtn}
               ${banBtn}
               ${delBtn}
             </td>

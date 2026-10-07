@@ -1308,13 +1308,13 @@ node_manual_hints() {
     dnf|yum)
       add_hint "  【A】NodeSource（RHEL/CentOS/Rocky/Alma —— 与本机匹配）"
       add_hint "    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
-      add_hint "    ${PM} install -y nodejs" ;;
+      add_hint "    ${PM} install -y nodejs --allowerasing" ;;
     *)
       add_hint "  【A】发行版源：$(pm_install_cmd) nodejs npm" ;;
   esac
   add_hint "  【B】其它发行版参考"
   add_hint "    Debian/Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs"
-  add_hint "    RHEL/CentOS  : curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && dnf install -y nodejs"
+  add_hint "    RHEL/CentOS  : curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && dnf install -y nodejs --allowerasing"
   add_hint "  【C】官方二进制包（任何发行版通用，装进 /usr/local）"
   add_hint "    curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-${arch}.tar.gz \\"
   add_hint "      | tar -xz -C /usr/local --strip-components=1"
@@ -1346,9 +1346,10 @@ node_conflict_hints() {
   add_hint "  新版本与它互斥，所以 NodeSource 一定装不上、node 会一直停在旧版本。按下面顺序来："
   case "$PM" in
     dnf|yum)
-      add_hint "    1) ${PM} module reset nodejs"
-      add_hint "    2) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"
-      add_hint "    3) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs" ;;
+      add_hint "    1) ${PM} install -y nodejs --allowerasing   # 先试这条：让 dnf 直接替换掉冲突的旧模块包"
+      add_hint "    2) ${PM} module reset nodejs"
+      add_hint "    3) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"
+      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs --allowerasing" ;;
     apt)
       add_hint "    1) apt-get remove -y nodejs npm && apt-get autoremove -y"
       add_hint "    2) curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs" ;;
@@ -1358,6 +1359,23 @@ node_conflict_hints() {
   add_hint "    （若第 2 步卸不掉：说明有别的包依赖它，看 ${PM} repoquery --whatrequires nodejs）"
   add_hint "    · 不想动系统包就用下面【C】的官方二进制包：它装进 /usr/local，"
   add_hint "      完全不经过包管理器，与系统里那份 nodejs 互不冲突 —— 最省事的一条路。"
+}
+
+# RPM 系装 nodejs 时**额外要带的参数**（唯一实现点）。
+#
+# R40：EL8（RockyLinux 8 / CentOS Stream 8 等）的 AppStream 自带 nodejs 模块流，
+# 预装了 nodejs:16，模块包（nodejs-full-i18n / nodejs-libs / nodejs-devel）把版本
+# 钉在 16 上，与 NodeSource 的 nodejs20 直接互斥 —— dnf 会回
+#     cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and
+#                        nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64
+# 事务连第一步都进不去，于是 node 一直停在旧版本。
+# `--allowerasing` 是 dnf 官方给出的解法：允许它**替换掉**冲突的旧包来完成本次事务。
+# 只在 dnf 下给出 —— 走到 yum 说明本机没有 dnf（EL7 一类的旧 yum），它不认这个选项，
+# 传进去会直接报 `no such option`。返回值刻意**不加引号**地展开：空串应当展开成
+# 「没有参数」，而不是一个空字符串参数。
+node_pm_extra_args() {
+  if [[ "${PM:-}" == "dnf" ]]; then printf '%s' "--allowerasing"; fi
+  return 0
 }
 
 install_node() {
@@ -1387,7 +1405,10 @@ install_node() {
   mark_log
   case "$PM" in
     apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm' ;;
-    dnf|yum) run_soft "$PM" install -y nodejs npm ;;
+    # R40：这条原本是 `"$PM" install -y nodejs npm`，在 EL8 上必然失败（原因见
+    # node_pm_extra_args 的注释）。两处一起改：不再显式装 npm（npm 由 nodejs 包自带，
+    # 单独 install npm 会把 AppStream 的模块包整串拉回来，正好又撞上同一个冲突）。
+    dnf|yum) run_soft "$PM" install -y nodejs $(node_pm_extra_args) ;;
     apk) run_soft apk add --no-cache nodejs npm ;;
     zypper) run_soft zypper --non-interactive install nodejs npm ;;
   esac
@@ -1408,7 +1429,7 @@ install_node() {
         && run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs'
     else
       run_soft bash -c "curl -fsSL https://rpm.nodesource.com/setup_${major}.x | bash -" \
-        && run_soft "$PM" install -y nodejs
+        && run_soft "$PM" install -y nodejs $(node_pm_extra_args)
     fi
     NODE_BIN="$(command -v node || true)"
     if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then

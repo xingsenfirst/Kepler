@@ -6,6 +6,10 @@
   <meta name="referrer" content="no-referrer">
   <title>Kepler 对象存储管理系统</title>
   <link rel="stylesheet" href="css/style.css">
+  <!-- R40：主题脚本必须是 <head> 里的**普通脚本** —— 不能写成 module（module 天然 defer，
+       会先按亮色画一帧再变暗，也就是"闪白"），也不能内联（CSP 的 script-src 没有
+       'unsafe-inline'，见 server/index.js 的 SEC-06）。它同步把 data-theme 写到 <html> 上。 -->
+  <script src="js/theme.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230067c0'/><path d='M8 11h6l2 2h8v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z' fill='%23fff'/></svg>">
 </head>
 <body>
@@ -38,6 +42,12 @@
           </div>
           <button id="btn-viewopt" class="icon-btn" title="视图选项（列/排序/刷新频率）"></button>
           <span class="tb-sep"></span>
+          <!-- R40：「日间 / 暗黑」快捷切换。两颗图标都写在这里，露哪一颗由 CSS 按
+               [data-theme="dark"] 决定；点击行为在 js/theme.js（<head> 里的普通脚本）。 -->
+          <button id="btn-theme" class="tb-btn theme-btn" type="button" title="切换到暗黑模式" aria-pressed="false">
+            <svg class="ic-moon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.3 2.2a9.9 9.9 0 1 0 9.5 12.6 7.9 7.9 0 0 1-9.5-12.6z"/></svg>
+            <svg class="ic-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.3" fill="currentColor"/><g stroke="currentColor" stroke-width="1.9" stroke-linecap="round" fill="none"><path d="M12 2.7v2.3M12 19v2.3M2.7 12H5M19 12h2.3M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7"/></g></svg>
+          </button>
           <div id="user-menu-wrap" class="user-menu-wrap" hidden>
             <button id="btn-user-menu" class="tb-btn user-menu-btn" title="账户菜单"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4.42 0-8 2.24-8 5v1h16v-1c0-2.76-3.58-5-8-5z"/></svg><span id="user-name"></span><span class="um-caret">▾</span></button>
             <div id="user-menu" class="user-menu" hidden>
@@ -571,7 +581,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.6.2</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.6.3</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

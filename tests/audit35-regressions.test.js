@@ -530,3 +530,78 @@ test('R35 · 工具护栏：反向对照脚本必须拒绝位置参数（否则�
   assertEqual(parseArgs([]).only, '', '不带参数 = 跑全量（沿用既有语义）');
   assertEqual(parseArgs([]).error, undefined, '不带参数同样不得报错');
 });
+
+/* ================================================================== *
+ * R40 · 管理员不能在「用户管理」里编辑自己
+ *
+ * 需求原文只有一句「隐藏自己那一列的『编辑』按钮」。放在本文件里而不是新建 R40 的
+ * 护栏文件，是因为这条需求是**这张卡片**的又一次演进，而驱动它所需的假 DOM +
+ * `bootUserCard` 夹具只存在于这里；另起炉灶就意味着把那 150 行假 DOM 再抄一份 ——
+ * 那正是本仓库反复记录的「同一份实现两处各写一遍」。
+ *
+ * 三件事各有用例，缺任何一件都会留下假绿：
+ *   ① 自己那一行**没有**编辑按钮（需求本身）；
+ *   ② 别人的行**仍然有**（「隐藏自己」与「整列消失」是两种完全不同的写法）；
+ *   ③ 对话框里同样没有 —— 卡片与对话框共用 `userTableHtml`，这条同时是
+ *      「规则只写在渲染器里、没有第二份副本」的证据。
+ * ================================================================== */
+
+/** 当前登录用户是 `__me.id = 'me'`（见 bootUserCard）。把他放进列表 = 自己那一行。 */
+const selfPlus = (n) => [row('me', 'admin', { role: 'admin' })].concat(manyUsers(n));
+
+test('R40 · 前端：「用户管理」里不能编辑自己（自己那一行没有「编辑」按钮）', async () => {
+  const { dom } = await bootUserCard(selfPlus(11));
+  const table = dom.get('user-table');
+
+  assert(findBtn(table, 'edit', 'me') === undefined,
+    '自己那一行不得出现「编辑」按钮 —— 需求：管理员不能在「用户管理」中编辑自己');
+  assert(findBtn(table, 'edit', 'u01'),
+    '别人的行必须照常保留「编辑」按钮：隐藏只针对自己那一行，不能变成整列消失');
+  assertEqual(countRows(table.innerHTML), 10,
+    '前置：卡片确实只渲染前 10 位（自己 + u01…u09）—— 否则上面两条断言测的可能不是同一批行');
+
+  // 「编辑」是**不渲染**，「删除」是**渲染但禁用** —— 两种语义都要保住，
+  // 顺手把自删除的既有约束一起钉住（别在改这条时把那条弄丢了）。
+  const del = findBtn(table, 'del', 'me');
+  assert(del, '自己那一行的「删除」仍应渲染出来');
+  assert(del.attrs.disabled === '', '「删除」必须是「存在但禁用」（不能删掉当前登录账户），而不是直接消失');
+  assert(/当前账户/.test(table.innerHTML), '自己那一行仍要显示「当前账户」标记 —— 否则用户看不出为什么这行少了按钮');
+});
+
+test('R40 · 前端：「显示全部」对话框里同样不能编辑自己', async () => {
+  const { dom } = await bootUserCard(selfPlus(11));
+  await dom.get('btn-user-all').onclick();
+  const dialog = dom.get('user-all-body');
+
+  assert(findBtn(dialog, 'edit', 'me') === undefined,
+    '对话框里的自己那一行同样不得有「编辑」按钮 —— 卡片与对话框共用 userTableHtml，'
+    + '两处行为不一致就说明有人另抄了一份渲染器');
+  assert(findBtn(dialog, 'edit', 'u11'),
+    '对话框里**别人**的行必须照常可编辑（「列表里看不见的用户 = 管不了的用户」这条不能被本轮改坏）');
+});
+
+test('R40 · 静态：编辑按钮只在一个地方渲染，且以 isSelf 作条件', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'public', 'js', 'syssettings.js'), 'utf8');
+
+  // 取 userTableHtml 的函数体（配对花括号）。**必须把范围收进这个函数**：
+  // 本文件里另有一处 `data-act="edit"`（WebDAV 账户列表第 392 行，与用户无关），
+  // 全文件计数会把它一起数进来 —— 判据就没落在「用户表渲染器」上了。
+  const start = src.indexOf('function userTableHtml(');
+  assert(start !== -1, '前置：userTableHtml 必须存在（取不到 = 本条检查已失效）');
+  let depth = 0, end = -1;
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  assert(end > start, '前置：userTableHtml 的函数体应能配对到闭合花括号');
+  const body = src.slice(start, end);
+
+  // 计数断言，不是「存在」断言：`.test()` 在两处同串时会永远为真（R36 的 fail=0 教训）。
+  assertEqual((body.match(/data-act="edit"/g) || []).length, 1,
+    '用户表格里「编辑」按钮只允许渲染一次');
+  assert(/const editBtn = isSelf \? ''/.test(body),
+    '该按钮必须以 isSelf 为条件渲染：isSelf 为真时返回空串（**不渲染**），而不是 disabled');
+  assert(/\$\{editBtn\}/.test(body),
+    '条件渲染出来的 editBtn 必须真的插进行模板里 —— 定义了却不使用等于没改');
+});
+

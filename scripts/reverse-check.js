@@ -4628,6 +4628,176 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+
+    /* ======== R40-01 · EL8 上装 Node.js：模块包版本互斥 ======== */
+
+    {
+      // 用户给的那条命令的关键就是 `--allowerasing`：没有它，EL8 的 AppStream
+      // nodejs:16 模块包与 NodeSource 的 nodejs20 直接互斥，dnf 连事务都进不去。
+      name: 'R40-01a · 唯一实现点退化成「一个参数都不给」（EL8 装 Node 仍进不了事务）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "${PM:-}" == "dnf" ]]; then printf \'%s\' "--allowerasing"; fi\n  return 0',
+      replacement: '  return 0',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 反向的一半：无条件给。`--allowerasing` 是 dnf 的参数，旧版 yum / apt / apk / zypper
+      // 收到它会直接报未知选项 —— 「修好了 EL8、弄坏了 EL7 与 Debian」。
+      name: 'R40-01b · 参数变成「所有包管理器都给」（旧 yum / apt / apk 因未知选项直接失败）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "${PM:-}" == "dnf" ]]; then printf \'%s\' "--allowerasing"; fi',
+      replacement: '  if [[ 1 == 1 ]]; then printf \'%s\' "--allowerasing"; fi',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 两处安装点各是一条独立的路：只改一处 = 走另一条路（NodeSource / 发行版源）的
+      // 机器仍然装不上。护栏数的是「两处都带」，撤掉一处即变红。
+      name: 'R40-01c · 发行版源那条 node 安装退回不带额外参数（走这条路的 EL8 仍装不上）',
+      file: 'deploy.sh',
+      anchor: '    dnf|yum) run_soft "$PM" install -y nodejs $(node_pm_extra_args) ;;',
+      replacement: '    dnf|yum) run_soft "$PM" install -y nodejs ;;',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R40-01d · NodeSource 那条 node 安装退回不带额外参数（装完源之后照样失败）',
+      file: 'deploy.sh',
+      anchor: '        && run_soft "$PM" install -y nodejs $(node_pm_extra_args)',
+      replacement: '        && run_soft "$PM" install -y nodejs',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 本轮改动的另一半：不再显式装 `npm` 这个独立包名 —— 单独 install npm 会把
+      // AppStream 的 nodejs-npm 等模块包整串拉回来，正好又撞上同一个互斥。
+      name: 'R40-01e · RPM 分支退回 `install -y nodejs npm`（把模块包整串拉回来，又撞同一个冲突）',
+      file: 'deploy.sh',
+      anchor: '    dnf|yum) run_soft "$PM" install -y nodejs $(node_pm_extra_args) ;;',
+      replacement: '    dnf|yum) run_soft "$PM" install -y nodejs npm ;;',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 装包命令已经带了 --allowerasing，指引的第一条就该是它；退回旧版「先 module reset」
+      // 会把用户推去动全局模块状态（副作用大、且不是对症的那一档）。
+      // ⚠️ 必须整段替换：`--allowerasing` 在同一段里出现**两次**（第 1 条与第 4 条），
+      //    只改第 1 条的话输出里仍有这个词，护栏照样全绿（实测过）。
+      name: 'R40-01f · 冲突指引退回「先 module reset」且不再给 --allowerasing',
+      file: 'deploy.sh',
+      anchor: '      add_hint "    1) ${PM} install -y nodejs --allowerasing   # 先试这条：让 dnf 直接替换掉冲突的旧模块包"\n'
+        + '      add_hint "    2) ${PM} module reset nodejs"\n'
+        + '      add_hint "    3) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"\n'
+        + '      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs --allowerasing" ;;',
+      replacement: '      add_hint "    1) ${PM} module reset nodejs"\n'
+        + '      add_hint "    2) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"\n'
+        + '      add_hint "    3) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs" ;;',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ======== R40-02 · 「用户管理」里不能编辑自己 ======== */
+
+    {
+      // 需求原文：「隐藏自己那一列的『编辑』按钮」。判据是 `isSelf`，把它短路成 false
+      // 就等于「自己那一行也渲染编辑按钮」—— 管理员又能把自己改废了。
+      name: 'R40-02a · 自己那一行也渲染「编辑」按钮（isSelf 判据被短路）',
+      file: 'public/js/syssettings.js',
+      anchor: '          const editBtn = isSelf ? \'\'',
+      replacement: '          const editBtn = false ? \'\'',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 反向的一半：算了却不渲染。`editBtn` 是插值进行模板的，撤掉那一行 = 谁都编辑不了
+      // —— proves「按钮算出来了」与「按钮真的在行里」是两件事。
+      name: 'R40-02b · 行模板不再插 ${editBtn}（按钮算了却没渲染，所有人都不能编辑）',
+      file: 'public/js/syssettings.js',
+      anchor: '              ${editBtn}\n              ${banBtn}',
+      replacement: '              ${banBtn}',
+      testFile: 'audit35-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ======== R40-03 · 日间 / 暗黑快捷切换 ======== */
+
+    {
+      // 多步变异 = 把按钮**搬到**账户菜单右侧（而不是删掉它）：需求是「在账户菜单的
+      // **左侧**」，位置断言是 `btn < menu`，只有真的换位置才能证伪它。
+      name: 'R40-03a · 切换按钮被挪到账户菜单右侧（需求是左侧）',
+      file: 'public/index.html',
+      mutations: [
+        {
+          anchor: '          <button id="btn-theme" class="tb-btn theme-btn" type="button" title="切换到暗黑模式" aria-pressed="false">\n'
+            + '            <svg class="ic-moon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.3 2.2a9.9 9.9 0 1 0 9.5 12.6 7.9 7.9 0 0 1-9.5-12.6z"/></svg>\n'
+            + '            <svg class="ic-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.3" fill="currentColor"/><g stroke="currentColor" stroke-width="1.9" stroke-linecap="round" fill="none"><path d="M12 2.7v2.3M12 19v2.3M2.7 12H5M19 12h2.3M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7"/></g></svg>\n'
+            + '          </button>\n',
+          replacement: '',
+        },
+        {
+          anchor: '          <span class="tb-sep"></span>\n          <button id="btn-syssettings"',
+          replacement: '          <span class="tb-sep"></span>\n'
+            + '          <button id="btn-theme" class="tb-btn theme-btn" type="button" title="切换到暗黑模式" aria-pressed="false">\n'
+            + '            <svg class="ic-moon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.3 2.2a9.9 9.9 0 1 0 9.5 12.6 7.9 7.9 0 0 1-9.5-12.6z"/></svg>\n'
+            + '            <svg class="ic-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.3" fill="currentColor"/><g stroke="currentColor" stroke-width="1.9" stroke-linecap="round" fill="none"><path d="M12 2.7v2.3M12 19v2.3M2.7 12H5M19 12h2.3M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7"/></g></svg>\n'
+            + '          </button>\n'
+            + '          <button id="btn-syssettings"',
+        },
+      ],
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「不闪白」的全部秘密就是这一句：解析期同步落属性。改成等 DOMContentLoaded
+      // 就等于「暗色用户每次加载先看一帧白」—— 而这正是本轮要避免的。
+      name: 'R40-03b · theme.js 不再在解析期落属性（暗色用户每次加载先闪一帧白）',
+      file: 'public/js/theme.js',
+      anchor: '  if (root.document) init(root.document);',
+      replacement: '  if (false) init(root.document);',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「当前是哪个主题」必须读 DOM 属性。改读 storage 之后，隐私模式（storage 恒抛）
+      // 下每次读到的都是日间 → 第一次点击之后再也切不回亮色（单向切换）。
+      name: 'R40-03c · toggle 改以 storage 为「当前值」（隐私模式下点两下切不回去）',
+      file: 'public/js/theme.js',
+      anchor: '        setTheme(doc, st, toggle(doc.documentElement.getAttribute(ATTR)));',
+      replacement: '        setTheme(doc, st, toggle(read(st)));',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 脏值必须归到日间。改成「真值即暗色」之后，localStorage 里任何残留字符串都会
+      // 让页面变暗 —— 主题成了脏数据说了算。
+      name: 'R40-03d · normalize 退化成「真值即暗色」（脏数据决定主题）',
+      file: 'public/js/theme.js',
+      anchor: '  function normalize(value) {\n    return value === DARK ? DARK : LIGHT;\n  }',
+      replacement: '  function normalize(value) {\n    return value ? DARK : LIGHT;\n  }',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 明暗两套变量必须一一对应。少一格 = 那个面在暗色下仍是亮色（实测里最刺眼的是
+      // 输入框 / 对话框 / 提示块那几块白）。
+      name: 'R40-03e · 暗色块漏掉一个颜色变量（那个面在暗色下仍是亮色）',
+      file: 'public/css/style.css',
+      anchor: '  --muted: #8b93a1;',
+      replacement: '',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 图标靠 CSS 按主题显隐。少了这一条，日间模式下两颗图标会一起出现
+      //（月亮与太阳叠在一起），且点了没有视觉反馈。
+      name: 'R40-03f · 暗色模式下不再露出太阳图标（两颗图标同时出现）',
+      file: 'public/css/style.css',
+      anchor: '[data-theme="dark"] .theme-btn .ic-sun { display: inline; }',
+      replacement: '[data-theme="dark"] .theme-btn .ic-sun { display: none; }',
+      testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

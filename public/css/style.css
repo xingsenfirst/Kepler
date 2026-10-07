@@ -570,6 +570,12 @@ td.c-date, th.c-date { width: 150px; }
 /* S6：魔数模式强度警示（红色强调，区别于普通提示） */
 .enc-warn.danger { background: #fdecea; border-color: #f5c6c2; color: #7d2b26; }
 .enc-warn.danger b { color: #a32d2d; }
+
+/* R41：两种验证码服务商的凭证分组（各自独立保存，`is-active` 标记当前选用的那一套） */
+.cap-prov { border: 1px solid var(--line-soft); border-radius: 8px; padding: 12px 14px 2px; margin-bottom: 12px; background: var(--surface-2); }
+.cap-prov-h { font-size: 12.5px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+.cap-prov.is-active { border-color: #3b82f6; background: var(--tint-info); }
+.cap-prov.is-active .cap-prov-h { color: #1d4ed8; }
 /* 加密方式：可勾选卡片组（沿用 .seg/.chip 的强调色语汇，与表单卡片风格一致） */
 .enc-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
 /* 注意：卡片本身是 <label>，会被全局 .form-item label 命中（display:block / 12px / 灰字 / 下边距），

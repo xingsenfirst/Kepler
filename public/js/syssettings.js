@@ -558,6 +558,18 @@ async function copyWebdavUrl() {
 
 let captchaCfg = null;
 
+/**
+ * R41：两种服务商的凭证**各自独立保存**（服务端落点是 `captcha.providers[provider]`）。
+ * 这里是前端的唯一清单 —— 界面元素 id 由它拼出（`captcha-sitekey-<p>` 等），
+ * 增删服务商只需改这一处，回填与提交会自动跟着走。
+ */
+const CAPTCHA_PROVIDERS = ['recaptcha', 'turnstile'];
+
+/** 服务商显示名（唯一实现点，卡片与提示共用） */
+function captchaProviderName(p) {
+  return p === 'turnstile' ? 'Cloudflare Turnstile' : 'Google reCAPTCHA';
+}
+
 function chipValue(id) {
   const el = document.querySelector('#' + id + ' .chip.active');
   return el ? el.dataset.v : '';
@@ -575,13 +587,23 @@ function renderCaptcha(c) {
   if (en) en.checked = !!c.enabled;
   const enText = document.getElementById('captcha-enabled-text');
   if (enText) enText.textContent = c.enabled ? '启用' : '停用';
-  chipSelect('captcha-provider', c.provider || 'recaptcha');
-  const siteKey = document.getElementById('captcha-sitekey');
-  if (siteKey) siteKey.value = c.siteKey || '';
-  const secret = document.getElementById('captcha-secretkey');
-  if (secret) secret.value = '';
-  const secState = document.getElementById('captcha-secret-state');
-  if (secState) secState.textContent = c.hasSecret ? '（已设置，留空保持不变）' : '（未设置）';
+  const active = c.provider === 'turnstile' ? 'turnstile' : 'recaptcha';
+  chipSelect('captcha-provider', active);
+
+  // 两套凭证分别回填（互不影响）—— 这正是「可以同时保存两种配置，再选择使用其中一项」
+  const provs = (c.providers && typeof c.providers === 'object') ? c.providers : {};
+  for (const p of CAPTCHA_PROVIDERS) {
+    const e = (provs[p] && typeof provs[p] === 'object') ? provs[p] : {};
+    const siteKey = document.getElementById('captcha-sitekey-' + p);
+    if (siteKey) siteKey.value = e.siteKey || '';
+    const secret = document.getElementById('captcha-secretkey-' + p);
+    if (secret) secret.value = ''; // 明文密钥绝不下发，因此也绝无回填
+    const secState = document.getElementById('captcha-secret-state-' + p);
+    if (secState) secState.textContent = e.hasSecret ? '（已设置，留空保持不变）' : '（未设置）';
+    const box = document.getElementById('captcha-prov-' + p);
+    if (box) box.classList.toggle('is-active', p === active);
+  }
+
   const timeout = document.getElementById('captcha-timeout');
   if (timeout) timeout.value = c.timeoutMs || 5000;
   chipSelect('captcha-onerror', c.onError || 'block');
@@ -589,9 +611,8 @@ function renderCaptcha(c) {
   const effEl = document.getElementById('captcha-effective');
   if (effEl) {
     if (eff.available) {
-      const name = eff.provider === 'turnstile' ? 'Cloudflare Turnstile' : 'Google reCAPTCHA';
       const envHit = c.envOverridden && (c.envOverridden.provider || c.envOverridden.siteKey || c.envOverridden.secretKey);
-      effEl.textContent = `当前生效：${name}（登录页已启用）` + (envHit ? ' · 部分配置被环境变量覆盖' : '');
+      effEl.textContent = `当前生效：${captchaProviderName(eff.provider)}（登录页已启用）` + (envHit ? ' · 部分配置被环境变量覆盖' : '');
     } else {
       effEl.textContent = '当前登录页未启用人机验证';
     }
@@ -615,18 +636,35 @@ async function loadCaptcha() {
   }
 }
 
+/** 读取两组输入框里的凭证（两组都读、都提交 = 同时保存两套配置） */
+function readCaptchaProviderInputs() {
+  const out = {};
+  for (const p of CAPTCHA_PROVIDERS) {
+    const sk = document.getElementById('captcha-sitekey-' + p);
+    const se = document.getElementById('captcha-secretkey-' + p);
+    out[p] = {
+      siteKey: sk ? (sk.value || '').trim() : '',
+      // 空串 = 服务端保持原密钥不变（见 routes/captcha.js 的 parseProviderPatch）
+      secretKey: se ? (se.value || '') : '',
+    };
+  }
+  return out;
+}
+
 async function saveCaptchaSettings() {
   const msg = document.getElementById('captcha-msg');
   const showMsg = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'form-msg show ' + cls; } };
   const checked = document.getElementById('captcha-enabled').checked;
   const provider = chipValue('captcha-provider') || 'recaptcha';
-  const siteKey = (document.getElementById('captcha-sitekey').value || '').trim();
-  const secretKey = document.getElementById('captcha-secretkey').value || '';
   const timeoutMs = Number(document.getElementById('captcha-timeout').value) || 5000;
   const onError = chipValue('captcha-onerror') || 'block';
 
-  // 服务端密钥是否可用：本次填了新的，或此前已配置 / 环境变量注入
-  const hasSecret = !!secretKey || !!(captchaCfg && captchaCfg.hasSecret);
+  const providers = readCaptchaProviderInputs();
+  const sel = providers[provider] || { siteKey: '', secretKey: '' };
+  const savedSel = (captchaCfg && captchaCfg.providers && captchaCfg.providers[provider]) || {};
+
+  // 服务端密钥是否可用：本次为**选中服务商**填了新的，或它此前已配置 / 环境变量注入
+  const hasSecret = !!sel.secretKey || !!savedSel.hasSecret;
 
   /**
    * R31-02：保存成功后「自动启用」。
@@ -635,10 +673,11 @@ async function saveCaptchaSettings() {
    * 旧行为只是把 enabled:false 原样再存一遍，功能依旧停用，而管理员以为「保存即生效」，
    * 登录页其实仍无任何验证；必须再回来手动拨一次开关（很多人就此以为配置没生效）。
    *
-   * 三个闸门**同时**满足才自动启用：
+   * 三个闸门**同时**满足才自动启用，且**只针对当前选中的服务商**（R41 起两套并存，
+   * 拿另一家的密钥来判定「已配好」是不对的）：
    *  ① 保存前就是停用状态（`captchaCfg.enabled` 为假）—— 功能已在启用态时，
    *     用户的任何操作都不该被我们改判；
-   *  ② 本次提交里用户**真的新填了信息**（站点密钥与已保存值不同，或填入了服务端密钥）——
+   *  ② 本次提交里用户**真的新填了信息**（选中服务商的站点密钥与已保存值不同，或填入了服务端密钥）——
    *     这一条专门保护「手动停用后仍要保存别的改动」：只把开关拨到停用再点保存时
    *     typedNew 为假，仍按停用提交，绝不会「关了又被自动打开」而再也停不下来；
    *  ③ 凭证完整（站点密钥 + 服务端密钥都在）—— 与下面那段启用前校验同源，避免出现
@@ -646,21 +685,21 @@ async function saveCaptchaSettings() {
    * 自动启用只作用在**本次提交的入参**上（把 enabled 一并提交），不额外发一次请求，
    * 因此不会产生「已保存但启用失败」的半途状态。
    */
-  const typedNew = siteKey !== String((captchaCfg && captchaCfg.siteKey) || '') || !!secretKey;
+  const typedNew = sel.siteKey !== String(savedSel.siteKey || '') || !!sel.secretKey;
   const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)
-    && typedNew && !!siteKey && hasSecret;
+    && typedNew && !!sel.siteKey && hasSecret;
   const enabled = checked || autoEnable;
 
   if (enabled) {
-    if (!siteKey) { showMsg('启用验证码需填写站点密钥（Site Key）', 'bad'); return; }
+    if (!sel.siteKey) { showMsg(`启用验证码需填写「${captchaProviderName(provider)}」的站点密钥（Site Key）`, 'bad'); return; }
     if (!hasSecret) {
-      showMsg('启用验证码需填写服务端密钥（Secret Key），或通过环境变量 CAPTCHA_SECRET_KEY 注入', 'bad');
+      showMsg(`启用验证码需填写「${captchaProviderName(provider)}」的服务端密钥（Secret Key），或通过环境变量 CAPTCHA_SECRET_KEY 注入`, 'bad');
       return;
     }
   }
 
   try {
-    const r = await API.saveCaptchaConfig({ enabled, provider, siteKey, secretKey, timeoutMs, onError });
+    const r = await API.saveCaptchaConfig({ enabled, provider, providers, timeoutMs, onError });
     const autoEnabled = autoEnable && !!r.enabled;
     captchaCfg = r;
     renderCaptcha(r);

@@ -2,7 +2,8 @@
  * 验证码服务模块 —— 服务端校验网关（零硬依赖版本）
  *
  * 设计要点：
- *  - 同时支持 Google reCAPTCHA 与 Cloudflare Turnstile，通过配置项二选一。
+ *  - 同时支持 Google reCAPTCHA 与 Cloudflare Turnstile；**两套凭证各自独立保存**
+ *    （`config.captcha.providers[provider]`），顶层 `provider` 只决定登录页实际用哪一套（R41）。
  *  - 敏感信息（secretKey / siteKey）仅来自配置（data/config.enc）或环境变量，绝不硬编码。
  *  - 校验只在服务端完成：前端提交的 token 不可信，必须回源服务商验证。
  *  - 全程超时受控（AbortController），绝不会让 /auth/login 无响应。
@@ -11,9 +12,9 @@
  *  - 关闭（enabled=false）时本模块零行为：verify() 直接放行，无任何网络依赖。
  *
  * 环境变量覆盖（优先级高于 config.enc 中的同名字段）：
- *  - CAPTCHA_PROVIDER        'recaptcha' | 'turnstile'
- *  - CAPTCHA_SITE_KEY        前端渲染用站点公钥
- *  - CAPTCHA_SECRET_KEY      服务端校验用密钥（绝不下发前端）
+ *  - CAPTCHA_PROVIDER        'recaptcha' | 'turnstile'（先于密钥解析，决定取哪一套）
+ *  - CAPTCHA_SITE_KEY        前端渲染用站点公钥（作用在选中的那一套上）
+ *  - CAPTCHA_SECRET_KEY      服务端校验用密钥（绝不下发前端；同上）
  *  - CAPTCHA_ENABLED         'true' | 'false'
  */
 
@@ -30,9 +31,9 @@ const VERIFY_ENDPOINTS = {
 /** 默认配置（关闭状态；不依赖任何外部服务） */
 const DEFAULTS = {
   enabled: false,        // 全局开关（默认关闭，登录保持原有逻辑）
-  provider: 'recaptcha', // 'recaptcha' | 'turnstile'
-  siteKey: '',           // 站点公钥（前端渲染用，可下发）
-  secretKey: '',         // 服务端密钥（绝不回传前端）
+  provider: 'recaptcha', // 'recaptcha' | 'turnstile' —— 只决定**登录页用哪一套**凭证
+  siteKey: '',           // 站点公钥（选中的那一套；前端渲染用，可下发）
+  secretKey: '',         // 服务端密钥（选中的那一套；绝不回传前端）
   timeoutMs: 5000,       // 单次校验超时（毫秒）
   verifyPath: '',        // reCAPTCHA v2 可选：action 名或前端传回的额外字段归属（保留扩展位）
   // 失败策略：'block'（默认，校验失败/不可用拦截登录）或 'degrade'（异常时放行）
@@ -44,6 +45,9 @@ const DEFAULTS = {
  * 读取当前生效的验证码配置。
  * 优先级：环境变量 > configStore.captcha > DEFAULTS。
  * 任何字段缺失时回落到 DEFAULTS，确保返回结构完整、绝不抛错。
+ *
+ * R41：两套服务商凭证各自独立保存（`providers[provider]`），此处**只取选中那一套** ——
+ * 切服务商即换一套密钥，另一套原样留在配置里，下回切回来不必重填。
  * @param {object} configStore 配置存储模块（注入，避免直接 require 造成循环依赖）
  */
 function resolveConfig(configStore) {
@@ -53,17 +57,32 @@ function resolveConfig(configStore) {
     if (cfg && cfg.captcha && typeof cfg.captcha === 'object') stored = cfg.captcha;
   } catch (e) { /* 配置不可用时回落默认 */ }
 
-  const env = {};
-  // 仅在环境变量真实存在时写入，避免 Object.assign 用 undefined 覆盖已存储的配置
-  if (process.env.CAPTCHA_PROVIDER) env.provider = process.env.CAPTCHA_PROVIDER;
-  if (process.env.CAPTCHA_SITE_KEY) env.siteKey = process.env.CAPTCHA_SITE_KEY;
-  if (process.env.CAPTCHA_SECRET_KEY) env.secretKey = process.env.CAPTCHA_SECRET_KEY;
-  if (process.env.CAPTCHA_ENABLED === 'true') env.enabled = true;
-  else if (process.env.CAPTCHA_ENABLED === 'false') env.enabled = false;
+  const merged = Object.assign({}, DEFAULTS, stored);
 
-  const merged = Object.assign({}, DEFAULTS, stored, env);
+  // 1) 先定「用哪一套」：存储值 → 环境变量 CAPTCHA_PROVIDER（后者优先）
+  //    必须**先**决定 provider，再去取对应的密钥，否则环境变量切到另一家时会取错那一套。
+  if (process.env.CAPTCHA_PROVIDER) merged.provider = process.env.CAPTCHA_PROVIDER;
   // 规范化枚举，避免脏配置导致后续分支异常
   if (merged.provider !== 'turnstile' && merged.provider !== 'recaptcha') merged.provider = 'recaptcha';
+
+  // 2) 取选中服务商的凭证（新结构）；历史扁平键（siteKey/secretKey 落在 captcha 顶层）兜底
+  const byProvider = (stored.providers && typeof stored.providers === 'object') ? stored.providers : {};
+  const sel = (byProvider[merged.provider] && typeof byProvider[merged.provider] === 'object')
+    ? byProvider[merged.provider] : null;
+  if (sel) {
+    merged.siteKey = typeof sel.siteKey === 'string' ? sel.siteKey : '';
+    merged.secretKey = typeof sel.secretKey === 'string' ? sel.secretKey : '';
+  }
+  if (typeof merged.siteKey !== 'string') merged.siteKey = '';
+  if (typeof merged.secretKey !== 'string') merged.secretKey = '';
+
+  // 3) 环境变量覆盖优先级最高（作用在**选中的这一套**上）
+  //    仅在环境变量真实存在时写入，避免 Object.assign 用 undefined 覆盖已存储的配置
+  if (process.env.CAPTCHA_SITE_KEY) merged.siteKey = process.env.CAPTCHA_SITE_KEY;
+  if (process.env.CAPTCHA_SECRET_KEY) merged.secretKey = process.env.CAPTCHA_SECRET_KEY;
+  if (process.env.CAPTCHA_ENABLED === 'true') merged.enabled = true;
+  else if (process.env.CAPTCHA_ENABLED === 'false') merged.enabled = false;
+
   if (merged.onError !== 'degrade') merged.onError = 'block';
   if (!Number.isFinite(merged.timeoutMs) || merged.timeoutMs <= 0 || merged.timeoutMs > 15000) {
     merged.timeoutMs = DEFAULTS.timeoutMs;

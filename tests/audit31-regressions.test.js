@@ -343,16 +343,54 @@ test('R31-03 · 支付：总开关已被服务端规则拒绝时必须如实报�
 /**
  * 驱动一次「保存设置」。可连续多次调用（复用同一沙箱模块实例）——
  * 第 2 次会看到第 1 次保存后写回的 `captchaCfg`，正是「已启用 → 管理员再次改动」的场景。
- * @param {{checked:boolean, siteKey:string, secretKey:string}} p
+ *
+ * R41 起两种服务商**各自独立**保存：`provider` 决定往哪一组输入框里填（默认 reCAPTCHA），
+ * 另一家的输入框恒置空，模拟「另一套还没配 / 本次没动它」。
+ * @param {{checked:boolean, provider?:string, siteKey:string, secretKey:string}} p
  */
 async function captchaSave(sandbox, dom, p) {
+  const provider = p.provider || 'recaptcha';
+  const other = provider === 'recaptcha' ? 'turnstile' : 'recaptcha';
   dom.get('captcha-enabled').checked = !!p.checked;
-  dom.get('captcha-sitekey').value = p.siteKey === undefined ? '' : p.siteKey;
-  dom.get('captcha-secretkey').value = p.secretKey === undefined ? '' : p.secretKey;
+  dom.get('captcha-sitekey-' + provider).value = p.siteKey === undefined ? '' : p.siteKey;
+  dom.get('captcha-secretkey-' + provider).value = p.secretKey === undefined ? '' : p.secretKey;
+  dom.get('captcha-sitekey-' + other).value = '';
+  dom.get('captcha-secretkey-' + other).value = '';
   dom.get('captcha-timeout').value = '5000';
   await dom.get('btn-captcha-save').onclick();
   const c = callsOf('saveCaptchaConfig');
   return c[c.length - 1].args[0];
+}
+
+/**
+ * 桩 `saveCaptchaConfig`：按 R41 的响应形状回写 —— 两套凭证各自 `{ siteKey, hasSecret }`。
+ *
+ * 它还**如实模拟服务端那条「空串 = 保持原密钥」的契约**（用闭包状态记住已设过的密钥）：
+ * 若桩每次都按 `!!cfg.secretKey` 现算 `hasSecret`，第二次保存（密码框本来就留空）
+ * 就会得到 `hasSecret:false`，界面随即把「（已设置）」误显示成「（未设置）」——
+ * 那是**桩的错**，不是产品的错，会让护栏指向错误的方向。
+ * @param {(provs:object)=>object} [over] 需要额外覆盖时（例如强制某家 `hasSecret` 为真）
+ */
+function capSaveStub(over) {
+  const store = {
+    recaptcha: { siteKey: '', secretKey: '' },
+    turnstile: { siteKey: '', secretKey: '' },
+  };
+  return async (cfg) => {
+    const provs = {};
+    for (const p of ['recaptcha', 'turnstile']) {
+      const e = (cfg.providers && cfg.providers[p]) || {};
+      if (e.siteKey !== undefined) store[p].siteKey = e.siteKey;
+      if (e.secretKey) store[p].secretKey = e.secretKey; // 空串 = 保持原密钥不变
+      provs[p] = { siteKey: store[p].siteKey, hasSecret: !!store[p].secretKey };
+    }
+    return Object.assign({
+      enabled: cfg.enabled,
+      provider: cfg.provider,
+      providers: provs,
+      effective: { available: !!cfg.enabled, provider: cfg.provider },
+    }, over ? over(provs) : null);
+  };
 }
 
 test('R31-02 · 登录验证：本次填全凭证且当前停用时，保存后自动启用', async () => {
@@ -360,14 +398,8 @@ test('R31-02 · 登录验证：本次填全凭证且当前停用时，保存后�
   const dom = installFakeDom({ systemSettingsNull: true });
   globalThis.__calls = [];
   globalThis.__toasts = [];
-  globalThis.__api = {
-    // 保存前：停用、没有站点密钥、也没有服务端密钥
-    saveCaptchaConfig: async (cfg) => Object.assign({}, cfg, {
-      siteKey: cfg.siteKey,
-      hasSecret: !!cfg.secretKey,
-      effective: { available: !!cfg.enabled, provider: cfg.provider },
-    }),
-  };
+  // 保存前：停用、没有站点密钥、也没有服务端密钥
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
   const mod = await importFresh(dir, 'syssettings.js');
   mod.refresh(); // wire() 会绑定 btn-captcha-save.onclick = saveCaptchaSettings
 
@@ -379,8 +411,8 @@ test('R31-02 · 登录验证：本次填全凭证且当前停用时，保存后�
   assertEqual(sent.enabled, true,
     'R31-02：本次新填了站点密钥与服务端密钥、且开关处于停用 —— 保存时必须一并以 enabled:true 提交；'
     + '否则管理员以为「保存即生效」，而登录页其实仍无任何验证');
-  assertEqual(sent.siteKey, '6Lc-site-key-000', '站点密钥应原样提交');
-  assertEqual(sent.secretKey, '6Lc-secret-key-111', '服务端密钥应原样提交');
+  assertEqual(sent.providers.recaptcha.siteKey, '6Lc-site-key-000', '站点密钥应原样提交到选中服务商那一套');
+  assertEqual(sent.providers.recaptcha.secretKey, '6Lc-secret-key-111', '服务端密钥应原样提交到选中服务商那一套');
 });
 
 test('R31-02 · 登录验证：已启用时手动取消勾选并保存，必须能真正停用', async () => {
@@ -388,13 +420,7 @@ test('R31-02 · 登录验证：已启用时手动取消勾选并保存，必须�
   const dom = installFakeDom({ systemSettingsNull: true });
   globalThis.__calls = [];
   globalThis.__toasts = [];
-  globalThis.__api = {
-    saveCaptchaConfig: async (cfg) => Object.assign({}, cfg, {
-      siteKey: cfg.siteKey,
-      hasSecret: !!cfg.secretKey,
-      effective: { available: !!cfg.enabled, provider: cfg.provider },
-    }),
-  };
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
   const mod = await importFresh(dir, 'syssettings.js');
   mod.refresh();
 
@@ -412,13 +438,7 @@ test('R31-02 · 登录验证：功能已启用时改密钥不得被自动启用�
   const dom = installFakeDom({ systemSettingsNull: true });
   globalThis.__calls = [];
   globalThis.__toasts = [];
-  globalThis.__api = {
-    saveCaptchaConfig: async (cfg) => Object.assign({}, cfg, {
-      siteKey: cfg.siteKey,
-      hasSecret: !!cfg.secretKey,
-      effective: { available: !!cfg.enabled, provider: cfg.provider },
-    }),
-  };
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
   const mod = await importFresh(dir, 'syssettings.js');
   mod.refresh();
 
@@ -435,11 +455,7 @@ test('R31-02 · 登录验证：只填了站点密钥（凭证不完整）不得�
   const dom = installFakeDom({ systemSettingsNull: true });
   globalThis.__calls = [];
   globalThis.__toasts = [];
-  globalThis.__api = {
-    saveCaptchaConfig: async (cfg) => Object.assign({}, cfg, {
-      siteKey: cfg.siteKey, hasSecret: !!cfg.secretKey, effective: { available: false },
-    }),
-  };
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
   const mod = await importFresh(dir, 'syssettings.js');
   mod.refresh();
 
@@ -453,10 +469,11 @@ test('R31-02 · 登录验证：服务端密钥早已配好、本次没填新信�
   const dom = installFakeDom({ systemSettingsNull: true });
   globalThis.__calls = [];
   globalThis.__toasts = [];
-  // 服务端密钥此前已由环境变量 / 历史配置提供（`hasSecret` 恒为真）
+  // 服务端密钥此前已由环境变量 / 历史配置提供（该服务商的 `hasSecret` 恒为真）
   globalThis.__api = {
-    saveCaptchaConfig: async (cfg) => Object.assign({}, cfg, {
-      siteKey: cfg.siteKey, hasSecret: true, effective: { available: !!cfg.enabled },
+    saveCaptchaConfig: capSaveStub((provs) => {
+      provs.recaptcha.hasSecret = true;
+      return { providers: provs };
     }),
   };
   const mod = await importFresh(dir, 'syssettings.js');
@@ -474,3 +491,124 @@ test('R31-02 · 登录验证：服务端密钥早已配好、本次没填新信�
     + '否则管理员把开关拨到停用、再点一次保存（例如只想改超时时间）时会被强行打开，'
     + '这个开关就再也关不掉了');
 });
+
+/* ================================================================== *
+ * R41 · 两种服务商的凭证各自独立（同时保存、任选其一）
+ * ================================================================== */
+
+/**
+ * 让假 DOM 的 `document.querySelector('#id .chip.active')` 按 id 返回指定 chip 值。
+ *
+ * `installFakeDom` 默认的 `querySelector` 恒返回 null ⇒ `chipValue()` 恒为 `''`
+ * ⇒ provider 永远回落 recaptcha —— 那样「切换到另一家」这类行为根本测不到
+ * （测试会以为在测 Turnstile，实际测的还是 reCAPTCHA）。这里只对显式声明的 chip 生效。
+ * @param {Record<string,string>} map 形如 `{ 'captcha-provider': 'turnstile' }`
+ */
+function setChips(map) {
+  globalThis.document.querySelector = (sel) => {
+    const m = /^#([^\s]+) \.chip\.active$/.exec(String(sel || ''));
+    const v = m ? (map || {})[m[1]] : null;
+    return v ? { dataset: { v: String(v) } } : null;
+  };
+}
+
+test('R41 · 登录验证：两套凭证必须同时提交，回填时不得串台', async () => {
+  const dir = makeSandbox({ withSyssettings: true });
+  const dom = installFakeDom({ systemSettingsNull: true });
+  globalThis.__calls = [];
+  globalThis.__toasts = [];
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
+  setChips({ 'captcha-provider': 'turnstile', 'captcha-onerror': 'block' });
+  const mod = await importFresh(dir, 'syssettings.js');
+  mod.refresh();
+
+  // 两套都填上（模拟管理员「两套都配好」），当前选中 Turnstile
+  dom.get('captcha-sitekey-recaptcha').value = 'rec-key';
+  dom.get('captcha-secretkey-recaptcha').value = 'rec-secret';
+  dom.get('captcha-sitekey-turnstile').value = 'ts-key';
+  dom.get('captcha-secretkey-turnstile').value = 'ts-secret';
+  dom.get('captcha-timeout').value = '5000';
+  dom.get('captcha-enabled').checked = true;
+  await dom.get('btn-captcha-save').onclick();
+  const two = callsOf('saveCaptchaConfig').pop().args[0];
+
+  assertEqual(two.provider, 'turnstile', 'R41：提交的 provider 必须是界面上选中的那一家');
+  assertEqual(two.providers.recaptcha.siteKey, 'rec-key',
+    'R41：提交里必须**同时**带上另一家的站点密钥 —— 只提交选中那一家，切换服务商就会把另一套悄悄清空');
+  assertEqual(two.providers.recaptcha.secretKey, 'rec-secret', 'R41：另一家的服务端密钥也要一并提交');
+  assertEqual(two.providers.turnstile.siteKey, 'ts-key', 'R41：选中的那一家的站点密钥要提交');
+  assertEqual(two.providers.turnstile.secretKey, 'ts-secret', 'R41：选中的那一家的服务端密钥要提交');
+
+  // 保存后按服务端回帧重新回填：两套各回各的输入框
+  assertEqual(dom.get('captcha-sitekey-recaptcha').value, 'rec-key',
+    'R41：两套凭证须各回各的输入框；串台会让管理员在 A 家看到 B 家的密钥');
+  assertEqual(dom.get('captcha-sitekey-turnstile').value, 'ts-key', 'R41：Turnstile 那套同理');
+  assertEqual(dom.get('captcha-secretkey-recaptcha').value, '', 'R41：明文密钥绝不下发，因此输入框必须清空');
+  assertEqual(dom.get('captcha-secretkey-turnstile').value, '', 'R41：Turnstile 那套同理');
+});
+
+test('R41 · 登录验证：留空表示「保持原密钥」，不得被当成清空', async () => {
+  const dir = makeSandbox({ withSyssettings: true });
+  const dom = installFakeDom({ systemSettingsNull: true });
+  globalThis.__calls = [];
+  globalThis.__toasts = [];
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
+  setChips({ 'captcha-provider': 'recaptcha', 'captcha-onerror': 'block' });
+  const mod = await importFresh(dir, 'syssettings.js');
+  mod.refresh();
+
+  // 第一次：两家的服务端密钥都填上
+  dom.get('captcha-sitekey-recaptcha').value = 'rec-key';
+  dom.get('captcha-secretkey-recaptcha').value = 'rec-secret';
+  dom.get('captcha-sitekey-turnstile').value = 'ts-key';
+  dom.get('captcha-secretkey-turnstile').value = 'ts-secret';
+  dom.get('captcha-timeout').value = '5000';
+  dom.get('captcha-enabled').checked = true;
+  await dom.get('btn-captcha-save').onclick();
+
+  // 第二次：两个密码框都留空（界面本来就不会回填明文），只改超时
+  dom.get('captcha-timeout').value = '8000';
+  await dom.get('btn-captcha-save').onclick();
+  const second = callsOf('saveCaptchaConfig').pop().args[0];
+
+  assertEqual(second.providers.recaptcha.secretKey, '',
+    'R41：留空必须原样提交空串（服务端据此「保持原密钥」）—— '
+    + '若前端自作主张提交别的值，等于每次保存都把密钥换掉');
+  assertEqual(second.providers.turnstile.secretKey, '', 'R41：Turnstile 那套同理');
+  // 服务端必须如实回「两家都仍有密钥」，否则界面上「（已设置）」会误报成「（未设置）」
+  assertEqual(dom.get('captcha-secret-state-recaptcha').textContent.indexOf('已设置') !== -1, true,
+    'R41：两家都已配置过密钥 ⇒ 回填后状态应显示「已设置」');
+  assertEqual(dom.get('captcha-secret-state-turnstile').textContent.indexOf('已设置') !== -1, true,
+    'R41：Turnstile 那套同理');
+});
+
+test('R41 · 登录验证：切到「另一家」时，启用校验只看被选中那一家的凭证', async () => {
+  const dir = makeSandbox({ withSyssettings: true });
+  const dom = installFakeDom({ systemSettingsNull: true });
+  globalThis.__calls = [];
+  globalThis.__toasts = [];
+  globalThis.__api = { saveCaptchaConfig: capSaveStub() };
+  setChips({ 'captcha-provider': 'turnstile', 'captcha-onerror': 'block' });
+  const mod = await importFresh(dir, 'syssettings.js');
+  mod.refresh();
+
+  // 只给 reCAPTCHA 配好两把钥匙；当前选中的 Turnstile 一套是空的
+  dom.get('captcha-sitekey-recaptcha').value = 'rec-key';
+  dom.get('captcha-secretkey-recaptcha').value = 'rec-secret';
+  dom.get('captcha-sitekey-turnstile').value = '';
+  dom.get('captcha-secretkey-turnstile').value = '';
+  dom.get('captcha-timeout').value = '5000';
+  dom.get('captcha-enabled').checked = true; // 想启用
+  const before = callsOf('saveCaptchaConfig').length;
+  await dom.get('btn-captcha-save').onclick();
+
+  assertEqual(callsOf('saveCaptchaConfig').length, before,
+    'R41：选中服务商的凭证不完整时必须**就地拦下**、不发请求 —— '
+    + '否则会把「另一家配好了」误判成本次可启用，登录页随即报「未正确配置」而锁死登录');
+  const m = dom.get('captcha-msg').textContent;
+  assert(/站点密钥/.test(m), `R41：提示必须点名缺的是哪一家的站点密钥，实际：${m}`);
+  assert(/Cloudflare Turnstile/.test(m),
+    `R41：提示必须点名是哪一家（否则两套并存时管理员无从判断该去补哪一套），实际：${m}`);
+});
+
+

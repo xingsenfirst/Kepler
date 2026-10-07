@@ -134,6 +134,18 @@ function sanitizeBucket(b) {
 function boolOf(v) { return v === true; }
 
 /**
+ * 取「两套验证码凭证」的归一化副本（R41）。
+ *
+ * 导出与导入都走这里，保证备份载荷里 `captcha.providers` 的结构与
+ * `config-store` 侧完全一致（唯一实现点：归一化交给 `configStore.captchaProvidersOf`，
+ * 这里绝不自己重写一遍合并规则）。旧载荷只有扁平 `siteKey`/`secretKey` 时，
+ * 归一化会把它们落进 `provider` 指向的那一套，因此历史备份照样能导入。
+ */
+function captchaProviders(cap) {
+  return configStore.captchaProvidersOf(cap || {});
+}
+
+/**
  * 采集当前配置 → 备份载荷的 `data` 部分。
  *
  * ⚠️ WebDAV 账户口令在此**取明文**（`revealWebdavPassword`）。落盘的 `passwordSealed`
@@ -172,8 +184,8 @@ function collect() {
     captcha: {
       enabled: boolOf(cap.enabled),
       provider: String(cap.provider || 'recaptcha'),
-      siteKey: String(cap.siteKey || ''),
-      secretKey: String(cap.secretKey || ''),
+      // R41：两套凭证都随备份走（各自独立保存，切服务商时不必重填）
+      providers: captchaProviders(cap),
       timeoutMs: Number.isFinite(Number(cap.timeoutMs)) ? Number(cap.timeoutMs) : 5000,
       onError: String(cap.onError || 'block'),
     },
@@ -211,7 +223,14 @@ function isEmptyData(data) {
   const ue = data.uploadExcludes || {};
   if (ue.dsStore || ue.thumbsDb || ue.gitignore) return false;
   const cap = data.captcha || {};
-  if (cap.enabled || cap.siteKey || cap.secretKey) return false;
+  if (cap.enabled) return false;
+  // R41：两套凭证里任一套填过即算「已配置」；旧载荷的扁平键同样算数
+  const capProvs = (cap.providers && typeof cap.providers === 'object') ? cap.providers : {};
+  for (const name of Object.keys(capProvs)) {
+    const e = capProvs[name] || {};
+    if (e.siteKey || e.secretKey) return false;
+  }
+  if (cap.siteKey || cap.secretKey) return false;
   const w = data.webdav || {};
   if (w.enabled || (w.accounts || []).length) return false;
   const p = data.payment || {};
@@ -391,8 +410,8 @@ function apply(data) {
     captcha: {
       enabled: boolOf(cap.enabled),
       provider: String(cap.provider || 'recaptcha'),
-      siteKey: String(cap.siteKey || ''),
-      secretKey: String(cap.secretKey || ''),
+      // R41：两套凭证整批还原（旧载荷只有扁平 siteKey/secretKey 时，落到 provider 那一套）
+      providers: captchaProviders(cap),
       timeoutMs: Number.isFinite(Number(cap.timeoutMs)) ? Number(cap.timeoutMs) : 5000,
       onError: String(cap.onError || 'block'),
     },

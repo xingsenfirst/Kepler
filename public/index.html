@@ -436,24 +436,44 @@
               </h3>
               <div class="enc-warn">
                 <b>简要说明</b>：为登录页面启用人机验证（CAPTCHA），需通过校验才能登录，<b>关闭后登录流程保持原有逻辑。</b>
+                <b>两种服务商的配置各自独立保存</b>，可同时填好，再选择使用其中一项。
               </div>
               <div class="form-item">
-                <label>验证服务商</label>
+                <label>当前使用的服务商</label>
                 <div class="seg-col" id="captcha-provider">
                   <button class="chip" data-v="recaptcha" type="button">Google reCAPTCHA</button>
                   <button class="chip" data-v="turnstile" type="button">Cloudflare Turnstile</button>
                 </div>
-                <!-- reCAPTCHA 前端脚本固定从 <https://recaptcha.net/recaptcha/api.js 加载（非 google.com，避免无法访问） -->
+                <div class="hint">只决定登录页实际调用哪一套；两套凭证都会保存，随时切换无需重填。</div>
               </div>
-              <div class="form-item">
-                <label>站点密钥（Site Key）</label>
-                <input type="text" id="captcha-sitekey" class="full" placeholder="服务商控制台获取，用于前端渲染验证组件" autocomplete="off" spellcheck="false">
+
+              <div class="cap-prov" id="captcha-prov-recaptcha" data-prov="recaptcha">
+                <div class="cap-prov-h">Google reCAPTCHA（v2 复选框 / v3 隐形均适用）</div>
+                <div class="form-item">
+                  <label>站点密钥（Site Key）</label>
+                  <input type="text" id="captcha-sitekey-recaptcha" class="full" placeholder="reCAPTCHA 管理控制台获取，用于前端渲染组件" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="form-item">
+                  <label>服务端密钥（Secret Key）<span id="captcha-secret-state-recaptcha" class="hint" style="margin-left:6px"></span></label>
+                  <input type="password" id="captcha-secretkey-recaptcha" class="full" placeholder="留空表示保持现有密钥不变" autocomplete="new-password">
+                </div>
+                <div class="hint">前端脚本固定从 <code>https://www.recaptcha.net/recaptcha/api.js</code> 加载（非 google.com，避免无法访问）；该引导脚本随后注入的<b>实现脚本</b>在境外取自 <code>www.gstatic.com</code>、境内取自 <code>www.gstatic.cn</code>，两者的域名都已列入本站 CSP。</div>
               </div>
-              <div class="form-item">
-                <label>服务端密钥（Secret Key）<span id="captcha-secret-state" class="hint" style="margin-left:6px"></span></label>
-                <input type="password" id="captcha-secretkey" class="full" placeholder="留空表示保持现有密钥不变" autocomplete="new-password">
-                <div class="hint">仅用于服务端校验，任何接口均不会回传明文。密钥经加密配置（<code>data/config.enc</code>）保存，或通过环境变量 <code>CAPTCHA_SITE_KEY</code> / <code>CAPTCHA_SECRET_KEY</code> 注入（环境变量优先，禁止硬编码）。</div>
+
+              <div class="cap-prov" id="captcha-prov-turnstile" data-prov="turnstile">
+                <div class="cap-prov-h">Cloudflare Turnstile</div>
+                <div class="form-item">
+                  <label>站点密钥（Site Key）</label>
+                  <input type="text" id="captcha-sitekey-turnstile" class="full" placeholder="Turnstile 站点获取，用于前端渲染组件" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="form-item">
+                  <label>服务端密钥（Secret Key）<span id="captcha-secret-state-turnstile" class="hint" style="margin-left:6px"></span></label>
+                  <input type="password" id="captcha-secretkey-turnstile" class="full" placeholder="留空表示保持现有密钥不变" autocomplete="new-password">
+                </div>
+                <div class="hint">前端脚本从 <code>https://challenges.cloudflare.com/turnstile/v0/api.js</code> 加载，域名已列入本站 CSP。</div>
               </div>
+
+              <div class="hint" style="margin:-4px 0 8px">服务端密钥仅用于服务端校验，任何接口均不会回传明文。密钥经加密配置（<code>data/config.enc</code>）保存，或通过环境变量 <code>CAPTCHA_SITE_KEY</code> / <code>CAPTCHA_SECRET_KEY</code> 注入（环境变量优先，作用于当前选中的服务商；禁止硬编码）。</div>
               <div class="form-row">
                 <div class="form-item">
                   <label>校验超时（毫秒，1000–15000）</label>
@@ -581,7 +601,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.6.3</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.6.4</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsenfirst/Kepler" target="_blank">https://github.com/xingsenfirst/Kepler</a></li>

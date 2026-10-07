@@ -135,7 +135,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（51 个文件 / 500+ 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（52 个文件 / 500+ 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 

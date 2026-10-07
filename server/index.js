@@ -59,12 +59,11 @@ app.use((req, res, next) => {
     "default-src 'self'; "
     + "img-src 'self' data:; "
     + "style-src 'self' 'unsafe-inline'; "   // 少量组件依赖内联样式，暂保留
-    // 两个验证码服务商的脚本源都必须在列：host-source 是**精确匹配**，
-    // 少一个 www（recaptcha.net ≠ www.recaptcha.net）或漏掉整个域名（challenges.cloudflare.com）
-    // 都会让脚本被拦截 → 组件永不 load → 而"需要验证码"的开关已打开 → 全站账号无法登录。
-    // R14-02 当时的形态是：reCAPTCHA 少了 www、Turnstile 整个域名不在列 —— 两条分支都是坏的。
-    // 与 `public/js/main.js` 的 CAPTCHA_SCRIPTS 同源，由 invariants 护栏双向看住。
-    + "script-src 'self' https://www.recaptcha.net https://www.gstatic.com https://challenges.cloudflare.com; "
+    // 两个验证码服务商的脚本源都必须在列：host-source **精确匹配**，少一个 www 或漏整个域名
+    // 即被拦 → 组件永不 load → 全站无法登录（R14-02）。R41：recaptcha.net 下发的只是**引导脚本**，
+    // 它再注入实现 recaptcha__*.js —— 境内取自 www.gstatic.cn、境外 www.gstatic.com（同一份内容，
+    // 同为 858138 字节），两个都要列，少一个该地区用户就永远停在"正在加载人机验证组件…"。
+    + "script-src 'self' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn https://challenges.cloudflare.com; "
     + "frame-src https://www.recaptcha.net https://challenges.cloudflare.com; "
     + "connect-src 'self'; "
     + "object-src 'none'; "                  // 禁止 <object>/<embed>/<applet>

@@ -181,8 +181,13 @@ const DEFAULT_CONFIG = {
   webdav: { enabled: false, accounts: [] }, // WebDAV 服务（开关 + 账户，密码字段级加密）
   users: [], // 登录用户（username / passwordHash / passwordSalt / role）
   captcha: {
-    enabled: false, provider: 'recaptcha', siteKey: '', secretKey: '',
+    enabled: false, provider: 'recaptcha',
     timeoutMs: 5000, onError: 'block',
+    // R41：两种服务商各自独立保存一套凭证（`provider` 只决定登录页用哪一套）
+    providers: {
+      recaptcha: { siteKey: '', secretKey: '' },
+      turnstile: { siteKey: '', secretKey: '' },
+    },
   }, // 登录人机验证（默认关闭；secretKey 仅为服务端用，绝不下发前端）
   payment: { platforms: {} }, // 支付平台凭证（仅基础配置与合法性校验，字段见 server/payment-providers.js）
   createdAt: '',
@@ -235,6 +240,63 @@ function migrateV1(raw) {
   return cfg;
 }
 
+/**
+ * R41：验证码支持的服务商清单。
+ *
+ * 两种服务商各自保存**一整套**凭证（`providers[provider] = { siteKey, secretKey }`），
+ * 顶层的 `provider` 只决定「登录页实际用哪一套」。用户因此可以两套都填好、随时切换，
+ * 而不必每换一次就重填一遍密钥。
+ */
+const CAPTCHA_PROVIDERS = ['recaptcha', 'turnstile'];
+
+/**
+ * 把任意历史形态的 captcha 配置归一为 `{ recaptcha:{…}, turnstile:{…} }`（唯一实现点）。
+ *
+ * 兼容两种落盘形态：
+ *  - 旧形态（≤1.6.3）：顶层扁平 `siteKey` / `secretKey`（只有一套，跟着 `provider` 走）；
+ *  - 新形态（R41）：`providers` 两套并存。
+ * 归一后**只保留** `providers`，扁平键被吸收进来 —— 这样「哪一套生效」永远只有
+ * `provider` 一个判据，不会出现「扁平键与新结构各说各话」的双真相。
+ *
+ * @param {object} c captcha 配置（可能只有扁平键、只有 providers、或两者都有）
+ */
+function captchaProvidersOf(c) {
+  const src = (c && typeof c === 'object') ? c : {};
+  const flatProvider = CAPTCHA_PROVIDERS.includes(src.provider) ? src.provider : 'recaptcha';
+  const existing = (src.providers && typeof src.providers === 'object') ? src.providers : {};
+  const out = {};
+  for (const p of CAPTCHA_PROVIDERS) {
+    const e = (existing[p] && typeof existing[p] === 'object') ? existing[p] : {};
+    let siteKey = typeof e.siteKey === 'string' ? e.siteKey : '';
+    let secretKey = typeof e.secretKey === 'string' ? e.secretKey : '';
+    // 旧扁平键只在「该服务商还没有自己的记录」时搬进来（新结构优先，避免覆盖已保存值）
+    if (!e.siteKey && !e.secretKey && p === flatProvider) {
+      siteKey = typeof src.siteKey === 'string' ? src.siteKey : '';
+      secretKey = typeof src.secretKey === 'string' ? src.secretKey : '';
+    }
+    out[p] = { siteKey, secretKey };
+  }
+  return out;
+}
+
+/**
+ * 就地归一 `cfg.captcha`（唯一实现点）：把旧扁平键吸收进 `providers`，随后抹掉扁平键。
+ *
+ * 两处都要调它，少一处就有「两个真相」：
+ *  - `normalize()`（**读盘**时）—— 升级后把历史配置里的 `siteKey`/`secretKey` 搬进
+ *    `providers[provider]`，否则管理员会发现密钥凭空消失；
+ *  - `save()`（**部分写入**时）—— `save(partial)` 是「顶层键替换」，若只有读取侧归一，
+ *    一次 `save({ captcha: { siteKey } })` 就会留下「扁平键 + providers」并存的状态，
+ *    而读取侧只认 `providers` ⇒ **写入静默失效**（存了但没生效）。
+ * @param {object} cfg 配置对象
+ */
+function normalizeCaptchaInto(cfg) {
+  if (!cfg || !cfg.captcha || typeof cfg.captcha !== 'object') return;
+  cfg.captcha.providers = captchaProvidersOf(cfg.captcha);
+  delete cfg.captcha.siteKey;
+  delete cfg.captcha.secretKey;
+}
+
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
   // v1 判定：存在扁平 secretId/bucket 且没有 credentials 数组
@@ -281,11 +343,11 @@ function normalize(raw) {
   // 验证码配置兜底：补全结构并归一化枚举，避免历史脏配置影响运行
   if (!cfg.captcha || typeof cfg.captcha !== 'object') cfg.captcha = {};
   if (typeof cfg.captcha.enabled !== 'boolean') cfg.captcha.enabled = false;
-  if (!['recaptcha', 'turnstile'].includes(cfg.captcha.provider)) cfg.captcha.provider = 'recaptcha';
+  if (!CAPTCHA_PROVIDERS.includes(cfg.captcha.provider)) cfg.captcha.provider = 'recaptcha';
   if (cfg.captcha.onError !== 'degrade') cfg.captcha.onError = 'block';
-  if (typeof cfg.captcha.siteKey !== 'string') cfg.captcha.siteKey = '';
-  if (typeof cfg.captcha.secretKey !== 'string') cfg.captcha.secretKey = '';
   if (!Number.isFinite(Number(cfg.captcha.timeoutMs)) || cfg.captcha.timeoutMs <= 0) cfg.captcha.timeoutMs = 5000;
+  // R41：把两套凭证归一（旧扁平键在此被吸收进 providers），随后抹掉扁平键
+  normalizeCaptchaInto(cfg);
   // 用户记录兜底：过滤非法项并补齐字段，避免历史脏数据导致运行异常
   cfg.users = cfg.users.filter((u) => u && typeof u === 'object' && typeof u.username === 'string' && u.username);
   for (const u of cfg.users) {
@@ -478,6 +540,10 @@ function getLastWriteError() { return lastWriteError; }
 function save(partial) {
   const cur = requireStore();
   Object.assign(cur, partial);
+  // R41：captcha 必须就地归一 —— `save(partial)` 是顶层键替换，若这里不归一，
+  // 一次带扁平 siteKey/secretKey 的部分写入就会与 providers 并存两个真相，
+  // 而读取侧只认 providers ⇒ 写入静默失效。见 `normalizeCaptchaInto()`。
+  normalizeCaptchaInto(cur);
   return persist(cur);
 }
 
@@ -1329,38 +1395,66 @@ function setUploadExcludes(patch) {
 /**
  * 读取验证码配置（服务端内部使用，含 secretKey）。
  * 绝不会被 routes 直接回传前端——对外由 captcha.publicConfig() 裁剪。
+ *
+ * 返回的 `siteKey` / `secretKey` 是**当前选中服务商**那一套的派生视图（向后兼容旧调用方）；
+ * 两套完整凭证在 `providers` 里。
  */
 function getCaptcha() {
   const cfg = load();
   const c = (cfg && cfg.captcha) || {};
+  const provider = CAPTCHA_PROVIDERS.includes(c.provider) ? c.provider : 'recaptcha';
+  const providersMap = captchaProvidersOf(c);
+  const sel = providersMap[provider];
   return {
     enabled: !!c.enabled,
-    provider: c.provider === 'turnstile' ? 'turnstile' : 'recaptcha',
-    siteKey: c.siteKey || '',
-    secretKey: c.secretKey || '',
+    provider,
+    providers: providersMap,
+    siteKey: sel.siteKey,
+    secretKey: sel.secretKey,
     timeoutMs: Number.isFinite(Number(c.timeoutMs)) && c.timeoutMs > 0 ? Number(c.timeoutMs) : 5000,
     onError: c.onError === 'degrade' ? 'degrade' : 'block',
   };
 }
 
 /**
- * 保存验证码配置。
- * - secretKey 留空表示"保持不变"（避免界面保存时误清空已配置的密钥）。
- * - secretKey 为 null（显式清除）时才真正置空。
+ * 保存验证码配置 —— 两种服务商的凭证**各自独立**保存（R41）。
+ *
+ * `providers` 里每个服务商支持部分字段：
+ *  - `siteKey`    省略 = 保持不变
+ *  - `secretKey`  省略或空串 = 保持不变（避免界面保存时误清空密钥）；`null` = 显式清除
+ * 顶层扁平 `siteKey` / `secretKey` 仍被接受（旧前端 / 旧脚本），落到 `provider` 指向的那一套。
  */
 function saveCaptcha(patch) {
   const cfg = requireStore();
   const prev = getCaptcha();
   const p = patch || {};
+  const provider = CAPTCHA_PROVIDERS.includes(p.provider) ? p.provider : prev.provider;
+  const providersMap = captchaProvidersOf({ providers: prev.providers });
+
+  // 逐服务商应用本次提交（只改本次真正带上的字段）
+  const incoming = (p.providers && typeof p.providers === 'object') ? p.providers : {};
+  for (const name of CAPTCHA_PROVIDERS) {
+    const e = incoming[name];
+    if (!e || typeof e !== 'object') continue;
+    const cur = providersMap[name];
+    if (e.siteKey !== undefined) cur.siteKey = String(e.siteKey || '');
+    if (e.secretKey === null) cur.secretKey = '';                  // 显式清除
+    else if (e.secretKey !== undefined && e.secretKey !== '') cur.secretKey = String(e.secretKey);
+  }
+  // 兼容旧的扁平形态：落到选中服务商那一套
+  if (p.siteKey !== undefined && incoming[provider] === undefined) providersMap[provider].siteKey = String(p.siteKey || '');
+  if (p.secretKey !== undefined && incoming[provider] === undefined) {
+    if (p.secretKey === null) providersMap[provider].secretKey = '';
+    else if (p.secretKey !== '') providersMap[provider].secretKey = String(p.secretKey);
+  }
+
   cfg.captcha = {
     enabled: p.enabled !== undefined ? !!p.enabled : prev.enabled,
-    provider: ['recaptcha', 'turnstile'].includes(p.provider) ? p.provider : prev.provider,
-    siteKey: p.siteKey !== undefined ? String(p.siteKey || '') : prev.siteKey,
-    secretKey: p.secretKey === undefined || p.secretKey === '' ? prev.secretKey : String(p.secretKey),
+    provider,
+    providers: providersMap,
     timeoutMs: p.timeoutMs !== undefined && Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : prev.timeoutMs,
     onError: p.onError !== undefined && p.onError === 'degrade' ? 'degrade' : 'block',
   };
-  if (p.secretKey === null) cfg.captcha.secretKey = ''; // 显式清除密钥
   persist(cfg);
   return getCaptcha();
 }
@@ -2078,6 +2172,8 @@ module.exports = {
   listUsers, getUserById, userView, addUser, updateUser, removeUser, authenticateUser,
   // Windows Hello（WebAuthn）
   isWebauthnEnabled, getWebauthn, setUserWebauthn, clearUserWebauthn, touchWebauthn,
+  // R41：验证码两套独立凭证
+  CAPTCHA_PROVIDERS, captchaProvidersOf,
   // R33：账户封禁
   BAN_REASON_MAX, banInfo, setUserBan, clearUserBan,
   findUserRaw, findUserRawById, verifyUserPassword,

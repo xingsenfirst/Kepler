@@ -112,7 +112,7 @@ function seedOne(section) {
   switch (section) {
     case 'credentials': configStore.addCredential({ provider: 'tencent', secretId: DEMO.sid, secretKey: DEMO.skey }); break;
     case 'uploadExcludes': configStore.save({ uploadExcludes: { dsStore: true, thumbsDb: false, gitignore: false } }); break;
-    case 'captcha': configStore.save({ captcha: { enabled: false, provider: 'recaptcha', siteKey: DEMO.capSite, secretKey: '', timeoutMs: 5000, onError: 'block' } }); break;
+    case 'captcha': configStore.save({ captcha: { enabled: false, provider: 'recaptcha', providers: { recaptcha: { siteKey: DEMO.capSite, secretKey: '' } }, timeoutMs: 5000, onError: 'block' } }); break;
     case 'webdav': configStore.setWebdavEnabled(true); break;
     case 'payment': configStore.save({ payment: { enabled: false, platforms: { alipay: { appId: 'demo' } }, siteUrl: '' } }); break;
     case 'buckets': configStore.addBucket({ provider: 'tencent', bucket: 'demo-bucket-0001', region: 'ap-guangzhou' }); break;
@@ -346,7 +346,7 @@ test('R38-02l · 准入判据「每一项都算数」：只配了任意一项，
   const empty = () => ({
     credentials: { credentials: [], activeCredentialId: '' },
     uploadExcludes: { dsStore: false, thumbsDb: false, gitignore: false },
-    captcha: { enabled: false, provider: 'recaptcha', siteKey: '', secretKey: '', timeoutMs: 5000, onError: 'block' },
+    captcha: { enabled: false, provider: 'recaptcha', providers: { recaptcha: { siteKey: '', secretKey: '' }, turnstile: { siteKey: '', secretKey: '' } }, timeoutMs: 5000, onError: 'block' },
     webdav: { enabled: false, accounts: [] },
     payment: { enabled: false, platforms: {}, siteUrl: '' },
     buckets: { buckets: [], activeBucketId: '' },
@@ -361,7 +361,9 @@ test('R38-02l · 准入判据「每一项都算数」：只配了任意一项，
     ['API Key 管理', (d) => { d.credentials.credentials.push({ id: 'c1', quotaBytes: 0, speedLimit: 0 }); }],
     ['生效密钥 id', (d) => { d.credentials.activeCredentialId = 'c1'; }],
     ['上传排除', (d) => { d.uploadExcludes.dsStore = true; }],
-    ['登陆验证', (d) => { d.captcha.siteKey = 'k'; }],
+    ['登陆验证（reCAPTCHA 站点密钥）', (d) => { d.captcha.providers.recaptcha.siteKey = 'k'; }],
+    ['登陆验证（Turnstile 站点密钥）', (d) => { d.captcha.providers.turnstile.siteKey = 'k'; }],
+    ['登陆验证（旧载荷的扁平键）', (d) => { d.captcha.siteKey = 'k'; }],
     ['登陆验证（仅启用）', (d) => { d.captcha.enabled = true; }],
     ['WebDAV 开关', (d) => { d.webdav.enabled = true; }],
     ['WebDAV 账户', (d) => { d.webdav.accounts.push({ appName: 'a', username: 'u', password: 'p' }); }],

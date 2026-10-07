@@ -984,8 +984,8 @@ const CASES = [
       // 而"需要验证码"的开关已打开 → 全站账号无法登录。修复前就是这个形态。
       name: 'R14-02 · CSP 去掉 challenges.cloudflare.com（启用 Turnstile 后锁死登录）',
       file: 'server/index.js',
-      anchor: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://challenges.cloudflare.com; "',
-      replacement: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com; "',
+      anchor: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn https://challenges.cloudflare.com; "',
+      replacement: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn; "',
       testFile: 'invariants.test.js',
       minFail: 1,
     },
@@ -3240,24 +3240,24 @@ const CASES = [
        */
       name: 'R31-02a · 登录验证自动启用不再要求「保存前是停用」（取消勾选保存也会被强行打开）',
       file: 'public/js/syssettings.js',
-      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey && hasSecret;",
-      replacement: "  const autoEnable = !checked\n    && typedNew && !!siteKey && hasSecret;",
+      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!sel.siteKey && hasSecret;",
+      replacement: "  const autoEnable = !checked\n    && typedNew && !!sel.siteKey && hasSecret;",
       testFile: 'audit31-regressions.test.js',
       minFail: 1,
     },
     {
       name: 'R31-02b · 登录验证自动启用不再要求「本次新填了信息」（只拨开关再保存就被打开）',
       file: 'public/js/syssettings.js',
-      anchor: "    && typedNew && !!siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
-      replacement: "    && !!siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
+      anchor: "    && typedNew && !!sel.siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
+      replacement: "    && !!sel.siteKey && hasSecret;\n  const enabled = checked || autoEnable;",
       testFile: 'audit31-regressions.test.js',
       minFail: 1,
     },
     {
       name: 'R31-02c · 登录验证自动启用不再要求「凭证完整」（只填站点密钥就被启用）',
       file: 'public/js/syssettings.js',
-      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey && hasSecret;",
-      replacement: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!siteKey;",
+      anchor: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!sel.siteKey && hasSecret;",
+      replacement: "  const autoEnable = !checked && !(captchaCfg && captchaCfg.enabled)\n    && typedNew && !!sel.siteKey;",
       testFile: 'audit31-regressions.test.js',
       minFail: 1, // 实测 2（「只填站点密钥」与「早已配好密钥」两条一起红）；取 1 留余量
     },
@@ -4428,9 +4428,13 @@ const CASES = [
     {
       // 准入判据要求「备份范围内每一项都算数」。漏掉任何一项，都会让「已经配过该项
       // 的实例」仍然显示可导入 —— 而那一次点击是**不可撤销**的整批覆盖。
-      name: 'R38-02l · 准入判据漏掉「登陆验证」一项（配过却仍允许导入线上实例）',
+      //
+      // R41 起「登陆验证」的判据有**两半**：新结构的 `providers`（任一套填过即算数）
+      // 与旧载荷的扁平 `siteKey`/`secretKey`。本条的变异摘掉的是**旧扁平键那一半**
+      // （`R41-02g` 守的是 `providers` 那一半），两侧各有一条对照，不会互相遮蔽。
+      name: 'R38-02l · 准入判据漏掉「登陆验证」的旧扁平键一侧（配过却仍允许导入线上实例）',
       file: 'server/backup.js',
-      anchor: '  if (cap.enabled || cap.siteKey || cap.secretKey) return false;\n',
+      anchor: '  if (cap.siteKey || cap.secretKey) return false;\n',
       replacement: '',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
@@ -4796,6 +4800,218 @@ const CASES = [
       anchor: '[data-theme="dark"] .theme-btn .ic-sun { display: inline; }',
       replacement: '[data-theme="dark"] .theme-btn .ic-sun { display: none; }',
       testFile: 'audit40-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-01：把实现脚本真正所在的那个域名从 CSP 里撤掉 = 修复前的形态。
+       *
+       * 实测（无头 Chrome + DevTools 协议）：`www.recaptcha.net` 下发的只是**引导脚本**，
+       * 它再注入 `recaptcha/releases/<版本>/recaptcha__*.js`，该实现在中国大陆解析到
+       * `www.gstatic.cn`。CSP 的 host-source 是**精确匹配**，站点里只列了 `www.gstatic.com`
+       * ⇒ 实现在 `script-src-elem` 上报违规 ⇒ `grecaptcha` 永不 ready ⇒
+       * 界面永远停在「正在加载人机验证组件…」（实测轮询 20.28s 耗尽）。
+       */
+      name: 'R41-01a · CSP 去掉 www.gstatic.cn（reCAPTCHA 卡在「正在加载人机验证组件…」）',
+      file: 'server/index.js',
+      anchor: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn https://challenges.cloudflare.com; "',
+      replacement: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://challenges.cloudflare.com; "',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-01b：少写一个 `www` —— 最像「已经修好了」的错法。
+       *
+       * host-source 精确匹配，`https://gstatic.cn` **不**匹配 `https://www.gstatic.cn`：
+       * 源码里肉眼看是「加了 gstatic.cn」，浏览器里照样拦。
+       */
+      name: 'R41-01b · CSP 把实现脚本域名写成 gstatic.cn（少一个 www = 仍然被拦）',
+      file: 'server/index.js',
+      anchor: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn https://challenges.cloudflare.com; "',
+      replacement: '    + "script-src \'self\' https://www.recaptcha.net https://www.gstatic.com https://gstatic.cn https://challenges.cloudflare.com; "',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02a：保存时只写「当前选中」的那一套（= 旧扁平结构的思路）。
+       * 后果：切一次服务商，另一家的密钥就被悄悄丢弃 —— 需求要的正是「两套同时保存」。
+       */
+      name: 'R41-02a · saveCaptcha 只写选中服务商（切换服务商即丢掉另一套）',
+      file: 'server/config-store.js',
+      anchor: '  for (const name of CAPTCHA_PROVIDERS) {\n'
+        + '    const e = incoming[name];\n'
+        + '    if (!e || typeof e !== \'object\') continue;',
+      replacement: '  for (const name of CAPTCHA_PROVIDERS.filter((n) => n === provider)) {\n'
+        + '    const e = incoming[name];\n'
+        + '    if (!e || typeof e !== \'object\') continue;',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02b：派生视图写死取 reCAPTCHA 那一套（而不是选中那一套）。
+       * 后果：切到 Turnstile 后，服务端仍在用 reCAPTCHA 的密钥校验、前端仍渲染 reCAPTCHA 组件 ——
+       * 「切换」在界面上看着成功了，实际一点没生效。
+       */
+      name: 'R41-02b · getCaptcha 的派生 siteKey/secretKey 固定取 reCAPTCHA（切换不生效）',
+      file: 'server/config-store.js',
+      anchor: '  const providersMap = captchaProvidersOf(c);\n  const sel = providersMap[provider];',
+      replacement: '  const providersMap = captchaProvidersOf(c);\n  const sel = providersMap.recaptcha;',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02c：**顺序陷阱** —— 先取密钥、再决定用哪一家。
+       *
+       * 环境变量 `CAPTCHA_PROVIDER` 把生效方切到 Turnstile，而密钥却按**存储里**的
+       * reCAPTCHA 取：前端会拿着 reCAPTCHA 的 siteKey 去渲染 Turnstile 组件（渲染失败），
+       * 服务端也会拿错密钥去回源校验。
+       */
+      name: 'R41-02c · resolveConfig 先取密钥再定服务商（环境变量切家后取错那一套）',
+      file: 'server/captcha.js',
+      anchor: '  const sel = (byProvider[merged.provider] && typeof byProvider[merged.provider] === \'object\')\n'
+        + '    ? byProvider[merged.provider] : null;',
+      replacement: '  const keyProvider = stored.provider === \'turnstile\' ? \'turnstile\' : \'recaptcha\';\n'
+        + '  const sel = (byProvider[keyProvider] && typeof byProvider[keyProvider] === \'object\')\n'
+        + '    ? byProvider[keyProvider] : null;',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02d：旧扁平配置不再被迁进它当时选中的那一套。
+       * 后果：升级到本版本后，管理员原有的 siteKey/secretKey 凭空消失，登录页无验证码可用。
+       */
+      name: 'R41-02d · 旧扁平配置不再迁进 providers[provider]（升级后密钥凭空消失）',
+      file: 'server/config-store.js',
+      anchor: '    if (!e.siteKey && !e.secretKey && p === flatProvider) {',
+      replacement: '    if (!e.siteKey && !e.secretKey && p === \'recaptcha\') {',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02e：把「空串 = 保持原密钥」当成「清空」。
+       * 后果：界面上的密码框永远不回填明文、每次保存都提交空串 ⇒ 管理员只改一下超时时间，
+       * 两套密钥当场清空，登录立刻被 `captcha_not_configured` 拦死。
+       */
+      name: 'R41-02e · saveCaptcha 把空串当作清除密钥（改一次超时即清空密钥、锁死登录）',
+      file: 'server/config-store.js',
+      anchor: '    else if (e.secretKey !== undefined && e.secretKey !== \'\') cur.secretKey = String(e.secretKey);',
+      replacement: '    else if (e.secretKey !== undefined && e.secretKey !== null) cur.secretKey = String(e.secretKey || \'\');',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02f：管理端视图把明文 secretKey 一起下发。
+       * 后果：服务端密钥只该用于回源校验，一旦进入响应体就等于「任何拿到管理员会话的人
+       * 都能把密钥导出带走」（浏览器缓存 / 代理日志 / 前端内存四处都是）。
+       */
+      name: 'R41-02f · GET /captcha/config 下发明文 secretKey（密钥外泄）',
+      file: 'server/routes/captcha.js',
+      anchor: '    out[name] = { siteKey: String(e.siteKey || \'\'), hasSecret: Boolean(e.secretKey) };',
+      replacement: '    out[name] = { siteKey: String(e.siteKey || \'\'), hasSecret: Boolean(e.secretKey), secretKey: String(e.secretKey || \'\') };',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02g：空判据只看扁平键（漏掉 providers）。
+       * 后果：只配了 Turnstile 的实例被判定为「全新」⇒ 导入闸门打开 ⇒ 一次点击把已配置的
+       * 那一套静默覆盖掉，而界面上没有任何提示。
+       */
+      name: 'R41-02g · isEmptyData 漏掉 providers（只配了 Turnstile 仍允许导入、静默覆盖）',
+      file: 'server/backup.js',
+      anchor: '  const capProvs = (cap.providers && typeof cap.providers === \'object\') ? cap.providers : {};',
+      replacement: '  const capProvs = {};',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02h：备份不再携带两套凭证。
+       * 后果：恢复后另一家（多半是尚未启用的那一家）的密钥没了，管理员得回服务商控制台
+       * 重新申请一遍 —— 备份「能用」但没保住该保住的东西。
+       */
+      name: 'R41-02h · 备份不再携带两套凭证（恢复后另一家密钥丢失）',
+      file: 'server/backup.js',
+      anchor: 'function captchaProviders(cap) {\n  return configStore.captchaProvidersOf(cap || {});\n}',
+      replacement: 'function captchaProviders(cap) {\n  return { recaptcha: { siteKey: \'\', secretKey: \'\' }, turnstile: { siteKey: \'\', secretKey: \'\' } };\n}',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02i：前端只提交「当前选中」那一家的输入框。
+       * 后果：正是需求点名的那个毛病 —— 切换服务商时另一套被清空。
+       */
+      name: 'R41-02i · 前端只提交选中服务商（切家即清空另一套）',
+      file: 'public/js/syssettings.js',
+      anchor: '  for (const p of CAPTCHA_PROVIDERS) {\n'
+        + '    const sk = document.getElementById(\'captcha-sitekey-\' + p);\n'
+        + '    const se = document.getElementById(\'captcha-secretkey-\' + p);',
+      replacement: '  for (const p of [chipValue(\'captcha-provider\') || \'recaptcha\']) {\n'
+        + '    const sk = document.getElementById(\'captcha-sitekey-\' + p);\n'
+        + '    const se = document.getElementById(\'captcha-secretkey-\' + p);',
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02j：回填时把两家的站点密钥都写进 reCAPTCHA 那一个输入框（串台）。
+       * 后果：界面显示的密钥与它标注的服务商对不上，管理员照着改只会越改越乱。
+       */
+      name: 'R41-02j · 前端回填串台（两家的密钥都写进 reCAPTCHA 的输入框）',
+      file: 'public/js/syssettings.js',
+      anchor: '    const siteKey = document.getElementById(\'captcha-sitekey-\' + p);\n'
+        + '    if (siteKey) siteKey.value = e.siteKey || \'\';',
+      replacement: '    const siteKey = document.getElementById(\'captcha-sitekey-recaptcha\');\n'
+        + '    if (siteKey) siteKey.value = e.siteKey || \'\';',
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02k：通用 `save()` 不再归一 captcha。
+       * 后果：一次带扁平 `siteKey` 的部分写入会与 `providers` 并存两个真相，而读取侧只认
+       * `providers` ⇒ **写入静默失效**（接口回 ok、界面显示已保存，登录页却拿不到 siteKey）。
+       */
+      name: 'R41-02k · save() 不再归一 captcha（扁平键写入静默失效）',
+      file: 'server/config-store.js',
+      anchor: '  normalizeCaptchaInto(cur);\n  return persist(cur);',
+      replacement: '  return persist(cur);',
+      testFile: 'audit41-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02l：启用校验把「另一家配好了」当成「这一家配好了」。
+       * 后果：管理员切到一家空配置的服务商并点保存，功能被启用、登录页却渲染不出组件 ⇒
+       * 所有人被 `captcha_not_configured` 挡在门外。
+       */
+      name: 'R41-02l · 启用校验拿另一家的凭证放行（切换后锁死登录）',
+      file: 'public/js/syssettings.js',
+      anchor: '    if (!sel.siteKey) { showMsg(`启用验证码需填写「${captchaProviderName(provider)}」的站点密钥（Site Key）`, \'bad\'); return; }',
+      replacement: '    const otherKey = CAPTCHA_PROVIDERS.some((x) => { const el = document.getElementById(\'captcha-sitekey-\' + x); return !!(el && (el.value || \'\').trim()); });\n'
+        + '    if (!sel.siteKey && !otherKey) { showMsg(`启用验证码需填写「${captchaProviderName(provider)}」的站点密钥（Site Key）`, \'bad\'); return; }',
+      testFile: 'audit31-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R41-02m：路由把空串也当成「清除密钥」。
+       * 后果与 R41-02e 同型，只是发生在边界层：前端每次保存都提交空串（密码框不回填明文），
+       * 于是每点一次「保存设置」都会把这一家的服务端密钥清掉。
+       */
+      name: 'R41-02m · PUT /captcha/config 把空 secretKey 当成清除（每次保存都清密钥）',
+      file: 'server/routes/captcha.js',
+      anchor: '  if (entry.secretKey === null) out.secretKey = null;',
+      replacement: '  if (entry.secretKey === null || entry.secretKey === \'\') out.secretKey = null;',
+      testFile: 'audit41-regressions.test.js',
       minFail: 1,
     },
   ];

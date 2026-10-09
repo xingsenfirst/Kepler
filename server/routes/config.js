@@ -306,16 +306,45 @@ router.post('/config/verify', requireAdmin, async (req, res) => {
       }
       return res.json({ ok: true, message: '连接成功，凭据有效', provider: cProvider, buckets: buckets2 });
     }
-    const secretId = (b.secretId && String(b.secretId).trim()) || stored.secretId;
-    const secretKey = (b.secretKey && String(b.secretKey).trim()) || stored.secretKey;
-    const bucket = (b.bucket && String(b.bucket).trim()) || stored.bucket || '';
-    const region = (b.region && String(b.region).trim()) || stored.region || '';
-    const provider = (b.provider && String(b.provider).trim()) || stored.provider || providers.DEFAULT_PROVIDER_ID;
+    /**
+     * R42：从「当前生效配置」回退取值时，**只允许在同一厂商内继承**。
+     *
+     * `stored = configStore.get()` 是**当前生效配置**的扁平形态（内部走 `effective()`），
+     * 它的 `region` / `bucket` / `endpoint` 属于**当前激活的那个桶**（及其密钥）。
+     * 而本接口的入参完全可以换成**另一家厂商**的密钥 —— 密钥表单里根本没有「地域」栏
+     * （地域记在**桶**上），所以调用方（`credmgr.js` 的「测试连接」）只会提交
+     * `provider / secretId / secretKey`。旧实现无条件回退，于是这些值被原样拿去
+     * 验证别人家的密钥：
+     *   · `region` 会**推导出端点** ⇒ 「用华为云密钥」实际打向
+     *     `https://obs.ap-guangzhou.myhuaweicloud.com`（华为云没有该地域）⇒ DNS 失败，
+     *     界面只说「网络连接异常」；又拍云更隐蔽 —— 它的端点是固定的
+     *     `s3.api.upyun.com`（看着全对），错的是**签名地域**（应为 us-east-1，被写成
+     *     了别家的 ap-guangzhou）⇒ 403 SignatureDoesNotMatch。
+     *   · `bucket` 会被当成「顺带要探测的桶」，拿**别家**的桶名去 headBucket。
+     *   · `endpoint` 在阿里云等「有固定端点」的厂商下**恒非空** ⇒ 请求被发到别家域名。
+     *
+     * 用户可见症状正是「密钥完全正确，却提示网络异常 / 签名错误，换哪家都不行」，
+     * 且**谁先配好谁正常**（先配的那家不会撞上自己以外的 region）。华为云 / 七牛云 /
+     * 又拍云 / Backblaze 等都因此无法绑定。
+     *
+     * 请求未指定厂商时（历史调用方只传 secretId/secretKey）仍照旧继承：那时
+     * `provider` 也取自 `stored`，本来就是同一家，行为与历史逐字一致。
+     */
+    const reqProvider = String(b.provider == null ? '' : b.provider).trim();
+    const sameProvider = !reqProvider
+      || reqProvider === String(stored.provider || providers.DEFAULT_PROVIDER_ID);
+    /** 跨厂商时一律不继承（返回空串），交由厂商元数据推导正确的地域与端点 */
+    const inherit = (v) => (sameProvider ? (v || '') : '');
+    const secretId = (b.secretId && String(b.secretId).trim()) || inherit(stored.secretId);
+    const secretKey = (b.secretKey && String(b.secretKey).trim()) || inherit(stored.secretKey);
+    const bucket = (b.bucket && String(b.bucket).trim()) || inherit(stored.bucket);
+    const region = (b.region && String(b.region).trim()) || inherit(stored.region);
+    const provider = reqProvider || stored.provider || providers.DEFAULT_PROVIDER_ID;
     // 与写入路径同源：先按厂商规则组装（R2 的账户 ID → 完整端点），
     // 否则「测试连接」会用账户 ID 当端点去发请求，必然失败。
     const endpoint = providers.composeEndpoint(
       provider,
-      (b.endpoint && String(b.endpoint).trim()) || stored.endpoint || ''
+      (b.endpoint && String(b.endpoint).trim()) || inherit(stored.endpoint)
     );
     if (!secretId || !secretKey) return res.status(400).json({ ok: false, error: '请先填写访问密钥（AccessKey ID / Secret Access Key）' });
 

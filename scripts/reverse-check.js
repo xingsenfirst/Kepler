@@ -5014,6 +5014,114 @@ const CASES = [
       testFile: 'audit41-regressions.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * R42-01a：把「跨厂商不继承」这条判据整个去掉 = 修复前的形态。
+       *
+       * 后果：`/api/config/verify` 验证**别家**密钥时，会把当前激活桶的
+       * region / bucket / endpoint 一起带上 —— 用华为云密钥实际打向
+       * `obs.ap-southeast-2.myhuaweicloud.com`（华为云没有该地域）⇒ DNS 失败，
+       * 界面只说「网络连接异常」；又拍云更隐蔽：端点固定且正确，错的是**签名地域**。
+       * 用户可见症状即「密钥完全正确却验不过」，且「谁先配好谁正常」。
+       */
+      name: 'R42-01a · /config/verify 跨厂商继承激活桶的 region/bucket/endpoint（正确的 key 也验不过）',
+      file: 'server/routes/config.js',
+      anchor: '    const sameProvider = !reqProvider\n      || reqProvider === String(stored.provider || providers.DEFAULT_PROVIDER_ID);',
+      replacement: '    const sameProvider = true;',
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-01b：只把 `region` 的一处继承放开（bucket / endpoint 仍受控）。
+       * 单点变异，用来定位「究竟是哪一项污染了验证」——
+       * 端点由地域推导的厂商（华为云 / 七牛 / B2）会因此打到不存在的主机。
+       */
+      name: 'R42-01b · /config/verify 只把 region 的继承放开（端点被别家地域拼走）',
+      file: 'server/routes/config.js',
+      anchor: 'const region = (b.region && String(b.region).trim()) || inherit(stored.region);',
+      replacement: "const region = (b.region && String(b.region).trim()) || stored.region || '';",
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-01c：只把 `bucket` 的继承放开。
+       * 后果：拿激活桶（属于别家厂商）的名字去本厂商做 headBucket 存在性探测 ——
+       * 即便密钥有效，也会得到「未找到存储桶 / 存储桶验证失败」。
+       */
+      name: 'R42-01c · /config/verify 只把 bucket 的继承放开（拿别家的桶名去探测）',
+      file: 'server/routes/config.js',
+      anchor: 'const bucket = (b.bucket && String(b.bucket).trim()) || inherit(stored.bucket);',
+      replacement: "const bucket = (b.bucket && String(b.bucket).trim()) || stored.bucket || '';",
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-01d：只把 `endpoint` 的继承放开。
+       * 后果最直白：阿里云等「有固定端点」的厂商 `effective().endpoint` **恒非空**，
+       * 于是别家密钥的请求被原样发到它的域名上。
+       */
+      name: 'R42-01d · /config/verify 只把 endpoint 的继承放开（请求发到别家域名）',
+      file: 'server/routes/config.js',
+      anchor: '(b.endpoint && String(b.endpoint).trim()) || inherit(stored.endpoint)',
+      replacement: "(b.endpoint && String(b.endpoint).trim()) || stored.endpoint || ''",
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-02a：撤掉华为云的 UNSIGNED-PAYLOAD 声明。
+       * 华为云 OBS 的 V4 只支持 UNSIGNED-PAYLOAD（与流式分块），发真实载荷哈希
+       * 必得 403 SignatureDoesNotMatch，且报文不带任何线索 ⇒ 界面显示
+       * 「签名错误：请检查 AccessKey / SecretKey 是否正确」，把运维引向轮换一把
+       * 完全有效的密钥。
+       */
+      name: 'R42-02a · 华为云不再声明 unsignedPayload（发真实载荷哈希 = OBS 403）',
+      file: 'server/providers.js',
+      anchor: '    unsignedPayload: true,',
+      replacement: '    unsignedPayload: false,',
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-02b：把「按厂商下发」改成「一律 true」——
+       * 看着更「安全」，实际会把七牛打挂（其 S3 文档明确要求每个请求带 payload 的 sha256）。
+       * 这条同时压住两个方向：华为云必须开，别家必须不开。
+       */
+      name: 'R42-02b · unsignedPayload 不再按厂商判定（一律 true = 七牛等被拒）',
+      file: 'server/providers.js',
+      anchor: 'return resolve(id).unsignedPayload === true;',
+      replacement: 'return true;',
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-02c：客户端拿到标志却不用（注册表是对的，`s3-client` 丢了）。
+       * 「配置层改好了、执行层没执行」—— 本项目反复踩过的形态，必须单独一条。
+       */
+      name: 'R42-02c · s3-client 忽略 unsignedPayload 标志（注册表正确但执行层失效）',
+      file: 'server/s3-client.js',
+      anchor: 'if (this.unsignedPayload) payloadHash = UNSIGNED_PAYLOAD;',
+      replacement: 'if (false && this.unsignedPayload) payloadHash = UNSIGNED_PAYLOAD;',
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R42-02d：顺手给七牛也开上（「多开一家更保险」的直觉错法）。
+       * 七牛 Kodo 的 S3 文档明确要求真实载荷 sha256，开成 UNSIGNED-PAYLOAD 会被拒。
+       */
+      name: 'R42-02d · 七牛云也被声明 unsignedPayload（该家明确要求真实载荷哈希）',
+      file: 'server/providers.js',
+      anchor: "credentialLabel: { id: 'AccessKey', key: 'SecretKey', idPlaceholder: '请输入 AccessKey' },",
+      replacement: "credentialLabel: { id: 'AccessKey', key: 'SecretKey', idPlaceholder: '请输入 AccessKey' },\n    unsignedPayload: true,",
+      testFile: 'audit42-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

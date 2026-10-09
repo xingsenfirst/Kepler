@@ -58,6 +58,26 @@ const PROVIDERS = [
     regionPlaceholder: '例如 cn-north-4',
     regionHint: '华为云对象存储所在地域，如 cn-north-4（北京四）、cn-east-3（华东三）',
     credentialLabel: { id: 'Access Key ID', key: 'Secret Access Key', idPlaceholder: '请输入 Access Key ID' },
+    /**
+     * R42：华为云 OBS 的 V4 签名**只接受** `UNSIGNED-PAYLOAD`（以及流式分块的
+     * `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`）两种载荷哈希，**不接受**「真实请求体
+     * 的 SHA-256」。见华为云官方 FAQ《如何使用 V4 签名访问 OBS》的「约束与限制」：
+     * 「V4 仅支持 UNSIGNED-PAYLOAD、STREAMING-AWS4-HMAC-SHA256-PAYLOAD 2 种模式」。
+     *
+     * 为什么这条必须由注册表下发：默认实现（AWS 规范）对**带体请求**发的是真实
+     * SHA-256 —— 在 AWS / 阿里云 / 七牛 / MinIO 上都合法，唯独 OBS 会以
+     * `403 SignatureDoesNotMatch` 拒绝，而报文里**不带任何线索**，界面只会显示
+     * 「签名错误：请检查 AccessKey / SecretKey 是否正确」，把运维引向轮换一把
+     * 完全有效的密钥（正是本轮用户报的「正确的 key 也无法绑定」）。
+     * 这也解释了为何「用 aws-cli / boto3 能传、自研客户端不能」：boto3 与 aws-cli
+     * 在 HTTPS 下默认就发 UNSIGNED-PAYLOAD（`payload_signing_enabled` 默认关闭），
+     * 真实载荷哈希根本不会出现在请求里。
+     *
+     * ⚠️ **只给华为云开**：七牛云 Kodo 的 S3 文档明确要求「每个请求必带
+     * x-amz-content-sha256（payload 的 sha256）」，对它发 UNSIGNED-PAYLOAD 反而
+     * 会被拒。因此这是一条**厂商差异**，不是「全局更安全的写法」。
+     */
+    unsignedPayload: true,
   },
   {
     id: 'qiniu',
@@ -328,6 +348,18 @@ function forcePathStyle(id) {
 }
 
 /**
+ * R42：该厂商是否只接受 `UNSIGNED-PAYLOAD` 作为载荷哈希（华为云 OBS）。
+ *
+ * true 时客户端**所有**请求（含 GET/HEAD 这类空体请求）都发 `UNSIGNED-PAYLOAD`，
+ * 绝不发真实请求体的 SHA-256。判据由厂商元数据驱动，理由见 `PROVIDERS` 里
+ * 华为云条目的注释（OBS 的 V4 只支持两种载荷模式；发真实哈希必得
+ * `403 SignatureDoesNotMatch`，且报文不带线索）。
+ */
+function unsignedPayload(id) {
+  return resolve(id).unsignedPayload === true;
+}
+
+/**
  * 该厂商是否要求用户提供「服务端点」这一栏。
  *
  * 两种形态都算「要用户填」：`'required'`（MinIO，填完整访问地址）与
@@ -451,6 +483,8 @@ module.exports = {
   PROVIDERS, DEFAULT_PROVIDER_ID,
   list, get, resolve, isSupported, nameOf, isCos, isS3, isAzure, endpointFor,
   forcePathStyle, endpointRequired, regionFor, composeEndpoint,
+  // R42：只接受 UNSIGNED-PAYLOAD 的厂商（华为云 OBS）—— 注册表下发，客户端唯一读取点
+  unsignedPayload,
   // R30：由账户名推导端点（Azure）—— 唯一实现点，含账户名字符集校验
   accountEndpointTemplate, isValidAccount, endpointForAccount,
 };

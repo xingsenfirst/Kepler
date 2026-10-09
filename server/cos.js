@@ -99,6 +99,9 @@ function createClient(cfg) {
     // 自建对象存储（MinIO）默认虚拟主机风格会拼出 `bucket.<host>` 而无法解析，
     // 必须按厂商元数据切到路径风格（见 s3-client._virtualHosted）。
     forcePathStyle: providers.forcePathStyle(pid),
+    // R42：华为云 OBS 的 V4 只接受 UNSIGNED-PAYLOAD（发真实载荷哈希必得 403），
+    // 这条差异同样由注册表下发（见 providers.unsignedPayload）。
+    unsignedPayload: providers.unsignedPayload(pid),
   });
 }
 

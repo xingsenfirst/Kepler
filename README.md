@@ -70,7 +70,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsenfirst/K
 | --- | --- | --- | --- | --- |
 | 腾讯云 | COS | 原生 SDK（`cos-nodejs-sdk-v5`） | `ap-guangzhou` | ✅ 已支持 |
 | 阿里云 | OSS | S3 兼容（SigV4） | `cn-hangzhou` | ✅ 已支持 |
-| 华为云 | OBS | S3 兼容（SigV4） | `cn-north-4` | ✅ 已支持 |
+| 华为云 | OBS | S3 兼容（SigV4，**该家 V4 只接受 `UNSIGNED-PAYLOAD`，已内置按厂商处理**） | `cn-north-4` | ✅ 已支持 |
 | 七牛云 | Kodo | S3 兼容（SigV4） | `cn-east-1` | ✅ 已支持 |
 | 又拍云 | USS | S3 兼容（SigV4，地域可留空） | `us-east-1` | ✅ 已支持 |
 | Microsoft Azure | Blob Storage | Blob REST + Shared Key（`x-ms-version` 2020-12-06） | 不适用（端点由存储账户名决定） | ✅ 已支持 |
@@ -135,7 +135,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（52 个文件 / 500+ 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（53 个文件 / 500+ 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 

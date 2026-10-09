@@ -314,6 +314,15 @@ class S3Client {
      * 可行形式。两者取或，语义一致。
      */
     this.forcePathStyle = o.forcePathStyle === true;
+    /**
+     * R42：是否**只**发 `UNSIGNED-PAYLOAD` 作为载荷哈希（华为云 OBS）。
+     *
+     * 由 `providers.unsignedPayload()` 按厂商下发。默认（AWS 规范）对带体请求发
+     * 真实 SHA-256；OBS 的 V4 **只支持** UNSIGNED-PAYLOAD 与流式分块两种模式，
+     * 收到真实哈希会回 `403 SignatureDoesNotMatch`，且报文不带任何线索。
+     * 详见 `providers.js` 华为云条目的注释（含「为什么只给华为云开」）。
+     */
+    this.unsignedPayload = o.unsignedPayload === true;
     this.timeout = Number(o.timeout) || DEFAULT_TIMEOUT_MS;
   }
 
@@ -408,7 +417,11 @@ class S3Client {
 
     const hasBody = spec.body !== undefined && spec.body !== null;
     let payloadHash;
-    if (!hasBody) payloadHash = EMPTY_PAYLOAD_SHA256;
+    // R42：只接受 UNSIGNED-PAYLOAD 的厂商（华为云 OBS）—— **所有**请求统一发它，
+    // 包括 GET / HEAD 这类空体请求（OBS 连空体的真实哈希也不收）。判据见
+    // providers.unsignedPayload()；这条必须在最前，否则带体请求会落到真实哈希上。
+    if (this.unsignedPayload) payloadHash = UNSIGNED_PAYLOAD;
+    else if (!hasBody) payloadHash = EMPTY_PAYLOAD_SHA256;
     else if (spec.streamBody) payloadHash = UNSIGNED_PAYLOAD;
     else payloadHash = sha256Hex(toBuffer(spec.body));
 
